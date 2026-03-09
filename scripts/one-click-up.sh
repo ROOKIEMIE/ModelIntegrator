@@ -15,14 +15,20 @@ if ! docker compose version >/dev/null 2>&1; then
 fi
 
 if [ ! -f .env ]; then
-  cp resource/docker/compose.example.env .env
-  echo "[INFO] 已生成 .env（来自 resource/docker/compose.example.env）"
+  cp resources/docker/compose.example.env .env
+  echo "[INFO] 已生成 .env（来自 resources/docker/compose.example.env）"
 fi
 
-mkdir -p resource/config resource/models
+if grep -q "/opt/modelintegrator/resource/" .env || grep -q "\./resource/" .env; then
+  sed -i 's|/opt/modelintegrator/resource/|/opt/modelintegrator/resources/|g' .env
+  sed -i 's|\./resource/|./resources/|g' .env
+  echo "[INFO] 已自动迁移 .env 中旧 resource 路径到 resources"
+fi
 
-touch resource/config/modelintegrator.db
-chmod 666 resource/config/modelintegrator.db || true
+mkdir -p resources/config resources/models resources/download-cache/hf resources/download-cache/aria2-config
+
+touch resources/config/modelintegrator.db
+chmod 666 resources/config/modelintegrator.db || true
 
 if command -v nvidia-smi >/dev/null 2>&1; then
   echo "[INFO] 检测到 nvidia-smi，CUDA 平台信息如下："
@@ -32,10 +38,25 @@ else
 fi
 
 PROFILE_ARGS=()
-if [[ "${1:-}" == "--addons" ]]; then
-  PROFILE_ARGS+=(--profile addons)
-  echo "[INFO] 将一并启动 addons"
-fi
+for arg in "$@"; do
+  case "$arg" in
+    --addons)
+      PROFILE_ARGS+=(--profile addons)
+      echo "[INFO] 将一并启动 addons"
+      ;;
+    --download)
+      PROFILE_ARGS+=(--profile download)
+      echo "[INFO] 将一并启动 download 容器"
+      ;;
+    --vllm)
+      PROFILE_ARGS+=(--profile vllm)
+      echo "[INFO] 将一并启动 vLLM 运行模板容器"
+      ;;
+    *)
+      echo "[WARN] 忽略未知参数: $arg"
+      ;;
+  esac
+done
 
 echo "[INFO] 校验 compose 配置..."
 docker compose "${PROFILE_ARGS[@]}" config >/dev/null

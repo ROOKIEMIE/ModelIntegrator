@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -23,6 +24,7 @@ var ErrModelNotFound = errors.New("model not found")
 type ModelService struct {
 	modelRegistry *registry.ModelRegistry
 	nodeRegistry  *registry.NodeRegistry
+	templates     *RuntimeTemplateService
 	scheduler     *scheduler.Scheduler
 	adapters      *adapter.Manager
 	logger        *slog.Logger
@@ -35,6 +37,7 @@ type ModelService struct {
 func NewModelService(
 	modelRegistry *registry.ModelRegistry,
 	nodeRegistry *registry.NodeRegistry,
+	templates *RuntimeTemplateService,
 	scheduler *scheduler.Scheduler,
 	adapters *adapter.Manager,
 	logger *slog.Logger,
@@ -43,6 +46,7 @@ func NewModelService(
 	return &ModelService{
 		modelRegistry: modelRegistry,
 		nodeRegistry:  nodeRegistry,
+		templates:     templates,
 		scheduler:     scheduler,
 		adapters:      adapters,
 		logger:        logger,
@@ -135,39 +139,65 @@ func (s *ModelService) executeAction(ctx context.Context, id, action string) (mo
 	}
 	defer s.unlockNodeAction(nodeID)
 
-	adapterInstance, err := s.adapters.Get(m.BackendType)
+	actionModel := m
+	actionModel.Metadata = cloneMetadataMap(m.Metadata)
+	runtimeEndpoint, runtimeToken := s.resolveRuntimeConnection(actionModel)
+	if runtimeEndpoint != "" {
+		actionModel.Endpoint = runtimeEndpoint
+		actionModel.Metadata["runtime_endpoint"] = runtimeEndpoint
+	}
+	if runtimeToken != "" {
+		actionModel.Metadata["runtime_token"] = runtimeToken
+	}
+
+	templateID, templatePayload, templateErr := s.resolveRuntimeTemplateForModel(ctx, actionModel)
+	if templateErr != nil {
+		return actionResult(false, templateErr.Error(), map[string]interface{}{
+			"model_id":            actionModel.ID,
+			"backend_type":        actionModel.BackendType,
+			"runtime_template_id": templateID,
+		}), nil
+	}
+	if templateID != "" {
+		actionModel.Metadata["runtime_template_id"] = templateID
+	}
+	if templatePayload != "" {
+		actionModel.Metadata["runtime_template_payload"] = templatePayload
+	}
+
+	adapterInstance, err := s.adapters.Get(actionModel.BackendType)
 	if err != nil {
-		return actionResult(false, err.Error(), map[string]interface{}{"backend_type": m.BackendType}), nil
+		return actionResult(false, err.Error(), map[string]interface{}{"backend_type": actionModel.BackendType}), nil
 	}
 
 	if action == "load" || action == "start" {
-		if canRun, reason := s.scheduler.CanRun(m); !canRun {
-			return actionResult(false, reason, map[string]interface{}{"model_id": m.ID}), nil
+		if canRun, reason := s.scheduler.CanRun(actionModel); !canRun {
+			return actionResult(false, reason, map[string]interface{}{"model_id": actionModel.ID}), nil
 		}
 	}
 
 	result := model.ActionResult{}
 	switch action {
 	case "load":
-		result, err = adapterInstance.LoadModel(ctx, m)
+		result, err = adapterInstance.LoadModel(ctx, actionModel)
 		if result.Success {
 			m.State = model.ModelStateLoaded
-			s.scheduler.MarkRunning(m)
+			s.scheduler.MarkRunning(actionModel)
 		}
 	case "unload":
-		result, err = adapterInstance.UnloadModel(ctx, m)
+		result, err = adapterInstance.UnloadModel(ctx, actionModel)
 		if result.Success {
 			m.State = model.ModelStateStopped
 			s.scheduler.MarkStopped(m.ID)
 		}
 	case "start":
-		result, err = adapterInstance.StartModel(ctx, m)
+		result, err = adapterInstance.StartModel(ctx, actionModel)
 		if result.Success {
 			m.State = model.ModelStateRunning
-			s.scheduler.MarkRunning(m)
+			s.scheduler.MarkRunning(actionModel)
 		}
 	case "stop":
-		result, err = adapterInstance.StopModel(ctx, m)
+		result, err = adapterInstance.StopModel(ctx, actionModel)
 		if result.Success {
 			m.State = model.ModelStateStopped
 			s.scheduler.MarkStopped(m.ID)
@@ -180,6 +210,21 @@ func (s *ModelService) executeAction(ctx context.Context, id, action string) (mo
 		s.logger.Error("调用适配器失败", "action", action, "model_id", m.ID, "error", err)
 		return actionResult(false, "适配器调用失败", map[string]interface{}{"error": err.Error(), "model_id": m.ID}), nil
 	}
+
+	if result.Detail == nil {
+		result.Detail = map[string]interface{}{}
+	}
+	if m.Metadata == nil {
+		m.Metadata = map[string]string{}
+	}
+	if templateID != "" {
+		m.Metadata["runtime_template_id"] = templateID
+		result.Detail["runtime_template_id"] = templateID
+	}
+	if runtimeEndpoint != "" {
+		m.Endpoint = runtimeEndpoint
+	}
+	applyContainerRuntimeDetail(result.Detail, &m)
 
 	s.modelRegistry.Upsert(m)
 	return result, nil
@@ -276,6 +321,90 @@ func (s *ModelService) resolveRuntimeBinding(runtimeType model.RuntimeType) (hos
 	return "", "", ""
 }
 
+func (s *ModelService) resolveContainerRuntimeBinding() (backendType model.RuntimeType, hostNodeID, runtimeID, endpoint string) {
+	hostNodeID, runtimeID, endpoint = s.resolveRuntimeBinding(model.RuntimeTypeDocker)
+	if hostNodeID != "" {
+		return model.RuntimeTypeDocker, hostNodeID, runtimeID, endpoint
+	}
+	hostNodeID, runtimeID, endpoint = s.resolveRuntimeBinding(model.RuntimeTypePortainer)
+	if hostNodeID != "" {
+		return model.RuntimeTypePortainer, hostNodeID, runtimeID, endpoint
+	}
+	return "", "", "", ""
+}
+
+func (s *ModelService) resolveRuntimeConnection(m model.Model) (endpoint, token string) {
+	endpoint = firstNonEmpty(
+		readMetadataValue(m.Metadata, "runtime_endpoint"),
+		m.Endpoint,
+	)
+	token = firstNonEmpty(
+		readMetadataValue(m.Metadata, "runtime_token"),
+		readMetadataValue(m.Metadata, "runtime_api_key"),
+		readMetadataValue(m.Metadata, "runtime_bearer_token"),
+	)
+
+	var match *model.Runtime
+	node, ok := s.nodeRegistry.Get(strings.TrimSpace(m.HostNodeID))
+	if ok {
+		match = s.matchRuntimeForModel(node.Runtimes, m)
+	}
+	if match == nil {
+		match = s.findRuntimeAcrossNodes(m)
+	}
+	if match == nil {
+		return endpoint, token
+	}
+
+	endpoint = firstNonEmpty(endpoint, match.Endpoint)
+	token = firstNonEmpty(
+		token,
+		readMetadataValue(match.Metadata, "token"),
+		readMetadataValue(match.Metadata, "api_token"),
+		readMetadataValue(match.Metadata, "bearer_token"),
+	)
+	return endpoint, token
+}
+
+func (s *ModelService) findRuntimeAcrossNodes(m model.Model) *model.Runtime {
+	runtimeID := strings.TrimSpace(m.RuntimeID)
+	if runtimeID == "" {
+		return nil
+	}
+	nodes := s.nodeRegistry.List()
+	for i := range nodes {
+		for j := range nodes[i].Runtimes {
+			rt := &nodes[i].Runtimes[j]
+			if rt.Enabled && rt.Type == m.BackendType && rt.ID == runtimeID {
+				return rt
+			}
+		}
+	}
+	return nil
+}
+
+func (s *ModelService) matchRuntimeForModel(runtimes []model.Runtime, m model.Model) *model.Runtime {
+	runtimeID := strings.TrimSpace(m.RuntimeID)
+	for i := range runtimes {
+		rt := &runtimes[i]
+		if !rt.Enabled || rt.Type != m.BackendType {
+			continue
+		}
+		if runtimeID != "" && rt.ID == runtimeID {
+			return rt
+		}
+	}
+	if runtimeID == "" {
+		for i := range runtimes {
+			rt := &runtimes[i]
+			if rt.Enabled && rt.Type == m.BackendType {
+				return rt
+			}
+		}
+	}
+	return nil
+}
+
 func (s *ModelService) refreshLocalModels(ctx context.Context) error {
 	_ = ctx
 	root := strings.TrimSpace(s.modelRootDir)
@@ -288,12 +417,15 @@ func (s *ModelService) refreshLocalModels(ctx context.Context) error {
 		return fmt.Errorf("扫描本地模型目录失败 (%s): %w", root, err)
 	}
 
-	hostNodeID, runtimeID, endpoint := s.resolveRuntimeBinding(model.RuntimeTypeDocker)
+	backendType, hostNodeID, runtimeID, endpoint := s.resolveContainerRuntimeBinding()
 	if hostNodeID == "" {
 		nodes := s.nodeRegistry.List()
 		if len(nodes) > 0 {
 			hostNodeID = nodes[0].ID
 		}
+	}
+	if backendType == "" {
+		backendType = model.RuntimeTypeDocker
 	}
 
 	scanned := make([]model.Model, 0)
@@ -314,14 +446,15 @@ func (s *ModelService) refreshLocalModels(ctx context.Context) error {
 			ID:          modelID,
 			Name:        modelName,
 			Provider:    "localfs",
-			BackendType: model.RuntimeTypeDocker,
+			BackendType: backendType,
 			HostNodeID:  hostNodeID,
 			RuntimeID:   runtimeID,
 			Endpoint:    endpoint,
 			State:       model.ModelStateStopped,
 			Metadata: map[string]string{
-				"source": "local-scan",
-				"path":   path,
+				"source":              "local-scan",
+				"path":                path,
+				"runtime_template_id": DefaultDockerTemplateID,
 			},
 		})
 	}
@@ -361,4 +494,88 @@ func slugify(input string) string {
 		return "model"
 	}
 	return out
+}
+
+func (s *ModelService) resolveRuntimeTemplateForModel(ctx context.Context, m model.Model) (id string, payload string, err error) {
+	if s.templates == nil {
+		return "", "", nil
+	}
+
+	if m.BackendType != model.RuntimeTypeDocker && m.BackendType != model.RuntimeTypePortainer {
+		return "", "", nil
+	}
+
+	templateID := DefaultDockerTemplateID
+	if m.Metadata != nil {
+		if configured := strings.TrimSpace(m.Metadata["runtime_template_id"]); configured != "" {
+			templateID = configured
+		}
+	}
+
+	tpl, ok := s.templates.GetTemplate(ctx, templateID)
+	if !ok {
+		return templateID, "", fmt.Errorf("运行时模板不存在: %s", templateID)
+	}
+
+	if m.BackendType == model.RuntimeTypeDocker && tpl.RuntimeType != model.RuntimeTypeDocker {
+		return templateID, "", fmt.Errorf("模板 %s runtime_type=%s 与模型后端 docker 不匹配", templateID, tpl.RuntimeType)
+	}
+	if m.BackendType == model.RuntimeTypePortainer && tpl.RuntimeType != model.RuntimeTypeDocker && tpl.RuntimeType != model.RuntimeTypePortainer {
+		return templateID, "", fmt.Errorf("模板 %s runtime_type=%s 与模型后端 portainer 不匹配", templateID, tpl.RuntimeType)
+	}
+
+	raw, err := json.Marshal(tpl)
+	if err != nil {
+		return templateID, "", fmt.Errorf("运行时模板序列化失败: %w", err)
+	}
+	return templateID, string(raw), nil
+}
+
+func applyContainerRuntimeDetail(detail map[string]interface{}, m *model.Model) {
+	if m == nil || detail == nil {
+		return
+	}
+	if m.Metadata == nil {
+		m.Metadata = map[string]string{}
+	}
+
+	if v, ok := detail["runtime_container_id"]; ok {
+		if s := strings.TrimSpace(fmt.Sprint(v)); s != "" && s != "<nil>" {
+			m.Metadata["runtime_container_id"] = s
+		}
+	}
+	if v, ok := detail["runtime_container"]; ok {
+		if s := strings.TrimSpace(fmt.Sprint(v)); s != "" && s != "<nil>" {
+			m.Metadata["runtime_container"] = s
+		}
+	}
+	if v, ok := detail["runtime_image"]; ok {
+		if s := strings.TrimSpace(fmt.Sprint(v)); s != "" && s != "<nil>" {
+			m.Metadata["runtime_image"] = s
+		}
+	}
+}
+
+func cloneMetadataMap(in map[string]string) map[string]string {
+	out := make(map[string]string)
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func readMetadataValue(metadata map[string]string, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	return strings.TrimSpace(metadata[key])
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }

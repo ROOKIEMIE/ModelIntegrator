@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ModelIntegrator</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <header>
+      <h1>ModelIntegrator（MVP）</h1>
+      <p>本地多节点模型管理控制台</p>
+    </header>
+
+    <div class="page-tabs" id="page-tabs">
+      <button class="page-tab-btn" data-page="runtime">Runtime</button>
+      <button class="page-tab-btn" data-page="download">Download</button>
+    </div>
+
+    <section id="runtime-page">
+      <div class="runtime-sub-tabs" id="runtime-sub-tabs">
+        <button class="runtime-sub-tab-btn" data-runtime-tab="list">List</button>
+        <button class="runtime-sub-tab-btn" data-runtime-tab="template">Template</button>
+      </div>
+
+      <main id="runtime-list-view">
+        <section class="panel panel-nodes">
+          <h2>节点列表</h2>
+          <div id="nodes">加载中...</div>
+        </section>
+
+        <section class="panel panel-models">
+          <h2>模型列表</h2>
+          <div id="model-tabs" class="tabs"></div>
+          <div id="models">加载中...</div>
+        </section>
+      </main>
+
+      <section id="runtime-template-view" class="panel panel-download hidden">
+        <h2>Runtime Template</h2>
+        <div class="meta">支持自定义 Docker/Portainer 运行时模板，校验通过后可用于容器编排执行。</div>
+
+        <div class="download-grid">
+          <section class="panel template-list-panel">
+            <h3>已注册模板</h3>
+            <div id="runtime-templates">加载中...</div>
+          </section>
+
+          <section class="panel template-editor-panel">
+            <h3>自定义模板校验与注册</h3>
+            <form id="runtime-template-form" class="template-form">
+              <label>
+                Template ID
+                <input id="tpl-id" type="text" placeholder="例如: vllm-qwen-7b" required />
+              </label>
+              <label>
+                Name
+                <input id="tpl-name" type="text" placeholder="例如: vLLM Qwen 7B" required />
+              </label>
+              <label>
+                Runtime Type
+                <select id="tpl-runtime-type">
+                  <option value="docker">docker</option>
+                  <option value="portainer">portainer</option>
+                </select>
+              </label>
+              <label>
+                Image
+                <input id="tpl-image" type="text" placeholder="例如: vllm/vllm-openai:latest" />
+              </label>
+              <label>
+                Description
+                <input id="tpl-description" type="text" placeholder="模板说明（可选）" />
+              </label>
+              <label>
+                Command（每行一个参数）
+                <textarea id="tpl-command" rows="4" placeholder="--host&#10;0.0.0.0&#10;--model&#10;Qwen/Qwen2.5-7B-Instruct"></textarea>
+              </label>
+              <label>
+                Volumes（每行 host:container[:ro|rw]）
+                <textarea id="tpl-volumes" rows="3" placeholder="./resources/models:/models&#10;./resources/download-cache/hf:/data/hf-cache"></textarea>
+              </label>
+              <label>
+                Ports（每行 host:container[/tcp|udp]）
+                <textarea id="tpl-ports" rows="2" placeholder="58000:8000"></textarea>
+              </label>
+              <label>
+                Env（每行 KEY=VALUE）
+                <textarea id="tpl-env" rows="4" placeholder="HF_HOME=/data/hf-cache"></textarea>
+              </label>
+              <label class="checkbox-line">
+                <input id="tpl-needs-gpu" type="checkbox" />
+                需要 GPU
+              </label>
+              <div class="actions">
+                <button id="tpl-validate-btn" type="button">校验模板</button>
+                <button id="tpl-register-btn" type="button">注册模板</button>
+              </div>
+            </form>
+            <div id="runtime-template-result" class="meta"></div>
+          </section>
+        </div>
+      </section>
+    </section>
+
+    <section id="download-page" class="panel panel-download hidden">
+      <h2>Download</h2>
+      <div class="meta">Download 页面预留，后续用于模型下载任务编排。</div>
+    </section>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

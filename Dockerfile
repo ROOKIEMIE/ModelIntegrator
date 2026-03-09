@@ -13,9 +13,9 @@ WORKDIR /opt/modelintegrator
 RUN addgroup -S app && adduser -S app -G app
 
 COPY --from=builder /out/model-integrator /opt/modelintegrator/model-integrator
-COPY resource /opt/modelintegrator/resource
+COPY resources /opt/modelintegrator/resources
 
 EXPOSE 8080
-ENV MCP_CONFIG=/opt/modelintegrator/resource/config/config.example.yaml
+ENV MCP_CONFIG=/opt/modelintegrator/resources/config/config.example.yaml
 
 CMD ["/opt/modelintegrator/model-integrator"]

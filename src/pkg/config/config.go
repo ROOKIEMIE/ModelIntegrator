@@ -11,17 +11,18 @@ import (
 	"ModelIntegrator/src/pkg/model"
 )
 
-const DefaultConfigPath = "./resource/config/config.example.yaml"
+const DefaultConfigPath = "./resources/config/config.example.yaml"
 
 type Config struct {
-	SourcePath   string             `yaml:"-"`
-	Server       ServerConfig       `yaml:"server"`
-	Log          LogConfig          `yaml:"log"`
-	Storage      StorageConfig      `yaml:"storage"`
-	Auth         AuthConfig         `yaml:"auth"`
-	Integrations IntegrationsConfig `yaml:"integrations"`
-	Nodes        []model.Node       `yaml:"nodes"`
-	Models       []model.Model      `yaml:"models"`
+	SourcePath       string                  `yaml:"-"`
+	Server           ServerConfig            `yaml:"server"`
+	Log              LogConfig               `yaml:"log"`
+	Storage          StorageConfig           `yaml:"storage"`
+	Auth             AuthConfig              `yaml:"auth"`
+	Integrations     IntegrationsConfig      `yaml:"integrations"`
+	Nodes            []model.Node            `yaml:"nodes"`
+	Models           []model.Model           `yaml:"models"`
+	RuntimeTemplates []model.RuntimeTemplate `yaml:"runtime_templates"`
 }
 
 type ServerConfig struct {
@@ -68,7 +69,7 @@ func DefaultConfig() *Config {
 	return &Config{
 		Server: ServerConfig{
 			Address:                ":8080",
-			StaticDir:              "./resource/web",
+			StaticDir:              "./resources/web",
 			ReadTimeoutSeconds:     15,
 			WriteTimeoutSeconds:    30,
 			ShutdownTimeoutSeconds: 10,
@@ -78,8 +79,8 @@ func DefaultConfig() *Config {
 			Format: "text",
 		},
 		Storage: StorageConfig{
-			SQLitePath:   "./resource/config/modelintegrator.db",
-			ModelRootDir: "./resource/models",
+			SQLitePath:   "./resources/config/modelintegrator.db",
+			ModelRootDir: "./resources/models",
 		},
 		Integrations: IntegrationsConfig{
 			LMStudio: LMStudioConfig{
@@ -90,8 +91,9 @@ func DefaultConfig() *Config {
 				CacheRefreshSeconds: 30,
 			},
 		},
-		Nodes:  []model.Node{},
-		Models: []model.Model{},
+		Nodes:            []model.Node{},
+		Models:           []model.Model{},
+		RuntimeTemplates: []model.RuntimeTemplate{},
 	}
 }
 
@@ -196,7 +198,7 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("配置校验失败: server.address 不能为空")
 	}
 	if c.Server.StaticDir == "" {
-		c.Server.StaticDir = "./resource/web"
+		c.Server.StaticDir = "./resources/web"
 	}
 	if c.Server.ReadTimeoutSeconds <= 0 {
 		c.Server.ReadTimeoutSeconds = 15
@@ -208,10 +210,10 @@ func (c *Config) Validate() error {
 		c.Server.ShutdownTimeoutSeconds = 10
 	}
 	if c.Storage.SQLitePath == "" {
-		c.Storage.SQLitePath = "./resource/config/modelintegrator.db"
+		c.Storage.SQLitePath = "./resources/config/modelintegrator.db"
 	}
 	if c.Storage.ModelRootDir == "" {
-		c.Storage.ModelRootDir = "./resource/models"
+		c.Storage.ModelRootDir = "./resources/models"
 	}
 	if c.Integrations.LMStudio.CacheRefreshSeconds <= 0 {
 		c.Integrations.LMStudio.CacheRefreshSeconds = 30

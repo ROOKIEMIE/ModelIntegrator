@@ -49,6 +49,7 @@ func main() {
 
 	nodeRegistry := registry.NewNodeRegistry(cfg.Nodes)
 	modelRegistry := registry.NewModelRegistry(cfg.Models)
+	templateRegistry := registry.NewRuntimeTemplateRegistry(nil)
 
 	schedulerInstance := scheduler.NewScheduler()
 	for _, m := range cfg.Models {
@@ -78,10 +79,17 @@ func main() {
 		cfg.Integrations.Portainer.Token,
 	))
 
-	nodeService := service.NewNodeService(nodeRegistry)
-	modelService := service.NewModelService(modelRegistry, nodeRegistry, schedulerInstance, adapterManager, log, cfg.Storage.ModelRootDir)
+	runtimeTemplateService := service.NewRuntimeTemplateService(templateRegistry, log)
+	runtimeTemplateService.RegisterBuiltins()
+	if err := runtimeTemplateService.RegisterFromConfig(context.Background(), cfg.RuntimeTemplates); err != nil {
+		log.Error("运行时模板配置校验失败", "error", err)
+		os.Exit(1)
+	}
 
-	handler := api.NewHandler(nodeService, modelService, log, version.Get())
+	nodeService := service.NewNodeService(nodeRegistry)
+	modelService := service.NewModelService(modelRegistry, nodeRegistry, runtimeTemplateService, schedulerInstance, adapterManager, log, cfg.Storage.ModelRootDir)
+
+	handler := api.NewHandler(nodeService, modelService, runtimeTemplateService, log, version.Get())
 	router := api.NewRouter(handler, cfg.Server.StaticDir, log)
 
 	httpServer := server.New(cfg, router, log)

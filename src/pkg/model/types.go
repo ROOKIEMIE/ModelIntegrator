@@ -72,6 +72,28 @@ type Runtime struct {
 	Metadata map[string]string `json:"metadata,omitempty" yaml:"metadata,omitempty"`
 }
 
+type RuntimeTemplate struct {
+	ID          string            `json:"id" yaml:"id"`
+	Name        string            `json:"name" yaml:"name"`
+	Description string            `json:"description,omitempty" yaml:"description,omitempty"`
+	RuntimeType RuntimeType       `json:"runtime_type" yaml:"runtime_type"`
+	Image       string            `json:"image,omitempty" yaml:"image,omitempty"`
+	Command     []string          `json:"command,omitempty" yaml:"command,omitempty"`
+	Env         map[string]string `json:"env,omitempty" yaml:"env,omitempty"`
+	Volumes     []string          `json:"volumes,omitempty" yaml:"volumes,omitempty"`
+	Ports       []string          `json:"ports,omitempty" yaml:"ports,omitempty"`
+	NeedsGPU    bool              `json:"needs_gpu" yaml:"needs_gpu"`
+	Source      string            `json:"source,omitempty" yaml:"source,omitempty"`
+	Metadata    map[string]string `json:"metadata,omitempty" yaml:"metadata,omitempty"`
+}
+
+type RuntimeTemplateValidationResult struct {
+	Valid      bool            `json:"valid"`
+	Errors     []string        `json:"errors,omitempty"`
+	Warnings   []string        `json:"warnings,omitempty"`
+	Normalized RuntimeTemplate `json:"normalized"`
+}
+
 type Model struct {
 	ID            string            `json:"id" yaml:"id"`
 	Name          string            `json:"name" yaml:"name"`

@@ -1,6 +1,6 @@
 server:
   address: ":8080"
-  static_dir: "./resource/web"
+  static_dir: "./resources/web"
   read_timeout_seconds: 15
   write_timeout_seconds: 30
   shutdown_timeout_seconds: 10
@@ -10,8 +10,8 @@ log:
   format: "text"
 
 storage:
-  sqlite_path: "./resource/config/modelintegrator.db"
-  model_root_dir: "./resource/models"
+  sqlite_path: "./resources/config/modelintegrator.db"
+  model_root_dir: "./resources/models"
 
 auth:
   token: "change-me-if-needed"
@@ -56,5 +56,17 @@ nodes:
         endpoint: "http://192.168.50.241:1234"
         enabled: true
 
-models:
-  - 
+models: []
+
+runtime_templates:
+  - id: "docker-generic-local"
+    name: "Docker Generic Local"
+    description: "示例：本地通用 Docker 模型运行模板"
+    runtime_type: "docker"
+    image: "ubuntu:22.04"
+    command:
+      - "sleep"
+      - "infinity"
+    volumes:
+      - "./resources/models:/models:ro"
+    needs_gpu: false

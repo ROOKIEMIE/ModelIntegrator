@@ -7,7 +7,7 @@ services:
     ports:
       - "${MCP_EXTERNAL_PORT:-59081}:80"
     volumes:
-      - ${MCP_PROJECT_DIR:-.}/resource/nginx/nginx.example.conf:/etc/nginx/conf.d/default.conf:ro
+      - ${MCP_PROJECT_DIR:-.}/resources/nginx/nginx.example.conf:/etc/nginx/conf.d/default.conf:ro
     networks:
       - mcp_net
     restart: unless-stopped
@@ -18,11 +18,11 @@ services:
       dockerfile: Dockerfile
     container_name: model-integrator
     environment:
-      MCP_CONFIG: /opt/modelintegrator/resource/config/config.example.yaml
+      MCP_CONFIG: /opt/modelintegrator/resources/config/config.example.yaml
       MCP_SERVER_ADDRESS: ":8080"
       MCP_LOG_LEVEL: ${MCP_LOG_LEVEL:-info}
       MCP_LOG_FORMAT: ${MCP_LOG_FORMAT:-text}
-      MCP_SQLITE_PATH: ${MCP_SQLITE_PATH:-/opt/modelintegrator/resource/config/modelintegrator.db}
+      MCP_SQLITE_PATH: ${MCP_SQLITE_PATH:-/opt/modelintegrator/resources/config/modelintegrator.db}
       MCP_MODEL_ROOT_DIR: ${MCP_MODEL_ROOT_DIR:-/opt/modelintegrator/models}
       MCP_LMSTUDIO_ENDPOINT: ${MCP_LMSTUDIO_ENDPOINT:-http://192.168.50.241:1234}
       MCP_LMSTUDIO_CACHE_ENABLED: ${MCP_LMSTUDIO_CACHE_ENABLED:-true}
@@ -30,8 +30,8 @@ services:
       MCP_DOCKER_ENDPOINT: ${MCP_DOCKER_ENDPOINT:-unix:///var/run/docker.sock}
       MCP_PORTAINER_ENDPOINT: ${MCP_PORTAINER_ENDPOINT:-http://portainer:9000}
     volumes:
-      - ${MCP_PROJECT_DIR:-.}/resource:/opt/modelintegrator/resource
-      - ${MCP_MODEL_DIR_HOST:-./resource/models}:${MCP_MODEL_ROOT_DIR:-/opt/modelintegrator/models}:ro
+      - ${MCP_PROJECT_DIR:-.}/resources:/opt/modelintegrator/resources
+      - ${MCP_MODEL_DIR_HOST:-./resources/models}:${MCP_MODEL_ROOT_DIR:-/opt/modelintegrator/models}:ro
       - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - mcp_net
@@ -45,7 +45,7 @@ services:
     command: -H unix:///var/run/docker.sock
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ${MCP_PROJECT_DIR:-.}/resource/portainer:/data
+      - ${MCP_PROJECT_DIR:-.}/resources/portainer:/data
     networks:
       - mcp_net
     restart: unless-stopped
@@ -58,8 +58,8 @@ services:
     environment:
       TZ: ${TZ:-UTC}
     volumes:
-      - ${MCP_PROJECT_DIR:-.}/resource/nginx-ui:/etc/nginx-ui
-      - ${MCP_PROJECT_DIR:-.}/resource/nginx:/etc/nginx/conf.d
+      - ${MCP_PROJECT_DIR:-.}/resources/nginx-ui:/etc/nginx-ui
+      - ${MCP_PROJECT_DIR:-.}/resources/nginx:/etc/nginx/conf.d
     networks:
       - mcp_net
     restart: unless-stopped
@@ -71,7 +71,7 @@ services:
       - addons
     command: ["--host", "0.0.0.0", "--port", "4000", "--config", "/app/config.yaml"]
     volumes:
-      - ${MCP_PROJECT_DIR:-.}/resource/litellm/config.yaml:/app/config.yaml:ro
+      - ${MCP_PROJECT_DIR:-.}/resources/litellm/config.yaml:/app/config.yaml:ro
     networks:
       - mcp_net
     restart: unless-stopped
@@ -86,7 +86,78 @@ services:
       ENABLE_OLLAMA_API: "False"
       OPENAI_API_BASE_URL: ${OPENAI_API_BASE_URL:-http://litellm:4000}
     volumes:
-      - ${MCP_PROJECT_DIR:-.}/resource/openwebui:/app/backend/data
+      - ${MCP_PROJECT_DIR:-.}/resources/openwebui:/app/backend/data
+    networks:
+      - mcp_net
+    restart: unless-stopped
+
+  # Download 功能容器（仅在具备 docker 的主节点场景下启用）
+  hf-downloader:
+    image: python:3.11-alpine
+    container_name: mcp-hf-downloader
+    profiles:
+      - download
+    environment:
+      HF_HOME: ${MCP_HF_CACHE_DIR:-/data/hf-cache}
+      TZ: ${TZ:-UTC}
+    command: ["/bin/sh", "-lc", "pip install --no-cache-dir -U huggingface_hub && sleep infinity"]
+    volumes:
+      - ${MCP_MODEL_DIR_HOST:-./resources/models}:/models
+      - ${MCP_PROJECT_DIR:-.}/resources/download-cache/hf:/data/hf-cache
+    networks:
+      - mcp_net
+    restart: unless-stopped
+
+  aria2-downloader:
+    image: p3terx/aria2-pro:latest
+    container_name: mcp-aria2-downloader
+    profiles:
+      - download
+    environment:
+      RPC_SECRET: ${MCP_ARIA2_RPC_SECRET:-change-me}
+      RPC_PORT: ${MCP_ARIA2_RPC_PORT:-6800}
+      LISTEN_PORT: ${MCP_ARIA2_LISTEN_PORT:-6888}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ${MCP_MODEL_DIR_HOST:-./resources/models}:/downloads
+      - ${MCP_PROJECT_DIR:-.}/resources/download-cache/aria2-config:/config
+    networks:
+      - mcp_net
+    restart: unless-stopped
+
+  # vLLM 运行模板（NVIDIA GPU，未来用于按模型实例化）
+  vllm-runtime:
+    image: vllm/vllm-openai:latest
+    container_name: mcp-vllm-runtime
+    profiles:
+      - vllm
+    environment:
+      HF_HOME: ${MCP_HF_CACHE_DIR:-/data/hf-cache}
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+      TZ: ${TZ:-UTC}
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --model
+      - ${MCP_VLLM_MODEL:-Qwen/Qwen2.5-7B-Instruct}
+      - --download-dir
+      - /models
+      - --served-model-name
+      - ${MCP_VLLM_SERVED_MODEL_NAME:-qwen2.5-7b-instruct}
+      - --gpu-memory-utilization
+      - ${MCP_VLLM_GPU_MEMORY_UTILIZATION:-0.90}
+      - --max-model-len
+      - ${MCP_VLLM_MAX_MODEL_LEN:-8192}
+    ports:
+      - "${MCP_VLLM_EXTERNAL_PORT:-58000}:8000"
+    volumes:
+      - ${MCP_MODEL_DIR_HOST:-./resources/models}:/models
+      - ${MCP_PROJECT_DIR:-.}/resources/download-cache/hf:/data/hf-cache
+    gpus: all
+    ipc: host
+    shm_size: "8g"
     networks:
       - mcp_net
     restart: unless-stopped

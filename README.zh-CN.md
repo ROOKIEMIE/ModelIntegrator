@@ -8,12 +8,16 @@ ModelIntegrator 是一个本地多节点 LLM 控制平面，用于统一管理 L
 ## 当前实现摘要
 
 - 控制平面后端（Go）+ 统一 REST API + 静态 Web 控制台
-- Web UI 双栏布局：左侧节点列表，右侧模型列表
+- Web UI 顶层双页签：`Runtime` / `Download`
+  - `Runtime` 页签：包含子页签 `List` / `Template`
+    - `List`：左侧节点列表 + 右侧模型列表
+    - `Template`：Runtime Template 列表与自定义模板校验/注册
+  - `Download` 页签：当前空白预留页
 - 节点列表与模型状态已联动：
   - 节点卡片显示 Runtime 数量、已装载模型数、Runtime 状态摘要
   - 模型标签页显示每个节点已装载模型数（`Main (N)` / `Sub1 (N)`）
 - 模型列表支持按节点标签切换，默认显示第一个节点
-- Docker Compose 编排（`nginx` 网关 + `model-integrator`，其余组件作为 `addons`）
+- Docker Compose 编排（`nginx` 网关 + `model-integrator`，其余组件作为 `addons` / `download` / `vllm` profile）
 
 - LM Studio 适配器：
   - 查询模型列表优先 `GET /api/v1/models`，兼容回退 `GET /v1/models`
@@ -48,8 +52,18 @@ ModelIntegrator 是一个本地多节点 LLM 控制平面，用于统一管理 L
 - 前端动作差异：
   - `backend_type=lmstudio` 的模型仅展示 `load/unload`
   - 其他后端保持 `load/unload/start/stop`
+- 运行时模板扩展：
+  - 内置模板：`docker-generic`、`vllm-openai`
+  - 支持用户提交自定义模板并进行后端校验与注册（Runtime -> Template）
+  - Docker/Portainer 模型动作前会校验模板绑定是否合法
 
-- Docker/Portainer 适配器目前仍是 placeholder
+- Docker/Portainer 适配器已接入真实容器编排调用（Docker Engine API / Portainer Docker Proxy）
+- 下载容器支持（`download` profile）：
+  - `hf-downloader`
+  - `aria2-downloader`
+- vLLM 运行模板容器（`vllm` profile）：
+  - `vllm-runtime`（NVIDIA GPU，未来用于模型实例化）
+- 下载功能当前仅面向“主节点且具备 docker 能力”的部署场景
 - 提供一键启动脚本
 
 ## 从 0 开始部署
@@ -64,10 +78,10 @@ cd /tank/docker_data/model_intergrator
 ```
 
 ```bash
-cp resource/docker/compose.example.env .env
-mkdir -p resource/config resource/models
-touch resource/config/modelintegrator.db
-chmod 666 resource/config/modelintegrator.db
+cp resources/docker/compose.example.env .env
+mkdir -p resources/config resources/models
+touch resources/config/modelintegrator.db
+chmod 666 resources/config/modelintegrator.db
 ```
 
 ```bash
@@ -76,6 +90,18 @@ chmod 666 resource/config/modelintegrator.db
 
 # 启动核心 + addons
 ./scripts/one-click-up.sh --addons
+
+# 启动核心 + 下载容器
+./scripts/one-click-up.sh --download
+
+# 启动核心 + addons + 下载容器
+./scripts/one-click-up.sh --addons --download
+
+# 启动核心 + vLLM 模板容器
+./scripts/one-click-up.sh --vllm
+
+# 启动核心 + addons + 下载容器 + vLLM 模板容器
+./scripts/one-click-up.sh --addons --download --vllm
 ```
 
 验证：
@@ -96,10 +122,10 @@ curl -sS http://127.0.0.1:59081/api/v1/nodes
 
 - 编排：`docker-compose.yml`
 - 构建：`Dockerfile`
-- 控制平面配置：`resource/config/config.example.yaml`
-- Compose 环境变量：`resource/docker/compose.example.env`
-- 网关配置：`resource/nginx/nginx.example.conf`
-- 前端：`resource/web/index.html` / `app.css` / `app.js`
+- 控制平面配置：`resources/config/config.example.yaml`
+- Compose 环境变量：`resources/docker/compose.example.env`
+- 网关配置：`resources/nginx/nginx.example.conf`
+- 前端：`resources/web/index.html` / `app.css` / `app.js`
 - 一键脚本：`scripts/one-click-up.sh` / `scripts/one-click-down.sh`
 - 变更日志：`doc/LOG.md`
 
@@ -107,13 +133,23 @@ curl -sS http://127.0.0.1:59081/api/v1/nodes
 
 - `MCP_EXTERNAL_PORT`：外部网关端口（默认 `59081`）
 - `MCP_SQLITE_PATH`：SQLite 文件路径
-- `MCP_MODEL_DIR_HOST`：宿主机模型目录（默认 `./resource/models`）
+- `MCP_MODEL_DIR_HOST`：宿主机模型目录（默认 `./resources/models`）
 - `MCP_MODEL_ROOT_DIR`：容器内模型目录（默认 `/opt/modelintegrator/models`）
 - `MCP_LMSTUDIO_ENDPOINT`：LM Studio 地址
 - `MCP_LMSTUDIO_CACHE_ENABLED`：是否启用 LM Studio 模型缓存
 - `MCP_LMSTUDIO_CACHE_REFRESH_SECONDS`：缓存刷新间隔秒数
 - `MCP_DOCKER_ENDPOINT`：Docker endpoint（用于 docker runtime 与 GPU 探测回退）
 - `MCP_GPU_PROBE_IMAGE`：Docker GPU 探针镜像（可选，默认 `nvidia/cuda:12.4.1-base-ubuntu22.04`）
+- `MCP_HF_CACHE_DIR`：HF 下载缓存目录（download profile）
+- `MCP_ARIA2_RPC_SECRET`：aria2 RPC 密钥（download profile）
+- `MCP_ARIA2_RPC_PORT`：aria2 RPC 端口（download profile）
+- `MCP_ARIA2_LISTEN_PORT`：aria2 下载监听端口（download profile）
+- `MCP_VLLM_EXTERNAL_PORT`：vLLM 对外端口（vllm profile）
+- `MCP_VLLM_MODEL`：vLLM 默认模型（支持 Hugging Face repo id 或本地目录）
+- `MCP_VLLM_SERVED_MODEL_NAME`：vLLM 对外服务模型名
+- `MCP_VLLM_GPU_MEMORY_UTILIZATION`：vLLM GPU 显存占用上限
+- `MCP_VLLM_MAX_MODEL_LEN`：vLLM 最大上下文长度
+- `HUGGING_FACE_HUB_TOKEN`：访问私有/gated 模型用 token（可选）
 
 ## nodes 配置说明（重要）
 
@@ -129,6 +165,55 @@ curl -sS http://127.0.0.1:59081/api/v1/nodes
 - 模型卸载：优先请求 `POST /api/v1/models/unload`，并优先使用 `instance_id`。
 - 若对端版本只支持旧路径，会自动回退到 `/v1/models/*`。
 
+## Download 功能说明（当前阶段）
+
+- Download 页面当前为空白预留页（后续用于模型下载任务编排 UI）。
+- 容器下载能力通过 compose `download` profile 启用。
+- `hf-downloader` 可直接下载 vLLM 所需的 Hugging Face 模型权重（如 safetensors）。
+- `aria2-downloader` 用于直链文件下载（如模型分片或镜像文件）。
+- 该能力当前仅在“主节点且存在 docker runtime”的部署场景下支持。
+- 若后续扩展到非 docker 平台，将按平台能力单独设计下载路径与适配器。
+
+## vLLM 容器说明（新增）
+
+- compose 提供 `vllm` profile 下的 `vllm-runtime` 模板容器。
+- 仅适用于“主节点 + Docker + NVIDIA Container Toolkit”场景。
+- 默认会将模型下载/读取目录指向 `./resources/models`，并复用 HF cache。
+
+## 运行时模板扩展（新增）
+
+- 配置文件可直接提供模板：`runtime_templates: []`。
+- 后端会先校验模板，再允许注册为可用模板。
+- 本地扫描的 docker 模型默认绑定模板：`docker-generic`（可在模型 metadata 中覆盖 `runtime_template_id`）。
+- 控制台入口：`Runtime` 页签下 `Template` 子页签。
+
+接口：
+
+- `GET /api/v1/runtime-templates`：列出所有模板（builtin/config/custom）。
+- `POST /api/v1/runtime-templates/validate`：校验模板定义。
+- `POST /api/v1/runtime-templates`：注册模板（校验通过后写入内存注册表）。
+
+示例请求：
+
+```json
+{
+  "id": "vllm-qwen-7b",
+  "name": "vLLM Qwen 7B",
+  "runtime_type": "docker",
+  "image": "vllm/vllm-openai:latest",
+  "command": ["--host", "0.0.0.0", "--port", "8000", "--model", "Qwen/Qwen2.5-7B-Instruct"],
+  "volumes": ["./resources/models:/models", "./resources/download-cache/hf:/data/hf-cache"],
+  "ports": ["58000:8000"],
+  "env": {"HF_HOME": "/data/hf-cache"},
+  "needs_gpu": true
+}
+```
+
+## 路线说明（已确认）
+
+- Docker/Portainer 适配器：先聚焦 NVIDIA GPU 场景，后续扩展其他硬件。
+- SQLite：下一阶段接入模型/节点状态持久化读写（当前仅路径预备）。
+
 ## API
 
 - `GET /healthz`
@@ -140,3 +225,6 @@ curl -sS http://127.0.0.1:59081/api/v1/nodes
 - `POST /api/v1/models/{id}/unload`
 - `POST /api/v1/models/{id}/start`
 - `POST /api/v1/models/{id}/stop`
+- `GET /api/v1/runtime-templates`
+- `POST /api/v1/runtime-templates/validate`
+- `POST /api/v1/runtime-templates`

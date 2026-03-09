@@ -31,6 +31,9 @@ func NewRouter(h *Handler, staticDir string, logger *slog.Logger) http.Handler {
 		r.Post("/models/{id}/unload", h.UnloadModel)
 		r.Post("/models/{id}/start", h.StartModel)
 		r.Post("/models/{id}/stop", h.StopModel)
+		r.Get("/runtime-templates", h.ListRuntimeTemplates)
+		r.Post("/runtime-templates/validate", h.ValidateRuntimeTemplate)
+		r.Post("/runtime-templates", h.RegisterRuntimeTemplate)
 	})
 
 	if staticDir == "" {

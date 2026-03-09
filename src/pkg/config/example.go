@@ -2,7 +2,7 @@ package config
 
 const ExampleConfigYAML = `server:
   address: ":8080"
-  static_dir: "./resource/web"
+  static_dir: "./resources/web"
   read_timeout_seconds: 15
   write_timeout_seconds: 30
   shutdown_timeout_seconds: 10
@@ -12,8 +12,8 @@ log:
   format: "text"
 
 storage:
-  sqlite_path: "./resource/config/modelintegrator.db"
-  model_root_dir: "./resource/models"
+  sqlite_path: "./resources/config/modelintegrator.db"
+  model_root_dir: "./resources/models"
 
 auth:
   token: ""
@@ -36,4 +36,5 @@ integrations:
 
 nodes: []
 models: []
+runtime_templates: []
 `
