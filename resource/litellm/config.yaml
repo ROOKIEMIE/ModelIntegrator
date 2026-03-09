@@ -1,0 +1,5 @@
+# LiteLLM 最小配置占位，可按需替换为真实模型路由
+model_list: []
+
+litellm_settings:
+  set_verbose: false

@@ -1,0 +1,86 @@
+server:
+  address: ":8080"
+  static_dir: "./resource/web"
+  read_timeout_seconds: 15
+  write_timeout_seconds: 30
+  shutdown_timeout_seconds: 10
+
+log:
+  level: "info"
+  format: "text"
+
+storage:
+  sqlite_path: "./resource/config/modelintegrator.db"
+
+auth:
+  token: "change-me-if-needed"
+
+integrations:
+  lmstudio:
+    enabled: true
+    endpoint: "http://192.168.50.241:1234"
+    token: ""
+  docker:
+    enabled: true
+    endpoint: "unix:///var/run/docker.sock"
+    token: ""
+  portainer:
+    enabled: true
+    endpoint: "http://portainer:9000"
+    token: ""
+
+nodes:
+  - id: "linux-main"
+    name: "Linux Server"
+    type: "linux"
+    host: "192.168.50.102"
+    status: "online"
+    last_seen_at: "2026-03-09T00:00:00Z"
+    runtimes:
+      - id: "docker-default"
+        type: "docker"
+        endpoint: "unix:///var/run/docker.sock"
+        enabled: true
+      - id: "portainer-default"
+        type: "portainer"
+        endpoint: "http://portainer:9000"
+        enabled: true
+
+  - id: "mac-mini"
+    name: "Mac mini M4 Pro"
+    type: "mac"
+    host: "192.168.50.241"
+    status: "online"
+    last_seen_at: "2026-03-09T00:00:00Z"
+    runtimes:
+      - id: "lmstudio-default"
+        type: "lmstudio"
+        endpoint: "http://192.168.50.241:1234"
+        enabled: true
+
+models:
+  - id: "qwen2.5-14b-instruct"
+    name: "Qwen2.5 14B Instruct"
+    provider: "local"
+    backend_type: "lmstudio"
+    host_node_id: "mac-mini"
+    runtime_id: "lmstudio-default"
+    endpoint: "http://192.168.50.241:1234"
+    state: "unknown"
+    context_length: 32768
+    metadata:
+      mutex_group: "mac-memory-heavy"
+      priority: "10"
+
+  - id: "llama3.1-8b-linux"
+    name: "Llama 3.1 8B Linux"
+    provider: "local"
+    backend_type: "docker"
+    host_node_id: "linux-main"
+    runtime_id: "docker-default"
+    endpoint: "http://192.168.50.102:8001"
+    state: "stopped"
+    context_length: 8192
+    metadata:
+      mutex_group: "linux-gpu-24g"
+      priority: "5"

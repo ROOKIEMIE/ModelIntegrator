@@ -1,0 +1,92 @@
+services:
+  nginx:
+    image: nginx:1.28-alpine
+    container_name: mcp-nginx
+    depends_on:
+      - model-integrator
+    ports:
+      - "${MCP_EXTERNAL_PORT:-59081}:80"
+    volumes:
+      - ${MCP_PROJECT_DIR:-.}/resource/nginx/nginx.example.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - mcp_net
+    restart: unless-stopped
+
+  model-integrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: model-integrator
+    environment:
+      MCP_CONFIG: /opt/modelintegrator/resource/config/config.example.yaml
+      MCP_SERVER_ADDRESS: ":8080"
+      MCP_LOG_LEVEL: ${MCP_LOG_LEVEL:-info}
+      MCP_LOG_FORMAT: ${MCP_LOG_FORMAT:-text}
+      MCP_SQLITE_PATH: ${MCP_SQLITE_PATH:-/opt/modelintegrator/resource/config/modelintegrator.db}
+      MCP_LMSTUDIO_ENDPOINT: ${MCP_LMSTUDIO_ENDPOINT:-http://192.168.50.241:1234}
+      MCP_DOCKER_ENDPOINT: ${MCP_DOCKER_ENDPOINT:-unix:///var/run/docker.sock}
+      MCP_PORTAINER_ENDPOINT: ${MCP_PORTAINER_ENDPOINT:-http://portainer:9000}
+    volumes:
+      - ${MCP_PROJECT_DIR:-.}/resource:/opt/modelintegrator/resource
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - mcp_net
+    restart: unless-stopped
+
+  portainer:
+    image: portainer/portainer-ce:2.21.5
+    container_name: mcp-portainer
+    profiles:
+      - addons
+    command: -H unix:///var/run/docker.sock
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${MCP_PROJECT_DIR:-.}/resource/portainer:/data
+    networks:
+      - mcp_net
+    restart: unless-stopped
+
+  nginx-ui:
+    image: uozi/nginx-ui:latest
+    container_name: mcp-nginx-ui
+    profiles:
+      - addons
+    environment:
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ${MCP_PROJECT_DIR:-.}/resource/nginx-ui:/etc/nginx-ui
+      - ${MCP_PROJECT_DIR:-.}/resource/nginx:/etc/nginx/conf.d
+    networks:
+      - mcp_net
+    restart: unless-stopped
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    container_name: mcp-litellm
+    profiles:
+      - addons
+    command: ["--host", "0.0.0.0", "--port", "4000", "--config", "/app/config.yaml"]
+    volumes:
+      - ${MCP_PROJECT_DIR:-.}/resource/litellm/config.yaml:/app/config.yaml:ro
+    networks:
+      - mcp_net
+    restart: unless-stopped
+
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: mcp-openwebui
+    profiles:
+      - addons
+    environment:
+      WEBUI_AUTH: "False"
+      ENABLE_OLLAMA_API: "False"
+      OPENAI_API_BASE_URL: ${OPENAI_API_BASE_URL:-http://litellm:4000}
+    volumes:
+      - ${MCP_PROJECT_DIR:-.}/resource/openwebui:/app/backend/data
+    networks:
+      - mcp_net
+    restart: unless-stopped
+
+networks:
+  mcp_net:
+    driver: bridge

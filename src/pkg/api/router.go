@@ -1,0 +1,71 @@
+package api
+
+import (
+	"io"
+	"log/slog"
+	"net/http"
+	"path/filepath"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+)
+
+func NewRouter(h *Handler, staticDir string, logger *slog.Logger) http.Handler {
+	r := chi.NewRouter()
+
+	r.Use(middleware.RequestID)
+	r.Use(middleware.RealIP)
+	r.Use(middleware.Recoverer)
+	r.Use(middleware.Timeout(60 * time.Second))
+	r.Use(requestLogger(logger))
+
+	r.Get("/healthz", h.Healthz)
+
+	r.Route("/api/v1", func(r chi.Router) {
+		r.Get("/version", h.GetVersion)
+		r.Get("/nodes", h.ListNodes)
+		r.Get("/models", h.ListModels)
+		r.Get("/models/{id}", h.GetModel)
+		r.Post("/models/{id}/load", h.LoadModel)
+		r.Post("/models/{id}/unload", h.UnloadModel)
+		r.Post("/models/{id}/start", h.StartModel)
+		r.Post("/models/{id}/stop", h.StopModel)
+	})
+
+	if staticDir == "" {
+		r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.WriteString(w, "model-integrator is running")
+		})
+		return r
+	}
+
+	indexFile := filepath.Join(staticDir, "index.html")
+	cssFile := filepath.Join(staticDir, "app.css")
+	jsFile := filepath.Join(staticDir, "app.js")
+
+	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, indexFile)
+	})
+	r.Get("/console", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, indexFile)
+	})
+	r.Get("/app.css", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, cssFile)
+	})
+	r.Get("/app.js", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, jsFile)
+	})
+
+	return r
+}
+
+func requestLogger(logger *slog.Logger) func(next http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			next.ServeHTTP(w, r)
+			logger.Info("http_request", "method", r.Method, "path", r.URL.Path, "elapsed", time.Since(start).String())
+		})
+	}
+}
