@@ -23,11 +23,15 @@ services:
       MCP_LOG_LEVEL: ${MCP_LOG_LEVEL:-info}
       MCP_LOG_FORMAT: ${MCP_LOG_FORMAT:-text}
       MCP_SQLITE_PATH: ${MCP_SQLITE_PATH:-/opt/modelintegrator/resource/config/modelintegrator.db}
+      MCP_MODEL_ROOT_DIR: ${MCP_MODEL_ROOT_DIR:-/opt/modelintegrator/models}
       MCP_LMSTUDIO_ENDPOINT: ${MCP_LMSTUDIO_ENDPOINT:-http://192.168.50.241:1234}
+      MCP_LMSTUDIO_CACHE_ENABLED: ${MCP_LMSTUDIO_CACHE_ENABLED:-true}
+      MCP_LMSTUDIO_CACHE_REFRESH_SECONDS: ${MCP_LMSTUDIO_CACHE_REFRESH_SECONDS:-30}
       MCP_DOCKER_ENDPOINT: ${MCP_DOCKER_ENDPOINT:-unix:///var/run/docker.sock}
       MCP_PORTAINER_ENDPOINT: ${MCP_PORTAINER_ENDPOINT:-http://portainer:9000}
     volumes:
       - ${MCP_PROJECT_DIR:-.}/resource:/opt/modelintegrator/resource
+      - ${MCP_MODEL_DIR_HOST:-./resource/models}:${MCP_MODEL_ROOT_DIR:-/opt/modelintegrator/models}:ro
       - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - mcp_net

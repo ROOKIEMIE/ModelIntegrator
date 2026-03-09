@@ -82,3 +82,31 @@ func (r *ModelRegistry) Upsert(m model.Model) {
 	defer r.mu.Unlock()
 	r.models[m.ID] = m
 }
+
+func (r *ModelRegistry) ReplaceByBackend(backend model.RuntimeType, items []model.Model) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for id, m := range r.models {
+		if m.BackendType == backend {
+			delete(r.models, id)
+		}
+	}
+	for _, m := range items {
+		r.models[m.ID] = m
+	}
+}
+
+func (r *ModelRegistry) ReplaceBySource(source string, items []model.Model) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for id, m := range r.models {
+		if m.Metadata != nil && m.Metadata["source"] == source {
+			delete(r.models, id)
+		}
+	}
+	for _, m := range items {
+		r.models[m.ID] = m
+	}
+}

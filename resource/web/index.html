@@ -9,27 +9,21 @@
   <body>
     <header>
       <h1>ModelIntegrator（MVP）</h1>
-      <p>本地多节点模型管理控制台占位页</p>
+      <p>本地多节点模型管理控制台</p>
     </header>
 
     <main>
-      <section class="panel">
+      <section class="panel panel-nodes">
         <h2>节点列表</h2>
         <div id="nodes">加载中...</div>
       </section>
 
-      <section class="panel">
+      <section class="panel panel-models">
         <h2>模型列表</h2>
+        <div id="model-tabs" class="tabs"></div>
         <div id="models">加载中...</div>
       </section>
     </main>
-
-    <template id="model-actions-template">
-      <button data-action="load">Load</button>
-      <button data-action="unload">Unload</button>
-      <button data-action="start">Start</button>
-      <button data-action="stop">Stop</button>
-    </template>
 
     <script src="/app.js"></script>
   </body>

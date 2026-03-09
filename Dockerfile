@@ -18,5 +18,4 @@ COPY resource /opt/modelintegrator/resource
 EXPOSE 8080
 ENV MCP_CONFIG=/opt/modelintegrator/resource/config/config.example.yaml
 
-USER app
 CMD ["/opt/modelintegrator/model-integrator"]

@@ -13,6 +13,7 @@ log:
 
 storage:
   sqlite_path: "./resource/config/modelintegrator.db"
+  model_root_dir: "./resource/models"
 
 auth:
   token: ""
@@ -22,6 +23,8 @@ integrations:
     enabled: true
     endpoint: "http://192.168.50.241:1234"
     token: ""
+    cache_enabled: true
+    cache_refresh_seconds: 30
   docker:
     enabled: true
     endpoint: "unix:///var/run/docker.sock"

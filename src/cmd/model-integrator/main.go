@@ -32,12 +32,19 @@ func main() {
 
 	log := logger.New(cfg.Log.Level, cfg.Log.Format)
 	log.Info("配置加载成功", "path", cfg.SourcePath)
-	preflight.LogGPUReport(log, preflight.DetectGPU(context.Background()))
+	gpuReport := preflight.DetectGPU(context.Background(), resolveDockerProbeEndpoint(cfg))
+	preflight.LogGPUReport(log, gpuReport)
+	applyNodePlatformInfo(cfg, gpuReport)
 
 	if err := storage.EnsureSQLitePath(cfg.Storage.SQLitePath); err != nil {
 		log.Warn("SQLite 路径准备失败", "path", cfg.Storage.SQLitePath, "error", err)
 	} else {
 		log.Info("SQLite 路径准备完成", "path", cfg.Storage.SQLitePath)
+	}
+	if err := storage.EnsureDirectory(cfg.Storage.ModelRootDir); err != nil {
+		log.Warn("模型目录检查失败", "path", cfg.Storage.ModelRootDir, "error", err)
+	} else {
+		log.Info("模型目录就绪", "path", cfg.Storage.ModelRootDir)
 	}
 
 	nodeRegistry := registry.NewNodeRegistry(cfg.Nodes)
@@ -51,11 +58,15 @@ func main() {
 	}
 
 	adapterManager := adapter.NewManager()
-	adapterManager.Register(model.RuntimeTypeLMStudio, lmstudio.NewAdapter(
+	lmstudioAdapter := lmstudio.NewAdapter(
 		cfg.Integrations.LMStudio.Endpoint,
 		cfg.Integrations.LMStudio.Token,
 		15*time.Second,
-	))
+		cfg.Integrations.LMStudio.CacheEnabled,
+		time.Duration(cfg.Integrations.LMStudio.CacheRefreshSeconds)*time.Second,
+	)
+	adapterManager.Register(model.RuntimeTypeLMStudio, lmstudioAdapter)
+	lmstudioAdapter.StartCacheSync()
 	adapterManager.Register(model.RuntimeTypeDocker, dockerctl.NewAdapter(
 		"dockerctl",
 		cfg.Integrations.Docker.Endpoint,
@@ -68,7 +79,7 @@ func main() {
 	))
 
 	nodeService := service.NewNodeService(nodeRegistry)
-	modelService := service.NewModelService(modelRegistry, nodeRegistry, schedulerInstance, adapterManager, log)
+	modelService := service.NewModelService(modelRegistry, nodeRegistry, schedulerInstance, adapterManager, log, cfg.Storage.ModelRootDir)
 
 	handler := api.NewHandler(nodeService, modelService, log, version.Get())
 	router := api.NewRouter(handler, cfg.Server.StaticDir, log)
@@ -77,6 +88,7 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	modelService.StartAutoRefresh(ctx, time.Duration(cfg.Integrations.LMStudio.CacheRefreshSeconds)*time.Second)
 
 	if err := httpServer.Start(ctx); err != nil {
 		log.Error("服务退出", "error", err)
@@ -84,4 +96,54 @@ func main() {
 	}
 
 	log.Info("服务已安全退出")
+}
+
+func applyNodePlatformInfo(cfg *config.Config, report preflight.GPUReport) {
+	for i := range cfg.Nodes {
+		node := &cfg.Nodes[i]
+		node.Platform = model.PlatformInfo{
+			Accelerator: "unknown",
+			GPU:         "unknown",
+			CUDAVersion: "unknown",
+			Driver:      "unknown",
+		}
+
+		if !hasEnabledRuntime(node, model.RuntimeTypeDocker) {
+			continue
+		}
+
+		if report.CUDAAvailable {
+			node.Platform.Accelerator = "nvidia-cuda"
+			if report.GPUName != "" {
+				node.Platform.GPU = report.GPUName
+			}
+			if report.CUDAVersion != "" {
+				node.Platform.CUDAVersion = report.CUDAVersion
+			}
+			if report.DriverVersion != "" {
+				node.Platform.Driver = report.DriverVersion
+			}
+		}
+	}
+}
+
+func hasEnabledRuntime(node *model.Node, runtimeType model.RuntimeType) bool {
+	for _, rt := range node.Runtimes {
+		if rt.Type == runtimeType && rt.Enabled {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveDockerProbeEndpoint(cfg *config.Config) string {
+	for i := range cfg.Nodes {
+		node := cfg.Nodes[i]
+		for _, rt := range node.Runtimes {
+			if rt.Type == model.RuntimeTypeDocker && rt.Enabled && rt.Endpoint != "" {
+				return rt.Endpoint
+			}
+		}
+	}
+	return cfg.Integrations.Docker.Endpoint
 }

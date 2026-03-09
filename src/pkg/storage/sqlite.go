@@ -28,3 +28,13 @@ func EnsureSQLitePath(path string) error {
 
 	return nil
 }
+
+func EnsureDirectory(path string) error {
+	if path == "" {
+		return fmt.Errorf("目录路径为空")
+	}
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return fmt.Errorf("创建目录失败 (%s): %w", path, err)
+	}
+	return nil
+}

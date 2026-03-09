@@ -17,6 +17,13 @@ const (
 	NodeStatusOffline NodeStatus = "offline"
 )
 
+type NodeRole string
+
+const (
+	NodeRoleMain NodeRole = "main"
+	NodeRoleSub  NodeRole = "sub"
+)
+
 type RuntimeType string
 
 const (
@@ -37,14 +44,24 @@ const (
 )
 
 type Node struct {
-	ID         string      `json:"id" yaml:"id"`
-	Name       string      `json:"name" yaml:"name"`
-	Type       NodeType    `json:"type" yaml:"type"`
-	Host       string      `json:"host" yaml:"host"`
-	Status     NodeStatus  `json:"status" yaml:"status"`
-	Runtimes   []Runtime   `json:"runtimes" yaml:"runtimes"`
-	LastSeenAt time.Time   `json:"last_seen_at" yaml:"last_seen_at"`
-	Metadata   interface{} `json:"metadata,omitempty" yaml:"metadata,omitempty"`
+	ID          string       `json:"id" yaml:"id"`
+	Name        string       `json:"name" yaml:"name"`
+	Description string       `json:"description,omitempty" yaml:"description,omitempty"`
+	Role        NodeRole     `json:"role" yaml:"role"`
+	Type        NodeType     `json:"type" yaml:"type"`
+	Host        string       `json:"host" yaml:"host"`
+	Status      NodeStatus   `json:"status" yaml:"status"`
+	Platform    PlatformInfo `json:"platform" yaml:"platform"`
+	Runtimes    []Runtime    `json:"runtimes" yaml:"runtimes"`
+	LastSeenAt  time.Time    `json:"last_seen_at" yaml:"last_seen_at"`
+	Metadata    interface{}  `json:"metadata,omitempty" yaml:"metadata,omitempty"`
+}
+
+type PlatformInfo struct {
+	Accelerator string `json:"accelerator" yaml:"accelerator"`
+	GPU         string `json:"gpu" yaml:"gpu"`
+	CUDAVersion string `json:"cuda_version" yaml:"cuda_version"`
+	Driver      string `json:"driver" yaml:"driver"`
 }
 
 type Runtime struct {
