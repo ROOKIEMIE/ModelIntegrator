@@ -11,7 +11,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 )
 
-func NewRouter(h *Handler, staticDir string, logger *slog.Logger) http.Handler {
+func NewRouter(h *Handler, staticDir, authToken string, logger *slog.Logger) http.Handler {
 	r := chi.NewRouter()
 
 	r.Use(middleware.RequestID)
@@ -23,6 +23,7 @@ func NewRouter(h *Handler, staticDir string, logger *slog.Logger) http.Handler {
 	r.Get("/healthz", h.Healthz)
 
 	r.Route("/api/v1", func(r chi.Router) {
+		r.Use(bearerAuthMiddleware(authToken, logger))
 		r.Get("/version", h.GetVersion)
 		r.Get("/nodes", h.ListNodes)
 		r.Get("/models", h.ListModels)
@@ -46,6 +47,8 @@ func NewRouter(h *Handler, staticDir string, logger *slog.Logger) http.Handler {
 	indexFile := filepath.Join(staticDir, "index.html")
 	cssFile := filepath.Join(staticDir, "app.css")
 	jsFile := filepath.Join(staticDir, "app.js")
+
+	// 静态资源暂不强制鉴权，便于控制台页面加载；API 通过 /api/v1 统一鉴权保护。
 
 	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, indexFile)

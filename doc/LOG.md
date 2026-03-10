@@ -1,5 +1,116 @@
 # 变更日志
 
+## 2026-03-10
+
+### v0.2-prep 架构演进定稿（controller + agent + runtime）
+
+- 背景
+  - 本条目由项目根目录 `LOG.md` 合并而来，作为当前阶段架构决策记录。
+
+- 1) 为什么从单控制面演进为 `controller + agent`
+  - 单控制面已能覆盖基础管理，但对异构节点可控性不一致。
+  - 从节点的本机能力（资源快照、本地目录、本机下载、本机容器）不应长期依赖中心直接操作。
+  - 采用中心控制 + 节点执行拆分后，可在不破坏现有控制面的前提下渐进增强。
+  - 结论：定稿为“controller + 可选 agent + 外部运行时分级接入”。
+
+- 2) 为什么资源感知不能做统一真相，而要做分级
+  - LM Studio、Ollama、vLLM、Docker 容器、纯服务进程的可观测性天然不同。
+  - 强行统一会制造“表面一致、实质不可控”的假象，影响调度和运维判断。
+  - 结论：采用能力分级并显式暴露边界：
+    - `runtime_managed`：以运行时动作结果与反馈为主
+    - `service_observed`：以健康和指标观测为主
+    - `agent_managed`：具备更强本机执行能力
+
+- 3) 为什么从节点 Docker 管理需要 agent
+  - 中央控制器不能假设天然可安全稳定地直管所有从节点 Docker。
+  - 远程直连 Docker 会放大网络暴露、安全边界与运维一致性风险。
+  - 结论：需要 Docker 级纳管时，由节点本机 agent 暴露能力并执行动作，controller 负责策略与编排。
+
+- 4) 为什么 agent 必须支持原生 + 容器双形态
+  - 仅容器部署会排斥无 Docker/Podman 节点。
+  - 仅原生部署又无法充分利用 Linux 容器化运维能力。
+  - 结论：双形态是覆盖 macOS/Windows/Linux 异构节点的必要条件：
+    - 原生二进制优先
+    - 容器版可选
+
+- 5) 为什么前端从“单层节点列表”演进为“节点 + runtime + capability”
+  - 混合节点常态下，节点层“在线/离线”不足以表达可执行能力。
+  - 前端必须显示 runtime 级能力，避免误导为“所有节点能力等价”。
+  - 目标展示模型：
+    - 节点卡片：分类、agent 状态、能力来源、心跳
+    - 节点内 runtime 列表：类型、endpoint、能力、动作
+    - 分级能力文案：观测级/运行时反馈级/增强纳管级
+
+- 6) 为什么混合节点必须视为常态
+  - 生产与实验环境通常并存 Docker、LM Studio、Ollama、vLLM 等多运行时。
+  - 节点是宿主抽象，runtime 才是能力单元。
+  - 结论：调度目标应尽量落在“节点上的 runtime”，而非仅落在抽象节点。
+
+- 7) 为什么 llmfit 采用“agent 托管二进制 + 本地 HTTP 调用”
+  - 源码级嵌入/FFI 会显著提高构建复杂度与跨平台维护成本。
+  - llmfit 已具备可复用的进程/服务能力，最稳妥方案是托管进程 + 本地调用。
+  - 定稿方案：
+    - agent 附带 llmfit 二进制
+    - agent 优先托管 `llmfit serve`
+    - agent 通过 loopback HTTP 调用
+    - agent 退出时主动回收子进程
+    - 必要时保留 CLI fallback
+
+- 8) 下一阶段方向与未完成事项
+  - 结构上保持过渡兼容并新增双入口：
+    - `src/cmd/controller`
+    - `src/cmd/agent`
+    - 保留 `src/cmd/model-integrator` 作为过渡入口
+  - 将节点分类与能力分级写入 API 模型与前端数据结构。
+  - 建立 controller<->agent 最小注册、心跳、能力上报链路。
+  - 在 agent 落地 llmfit managed serve 与健康管理。
+  - 当前明确不做：完整 agent、复杂分布式通信、完整下载分发、复杂资源估算引擎。
+
+### v0.2-prep 管理边界原则与实现概述
+
+- 管理边界原则（后续迭代约束）
+  - 系统仅管理“当前系统模型清单中的受管模型容器”。
+  - 不干涉已有、已启动的外部容器（无论是否运行模型）。
+  - 若发现同名外部容器，系统应拒绝接管并返回冲突错误，而非停止/删除该容器。
+
+- 当前实现概述（截至本次修复）
+  - 控制面：Go 后端 + REST API + Web 控制台（Runtime/Download 页签）
+  - Runtime 模型控制：支持 `load/unload/start/stop`，并区分 `lmstudio` 与 `docker/portainer` 动作矩阵
+  - 容器后端：Docker/Portainer 适配器已接入真实容器编排 API，支持容器创建、启动、停止、卸载与状态查询
+  - 模型来源：支持本地模型目录扫描（`resources/models`）与 LM Studio 刷新
+  - 模板体系：支持 builtin/config/custom Runtime Template 校验与注册，并在容器动作前执行模板解析与校验
+  - 停机回收：`one-click-down` 会清理系统受管模型容器并下线控制面
+
+- 下一阶段开发共识
+  - 优先推进 SQLite 持久化完整落地（模型状态、模板、动作记录、重启恢复）
+
+### v0.2-prep Docker 模型动作状态机修复
+
+- Docker/Portainer 模型按钮状态矩阵修复（`resources/web/app.js`）
+  - `stopped`: 仅 `load` 可用
+  - `loaded`: `unload/start` 可用
+  - `running`: `unload/stop` 可用
+  - `busy`: `unload/stop` 可用
+  - 其余动作按上述矩阵严格禁用，避免 `load/start` 错误同步
+  - 模型列表状态文案调整：容器后端 `stopped` 在 UI 中显示为 `unload`，页面主状态统一为 `unload/loaded/running`
+
+- 后端动作状态校验新增（`src/pkg/service/model_service.go`）
+  - 在 `ModelService.executeAction` 中新增 `docker/portainer` 严格状态校验
+  - 非法状态动作直接返回失败，不再调用适配器，防止通过 API 绕过前端限制
+  - `running/busy` 状态下执行 `unload` 时，先执行 `stop`，成功后再执行真实 `unload`
+  - 容器后端动作语义保持：`load->loaded`、`start->running`、`stop->loaded`、`unload->stopped`
+  - 新增容器状态对账刷新：以运行时实际状态同步模型状态（`exists=false -> stopped`，`exists=true/running=false -> loaded`，`running=true -> running`）
+
+- 单测补充与更新（`src/pkg/service/model_service_test.go`）
+  - `load` 测试更新为容器后端统一进入 `loaded`
+  - 新增容器动作状态矩阵测试
+  - 新增“`stopped` 状态下 `start` 被拒绝且不调用适配器”测试
+  - 新增“容器状态对账刷新”测试，覆盖 `running->loaded`、`missing->stopped` 与容器元信息清理
+
+- Docker/Portainer 适配器管理边界增强（`src/pkg/adapter/dockerctl/adapter.go`）
+  - 增加容器归属校验：仅操作带 `com.modelintegrator.managed=true` 且 `model_id` 匹配当前模型的容器
+  - 对同名非受管容器不再停止/删除，改为拒绝接管并返回冲突错误
+
 ## 2026-03-09
 
 ### v0.2-prep 前端页签分隔与模型元信息展示优化

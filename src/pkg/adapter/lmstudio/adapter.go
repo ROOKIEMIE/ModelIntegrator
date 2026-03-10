@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -17,6 +18,7 @@ type Adapter struct {
 	client               *Client
 	cacheEnabled         bool
 	cacheRefreshInterval time.Duration
+	logger               *slog.Logger
 
 	cacheMu        sync.RWMutex
 	cachedModels   []model.Model
@@ -32,6 +34,7 @@ func NewAdapter(endpoint, token string, timeout time.Duration, cacheEnabled bool
 		client:               NewClient(endpoint, token, timeout),
 		cacheEnabled:         cacheEnabled,
 		cacheRefreshInterval: cacheRefreshInterval,
+		logger:               slog.Default(),
 	}
 }
 
@@ -389,12 +392,16 @@ func (a *Adapter) startCacheLoop() {
 			defer ticker.Stop()
 
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			_ = a.refreshCache(ctx)
+			if err := a.refreshCache(ctx); err != nil {
+				a.logger.Warn("LM Studio 初始缓存刷新失败", "error", err)
+			}
 			cancel()
 
 			for range ticker.C {
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				_ = a.refreshCache(ctx)
+				if err := a.refreshCache(ctx); err != nil {
+					a.logger.Warn("LM Studio 周期缓存刷新失败", "error", err)
+				}
 				cancel()
 			}
 		}()
@@ -430,7 +437,9 @@ func (a *Adapter) refreshCacheAsync(timeout time.Duration) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
-		_ = a.refreshCache(ctx)
+		if err := a.refreshCache(ctx); err != nil {
+			a.logger.Warn("LM Studio 异步缓存刷新失败", "error", err)
+		}
 	}()
 }
 

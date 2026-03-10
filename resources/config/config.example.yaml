@@ -14,7 +14,7 @@ storage:
   model_root_dir: "./resources/models"
 
 auth:
-  token: "change-me-if-needed"
+  token: ""
 
 integrations:
   lmstudio:

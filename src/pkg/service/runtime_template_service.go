@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	DefaultDockerTemplateID = "docker-generic"
-	DefaultVLLMTemplateID   = "vllm-openai"
+	DefaultDockerTemplateID    = "docker-generic"
+	DefaultVLLMTemplateID      = "vllm-openai"
+	DefaultEmbeddingTemplateID = "tei-embedding"
 )
 
 var (
@@ -304,6 +305,24 @@ func builtinRuntimeTemplates() []model.RuntimeTemplate {
 			Source:   "builtin",
 			Metadata: map[string]string{
 				"category": "vllm",
+			},
+		},
+		{
+			ID:          DefaultEmbeddingTemplateID,
+			Name:        "TEI Embedding",
+			Description: "HuggingFace Text Embeddings Inference（CPU）模板，面向 embedding 模型快速验证",
+			RuntimeType: model.RuntimeTypeDocker,
+			Image:       "ghcr.io/huggingface/text-embeddings-inference:cpu-latest",
+			Command: []string{
+				"--model-id", "{{MODEL_PATH_CONTAINER}}",
+				"--port", "80",
+			},
+			Volumes:  []string{"./resources/models:/models:ro"},
+			Ports:    []string{"58001:80"},
+			NeedsGPU: false,
+			Source:   "builtin",
+			Metadata: map[string]string{
+				"category": "embedding",
 			},
 		},
 	}

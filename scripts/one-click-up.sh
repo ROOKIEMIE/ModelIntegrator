@@ -25,6 +25,29 @@ if grep -q "/opt/modelintegrator/resource/" .env || grep -q "\./resource/" .env;
   echo "[INFO] 已自动迁移 .env 中旧 resource 路径到 resources"
 fi
 
+if [ -S /var/run/docker.sock ]; then
+  DOCKER_SOCK_GID=""
+  if stat -c '%g' /var/run/docker.sock >/dev/null 2>&1; then
+    DOCKER_SOCK_GID="$(stat -c '%g' /var/run/docker.sock)"
+  elif stat -f '%g' /var/run/docker.sock >/dev/null 2>&1; then
+    DOCKER_SOCK_GID="$(stat -f '%g' /var/run/docker.sock)"
+  fi
+
+  if [ -n "$DOCKER_SOCK_GID" ]; then
+    if grep -q '^MCP_DOCKER_GID=' .env; then
+      sed -i "s/^MCP_DOCKER_GID=.*/MCP_DOCKER_GID=${DOCKER_SOCK_GID}/" .env
+    else
+      echo "MCP_DOCKER_GID=${DOCKER_SOCK_GID}" >> .env
+    fi
+    export MCP_DOCKER_GID="$DOCKER_SOCK_GID"
+    echo "[INFO] 已设置 MCP_DOCKER_GID=${DOCKER_SOCK_GID}（来自 /var/run/docker.sock）"
+  else
+    echo "[WARN] 无法识别 /var/run/docker.sock 的 GID，将使用 compose 默认值"
+  fi
+else
+  echo "[WARN] 未找到 /var/run/docker.sock，跳过 MCP_DOCKER_GID 自动设置"
+fi
+
 mkdir -p resources/config resources/models resources/download-cache/hf resources/download-cache/aria2-config
 
 touch resources/config/modelintegrator.db

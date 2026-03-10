@@ -21,6 +21,7 @@ const state = {
   activePage: "runtime",
   activeRuntimeTab: "list",
   nodeActionLocks: {},
+  apiToken: "",
 };
 
 function showToast(text) {
@@ -38,13 +39,40 @@ function showToast(text) {
 }
 
 async function requestJSON(url, options = {}) {
-  const resp = await fetch(url, options);
-  const payload = await resp.json();
+  const headers = new Headers(options.headers || {});
+  if (state.apiToken) {
+    headers.set("Authorization", `Bearer ${state.apiToken}`);
+  }
+
+  const resp = await fetch(url, {
+    ...options,
+    headers,
+  });
+
+  let payload = {};
+  try {
+    payload = await resp.json();
+  } catch (err) {
+    payload = {};
+  }
+
   if (!resp.ok || payload.success === false) {
+    if (resp.status === 401) {
+      throw new Error("未授权，请在 URL 添加 ?token=<api-token> 或设置 localStorage.mi_api_token");
+    }
     const msg = payload.message || `请求失败: ${resp.status}`;
     throw new Error(msg);
   }
   return payload.data;
+}
+
+function resolveAPIToken() {
+  const fromQuery = String(new URLSearchParams(window.location.search).get("token") || "").trim();
+  if (fromQuery) {
+    localStorage.setItem("mi_api_token", fromQuery);
+    return fromQuery;
+  }
+  return String(localStorage.getItem("mi_api_token") || "").trim();
 }
 
 function renderNodes() {
@@ -197,6 +225,15 @@ function normalizeBackendType(raw) {
   return String(raw || "").toLowerCase().trim();
 }
 
+function displayModelState(rawState, backendType) {
+  const stateValue = normalizeModelState(rawState) || "unknown";
+  const backend = normalizeBackendType(backendType);
+  if ((backend === "docker" || backend === "portainer") && stateValue === "stopped") {
+    return "unload";
+  }
+  return stateValue;
+}
+
 function isLoadedState(raw) {
   const stateValue = normalizeModelState(raw);
   return stateValue === "loaded" || stateValue === "running" || stateValue === "busy";
@@ -250,11 +287,34 @@ function actionAllowedByState(action, rawState) {
   return true;
 }
 
-function buildActionButton(modelId, action, nodeId, modelState) {
+function actionAllowedByBackendAndState(action, backendType, rawState) {
+  const backend = normalizeBackendType(backendType);
+  const stateValue = normalizeModelState(rawState);
+
+  if (backend === "lmstudio") {
+    return actionAllowedByState(action, stateValue);
+  }
+
+  if (action === "load") {
+    return stateValue === "stopped" || stateValue === "unknown" || stateValue === "error";
+  }
+  if (action === "unload") {
+    return stateValue === "loaded" || stateValue === "running" || stateValue === "busy";
+  }
+  if (action === "start") {
+    return stateValue === "loaded";
+  }
+  if (action === "stop") {
+    return stateValue === "running" || stateValue === "busy";
+  }
+  return true;
+}
+
+function buildActionButton(modelId, action, nodeId, modelState, backendType) {
   const button = document.createElement("button");
   button.textContent = action.toUpperCase();
   button.dataset.nodeId = nodeId;
-  const allowed = actionAllowedByState(action, modelState);
+  const allowed = actionAllowedByBackendAndState(action, backendType, modelState);
   button.dataset.allowed = String(allowed);
   const locked = Boolean(state.nodeActionLocks[nodeId]);
   button.disabled = locked || !allowed;
@@ -275,7 +335,7 @@ function buildActionButton(modelId, action, nodeId, modelState) {
         method: "POST",
       });
       showToast(`${action} -> ${data.message || "ok"}`);
-      await loadModels();
+      await loadModels({ refresh: true });
       renderNodes();
       renderModelTabs();
       renderModels();
@@ -417,7 +477,7 @@ function renderModels() {
     const metaParts = [
       `后端: ${m.backend_type}`,
       `节点: ${m.host_node_id}`,
-      `状态: ${m.state}`,
+      `状态: ${displayModelState(m.state, m.backend_type)}`,
       `装载: ${isLoadedState(m.state) ? "已装载" : "未装载"}`,
     ];
     if (normalizeBackendType(m.backend_type) !== "lmstudio") {
@@ -428,7 +488,7 @@ function renderModels() {
     const actions = document.createElement("div");
     actions.className = "actions";
     actionsForModelBackend(m.backend_type).forEach((action) => {
-      actions.appendChild(buildActionButton(m.id, action, m.host_node_id || "unknown", m.state));
+      actions.appendChild(buildActionButton(m.id, action, m.host_node_id || "unknown", m.state, m.backend_type));
     });
 
     item.appendChild(title);
@@ -446,8 +506,10 @@ async function loadNodes() {
   }
 }
 
-async function loadModels() {
-  const models = await requestJSON("/api/v1/models");
+async function loadModels(options = {}) {
+  const refresh = Boolean(options.refresh);
+  const path = refresh ? "/api/v1/models?refresh=true" : "/api/v1/models";
+  const models = await requestJSON(path);
   state.models = Array.isArray(models) ? models : [];
 }
 
@@ -458,6 +520,8 @@ async function loadRuntimeTemplates() {
 
 (async function init() {
   try {
+    state.apiToken = resolveAPIToken();
+
     let runtimeTemplatesLoadFailed = false;
     await Promise.all([loadNodes(), loadModels()]);
     try {

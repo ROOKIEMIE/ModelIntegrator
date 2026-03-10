@@ -86,11 +86,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	nodeService := service.NewNodeService(nodeRegistry)
+	nodeService := service.NewNodeService(nodeRegistry, adapterManager, log)
 	modelService := service.NewModelService(modelRegistry, nodeRegistry, runtimeTemplateService, schedulerInstance, adapterManager, log, cfg.Storage.ModelRootDir)
 
 	handler := api.NewHandler(nodeService, modelService, runtimeTemplateService, log, version.Get())
-	router := api.NewRouter(handler, cfg.Server.StaticDir, log)
+	router := api.NewRouter(handler, cfg.Server.StaticDir, cfg.Auth.Token, log)
 
 	httpServer := server.New(cfg, router, log)
 

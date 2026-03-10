@@ -2,43 +2,42 @@ package service
 
 import (
 	"context"
+	"log/slog"
 	"os/exec"
 	"runtime"
 	"strings"
 	"time"
 
+	"ModelIntegrator/src/pkg/adapter"
+	"ModelIntegrator/src/pkg/adapter/dockerctl"
+	"ModelIntegrator/src/pkg/adapter/lmstudio"
 	"ModelIntegrator/src/pkg/model"
 	"ModelIntegrator/src/pkg/registry"
 )
 
 type NodeService struct {
 	registry *registry.NodeRegistry
+	adapters *adapter.Manager
+	logger   *slog.Logger
 }
 
-func NewNodeService(reg *registry.NodeRegistry) *NodeService {
-	return &NodeService{registry: reg}
+func NewNodeService(reg *registry.NodeRegistry, adapters *adapter.Manager, logger *slog.Logger) *NodeService {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &NodeService{
+		registry: reg,
+		adapters: adapters,
+		logger:   logger,
+	}
 }
 
 func (s *NodeService) ListNodes(ctx context.Context) ([]model.Node, error) {
 	nodes := s.registry.List()
 	for i := range nodes {
-		if nodes[i].Role != model.NodeRoleSub {
-			continue
-		}
-		if strings.TrimSpace(nodes[i].Host) == "" {
-			nodes[i].Status = model.NodeStatusUnknown
-			continue
-		}
-
-		reachable, tried := icmpPing(ctx, nodes[i].Host)
-		if !tried {
-			nodes[i].Status = model.NodeStatusUnknown
-			continue
-		}
-		if reachable {
-			nodes[i].Status = model.NodeStatusOnline
-		} else {
-			nodes[i].Status = model.NodeStatusOffline
+		nodes[i].Status = s.detectNodeStatus(ctx, nodes[i])
+		if nodes[i].Status == model.NodeStatusOnline {
+			nodes[i].LastSeenAt = time.Now().UTC()
 		}
 	}
 	return nodes, nil
@@ -47,6 +46,126 @@ func (s *NodeService) ListNodes(ctx context.Context) ([]model.Node, error) {
 func (s *NodeService) GetNode(ctx context.Context, id string) (model.Node, bool) {
 	_ = ctx
 	return s.registry.Get(id)
+}
+
+func (s *NodeService) detectNodeStatus(ctx context.Context, node model.Node) model.NodeStatus {
+	if online, checked := s.runtimeHealthCheckFirst(ctx, node); checked {
+		if online {
+			return model.NodeStatusOnline
+		}
+		return model.NodeStatusOffline
+	}
+
+	host := strings.TrimSpace(node.Host)
+	if host == "" {
+		return model.NodeStatusUnknown
+	}
+	reachable, pingTried := icmpPing(ctx, host)
+	if !pingTried {
+		return model.NodeStatusUnknown
+	}
+	if reachable {
+		return model.NodeStatusOnline
+	}
+	return model.NodeStatusOffline
+}
+
+// 优先使用 runtime 健康检查来判断节点可用性；只有没有可用 runtime 检查能力时才 fallback 到 ping。
+func (s *NodeService) runtimeHealthCheckFirst(ctx context.Context, node model.Node) (online bool, checked bool) {
+	for _, rt := range node.Runtimes {
+		if !rt.Enabled {
+			continue
+		}
+		rtOnline, rtChecked := s.healthCheckRuntime(ctx, node, rt)
+		if !rtChecked {
+			continue
+		}
+		if rtOnline {
+			return true, true
+		}
+		checked = true
+	}
+	return false, checked
+}
+
+func (s *NodeService) healthCheckRuntime(ctx context.Context, node model.Node, rt model.Runtime) (bool, bool) {
+	runtimeAdapter, ok := s.runtimeAdapterForNode(rt)
+	if !ok {
+		return false, false
+	}
+
+	healthCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	result, err := runtimeAdapter.HealthCheck(healthCtx)
+	if err != nil {
+		s.logger.Warn("runtime 健康检查失败",
+			"node_id", node.ID,
+			"node_host", node.Host,
+			"runtime_id", rt.ID,
+			"runtime_type", rt.Type,
+			"runtime_endpoint", rt.Endpoint,
+			"error", err,
+		)
+		return false, true
+	}
+	if !result.Success {
+		s.logger.Warn("runtime 健康检查返回失败",
+			"node_id", node.ID,
+			"node_host", node.Host,
+			"runtime_id", rt.ID,
+			"runtime_type", rt.Type,
+			"runtime_endpoint", rt.Endpoint,
+			"message", result.Message,
+		)
+		return false, true
+	}
+
+	s.logger.Debug("runtime 健康检查通过",
+		"node_id", node.ID,
+		"runtime_id", rt.ID,
+		"runtime_type", rt.Type,
+		"runtime_endpoint", rt.Endpoint,
+	)
+	return true, true
+}
+
+func (s *NodeService) runtimeAdapterForNode(rt model.Runtime) (adapter.RuntimeAdapter, bool) {
+	token := readRuntimeToken(rt.Metadata)
+	endpoint := strings.TrimSpace(rt.Endpoint)
+	if endpoint != "" {
+		switch rt.Type {
+		case model.RuntimeTypeLMStudio:
+			return lmstudio.NewAdapter(endpoint, token, 3*time.Second, false, 0), true
+		case model.RuntimeTypeDocker:
+			return dockerctl.NewAdapter("dockerctl", endpoint, token), true
+		case model.RuntimeTypePortainer:
+			return dockerctl.NewAdapter("portainer", endpoint, token), true
+		default:
+			return nil, false
+		}
+	}
+
+	if s.adapters == nil {
+		return nil, false
+	}
+	adapterInstance, err := s.adapters.Get(rt.Type)
+	if err != nil {
+		return nil, false
+	}
+	return adapterInstance, true
+}
+
+func readRuntimeToken(metadata map[string]string) string {
+	if metadata == nil {
+		return ""
+	}
+	for _, key := range []string{"token", "api_token", "bearer_token"} {
+		if v := strings.TrimSpace(metadata[key]); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func icmpPing(ctx context.Context, host string) (reachable bool, tried bool) {

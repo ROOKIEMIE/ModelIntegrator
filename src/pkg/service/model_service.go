@@ -56,7 +56,7 @@ func NewModelService(
 }
 
 func (s *ModelService) ListModels(ctx context.Context) ([]model.Model, error) {
-	_ = s.RefreshModels(ctx)
+	_ = ctx
 	return s.modelRegistry.List(), nil
 }
 
@@ -109,8 +109,21 @@ func (s *ModelService) StartAutoRefresh(ctx context.Context, interval time.Durat
 func (s *ModelService) RefreshModels(ctx context.Context) error {
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
-	_ = s.refreshLocalModels(ctx)
-	return s.refreshLMStudioModels(ctx)
+
+	var refreshErrors []error
+	recordStepErr := func(step string, err error) {
+		if err == nil {
+			return
+		}
+		s.logger.Warn("模型刷新子步骤失败", "step", step, "error", err)
+		refreshErrors = append(refreshErrors, fmt.Errorf("%s: %w", step, err))
+	}
+
+	recordStepErr("refresh_local_models", s.refreshLocalModels(ctx))
+	recordStepErr("refresh_container_runtime_states", s.refreshContainerRuntimeStates(ctx))
+	recordStepErr("refresh_lmstudio_models", s.refreshLMStudioModels(ctx))
+
+	return errors.Join(refreshErrors...)
 }
 
 func (s *ModelService) runRefreshWithTimeout(timeout time.Duration) {
@@ -169,6 +182,15 @@ func (s *ModelService) executeAction(ctx context.Context, id, action string) (mo
 	if err != nil {
 		return actionResult(false, err.Error(), map[string]interface{}{"backend_type": actionModel.BackendType}), nil
 	}
+	if !actionAllowedForBackendAndState(action, actionModel.BackendType, m.State) {
+		currentState := normalizeState(m.State)
+		return actionResult(false, fmt.Sprintf("当前状态(%s)不允许执行 %s", currentState, action), map[string]interface{}{
+			"model_id":     actionModel.ID,
+			"backend_type": actionModel.BackendType,
+			"state":        currentState,
+			"action":       action,
+		}), nil
+	}
 
 	if action == "load" || action == "start" {
 		if canRun, reason := s.scheduler.CanRun(actionModel); !canRun {
@@ -181,10 +203,28 @@ func (s *ModelService) executeAction(ctx context.Context, id, action string) (mo
 	case "load":
 		result, err = adapterInstance.LoadModel(ctx, actionModel)
 		if result.Success {
-			m.State = model.ModelStateLoaded
-			s.scheduler.MarkRunning(actionModel)
+			if isContainerRuntime(actionModel.BackendType) {
+				m.State = model.ModelStateLoaded
+				s.scheduler.MarkStopped(m.ID)
+			} else {
+				m.State = model.ModelStateLoaded
+				s.scheduler.MarkRunning(actionModel)
+			}
 		}
 	case "unload":
+		if isContainerRuntime(actionModel.BackendType) && (m.State == model.ModelStateRunning || m.State == model.ModelStateBusy) {
+			stopResult, stopErr := adapterInstance.StopModel(ctx, actionModel)
+			if stopErr != nil {
+				s.logger.Error("卸载前停止容器失败", "action", action, "model_id", m.ID, "error", stopErr)
+				return actionResult(false, "卸载前停止容器失败", map[string]interface{}{"error": stopErr.Error(), "model_id": m.ID}), nil
+			}
+			if !stopResult.Success {
+				return actionResult(false, "卸载前停止容器失败", stopResult.Detail), nil
+			}
+			applyContainerRuntimeDetail(stopResult.Detail, &m)
+			m.State = model.ModelStateLoaded
+			s.modelRegistry.Upsert(m)
+		}
 		result, err = adapterInstance.UnloadModel(ctx, actionModel)
 		if result.Success {
 			m.State = model.ModelStateStopped
@@ -199,7 +239,11 @@ func (s *ModelService) executeAction(ctx context.Context, id, action string) (mo
 	case "stop":
 		result, err = adapterInstance.StopModel(ctx, actionModel)
 		if result.Success {
-			m.State = model.ModelStateStopped
+			if isContainerRuntime(actionModel.BackendType) && hasNonEmptyDetail(result.Detail, "runtime_container_id") {
+				m.State = model.ModelStateLoaded
+			} else {
+				m.State = model.ModelStateStopped
+			}
 			s.scheduler.MarkStopped(m.ID)
 		}
 	default:
@@ -258,12 +302,13 @@ func (s *ModelService) unlockNodeAction(nodeID string) {
 func (s *ModelService) refreshLMStudioModels(ctx context.Context) error {
 	adapterInstance, err := s.adapters.Get(model.RuntimeTypeLMStudio)
 	if err != nil {
+		s.logger.Debug("跳过 LM Studio 模型刷新：未注册适配器", "runtime_type", model.RuntimeTypeLMStudio, "error", err)
 		return nil
 	}
 
 	remoteModels, err := adapterInstance.ListModels(ctx)
 	if err != nil {
-		return fmt.Errorf("刷新 LM Studio 模型失败: %w", err)
+		return fmt.Errorf("刷新 LM Studio 模型失败: runtime=%s error=%w", model.RuntimeTypeLMStudio, err)
 	}
 
 	hostNodeID, runtimeID, endpoint := s.resolveRuntimeBinding(model.RuntimeTypeLMStudio)
@@ -441,6 +486,24 @@ func (s *ModelService) refreshLocalModels(ctx context.Context) error {
 			continue
 		}
 		modelID := "local-" + slugify(modelName)
+		templateID := inferTemplateIDForLocalModel(modelName, name)
+		existing, exists := s.modelRegistry.Get(modelID)
+		if exists && existing.Metadata != nil {
+			if configured := strings.TrimSpace(existing.Metadata["runtime_template_id"]); configured != "" {
+				templateID = configured
+			}
+		}
+
+		state := model.ModelStateStopped
+		if exists && existing.State != "" {
+			state = existing.State
+		}
+		metadata := map[string]string{
+			"source":              "local-scan",
+			"path":                path,
+			"runtime_template_id": templateID,
+		}
+		preserveContainerMetadata(existing.Metadata, metadata)
 
 		scanned = append(scanned, model.Model{
 			ID:          modelID,
@@ -450,18 +513,93 @@ func (s *ModelService) refreshLocalModels(ctx context.Context) error {
 			HostNodeID:  hostNodeID,
 			RuntimeID:   runtimeID,
 			Endpoint:    endpoint,
-			State:       model.ModelStateStopped,
-			Metadata: map[string]string{
-				"source":              "local-scan",
-				"path":                path,
-				"runtime_template_id": DefaultDockerTemplateID,
-			},
+			State:       state,
+			Metadata:    metadata,
 		})
 	}
 
 	s.modelRegistry.ReplaceBySource("local-scan", scanned)
 	s.logger.Debug("本地模型目录刷新完成", "count", len(scanned), "root", root)
 	return nil
+}
+
+func (s *ModelService) refreshContainerRuntimeStates(ctx context.Context) error {
+	models := s.modelRegistry.List()
+	var refreshErrors []error
+
+	for _, item := range models {
+		if !isContainerRuntime(item.BackendType) {
+			continue
+		}
+
+		adapterInstance, err := s.adapters.Get(item.BackendType)
+		if err != nil {
+			s.logger.Warn("刷新容器模型状态失败：获取适配器失败",
+				"action", "refresh_container_runtime_status",
+				"model_id", item.ID,
+				"model_name", item.Name,
+				"node_id", item.HostNodeID,
+				"runtime_type", item.BackendType,
+				"runtime_id", item.RuntimeID,
+				"error", err,
+			)
+			refreshErrors = append(refreshErrors, fmt.Errorf("model=%s backend=%s get adapter failed: %w", item.ID, item.BackendType, err))
+			continue
+		}
+
+		status, err := adapterInstance.GetStatus(ctx, item)
+		if err != nil {
+			s.logger.Warn("刷新容器模型状态失败",
+				"action", "refresh_container_runtime_status",
+				"model_id", item.ID,
+				"model_name", item.Name,
+				"node_id", item.HostNodeID,
+				"runtime_type", item.BackendType,
+				"runtime_id", item.RuntimeID,
+				"error", err,
+			)
+			refreshErrors = append(refreshErrors, fmt.Errorf("model=%s backend=%s status failed: %w", item.ID, item.BackendType, err))
+			continue
+		}
+		if !status.Success {
+			s.logger.Warn("刷新容器模型状态失败：状态返回失败",
+				"action", "refresh_container_runtime_status",
+				"model_id", item.ID,
+				"model_name", item.Name,
+				"node_id", item.HostNodeID,
+				"runtime_type", item.BackendType,
+				"runtime_id", item.RuntimeID,
+				"message", status.Message,
+			)
+			refreshErrors = append(refreshErrors, fmt.Errorf("model=%s backend=%s status unsuccessful: %s", item.ID, item.BackendType, status.Message))
+			continue
+		}
+
+		updated := item
+		updated.Metadata = cloneMetadataMap(item.Metadata)
+		applyContainerRuntimeDetail(status.Detail, &updated)
+
+		exists, hasExists := boolFromDetail(status.Detail, "runtime_exists")
+		running, hasRunning := boolFromDetail(status.Detail, "runtime_running")
+
+		switch {
+		case hasExists && !exists:
+			updated.State = model.ModelStateStopped
+			clearContainerMetadata(&updated)
+			s.scheduler.MarkStopped(updated.ID)
+		case hasRunning && running:
+			updated.State = model.ModelStateRunning
+			s.scheduler.MarkRunning(updated)
+		case (hasExists && exists) || hasNonEmptyDetail(status.Detail, "runtime_container_id"):
+			updated.State = model.ModelStateLoaded
+			s.scheduler.MarkStopped(updated.ID)
+		default:
+			continue
+		}
+
+		s.modelRegistry.Upsert(updated)
+	}
+	return errors.Join(refreshErrors...)
 }
 
 func normalizeModelName(name string) string {
@@ -472,6 +610,41 @@ func normalizeModelName(name string) string {
 		base = strings.TrimSuffix(name, filepath.Ext(name))
 	}
 	return strings.TrimSpace(base)
+}
+
+func inferTemplateIDForLocalModel(modelName, entryName string) string {
+	lower := strings.ToLower(strings.TrimSpace(modelName + " " + entryName))
+	embeddingHints := []string{
+		"embedding",
+		"embed",
+		"e5",
+		"bge",
+		"gte",
+		"m3e",
+		"jina-emb",
+	}
+	for _, hint := range embeddingHints {
+		if strings.Contains(lower, hint) {
+			return DefaultEmbeddingTemplateID
+		}
+	}
+	return DefaultDockerTemplateID
+}
+
+func preserveContainerMetadata(existing map[string]string, target map[string]string) {
+	if existing == nil || target == nil {
+		return
+	}
+	keys := []string{
+		"runtime_container_id",
+		"runtime_container",
+		"runtime_image",
+	}
+	for _, key := range keys {
+		if v := strings.TrimSpace(existing[key]); v != "" {
+			target[key] = v
+		}
+	}
 }
 
 func slugify(input string) string {
@@ -556,6 +729,15 @@ func applyContainerRuntimeDetail(detail map[string]interface{}, m *model.Model) 
 	}
 }
 
+func clearContainerMetadata(m *model.Model) {
+	if m == nil || m.Metadata == nil {
+		return
+	}
+	delete(m.Metadata, "runtime_container_id")
+	delete(m.Metadata, "runtime_container")
+	delete(m.Metadata, "runtime_image")
+}
+
 func cloneMetadataMap(in map[string]string) map[string]string {
 	out := make(map[string]string)
 	for k, v := range in {
@@ -578,4 +760,82 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func actionAllowedForBackendAndState(action string, backendType model.RuntimeType, state model.ModelState) bool {
+	if isContainerRuntime(backendType) {
+		normalized := normalizeState(state)
+		switch action {
+		case "load":
+			return normalized == model.ModelStateStopped || normalized == model.ModelStateUnknown || normalized == model.ModelStateError
+		case "unload":
+			return normalized == model.ModelStateLoaded || normalized == model.ModelStateRunning || normalized == model.ModelStateBusy
+		case "start":
+			return normalized == model.ModelStateLoaded
+		case "stop":
+			return normalized == model.ModelStateRunning || normalized == model.ModelStateBusy
+		default:
+			return false
+		}
+	}
+	switch action {
+	case "load", "start":
+		return !isLoadedState(state)
+	case "unload", "stop":
+		return isLoadedState(state)
+	default:
+		return false
+	}
+}
+
+func isLoadedState(state model.ModelState) bool {
+	return state == model.ModelStateLoaded || state == model.ModelStateRunning || state == model.ModelStateBusy
+}
+
+func normalizeState(state model.ModelState) model.ModelState {
+	if strings.TrimSpace(string(state)) == "" {
+		return model.ModelStateUnknown
+	}
+	return state
+}
+
+func isContainerRuntime(runtimeType model.RuntimeType) bool {
+	return runtimeType == model.RuntimeTypeDocker || runtimeType == model.RuntimeTypePortainer
+}
+
+func boolFromDetail(detail map[string]interface{}, key string) (bool, bool) {
+	if detail == nil {
+		return false, false
+	}
+	raw, ok := detail[key]
+	if !ok {
+		return false, false
+	}
+	switch v := raw.(type) {
+	case bool:
+		return v, true
+	case string:
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "true", "1", "yes", "on":
+			return true, true
+		case "false", "0", "no", "off":
+			return false, true
+		default:
+			return false, false
+		}
+	default:
+		return false, false
+	}
+}
+
+func hasNonEmptyDetail(detail map[string]interface{}, key string) bool {
+	if detail == nil {
+		return false
+	}
+	raw, ok := detail[key]
+	if !ok {
+		return false
+	}
+	value := strings.TrimSpace(fmt.Sprint(raw))
+	return value != "" && value != "<nil>"
 }

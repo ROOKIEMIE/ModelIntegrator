@@ -38,3 +38,6 @@ go.work.sum
 
 # Runtime data
 *.db
+
+# Models data
+multilingual-e5-base

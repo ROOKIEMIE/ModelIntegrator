@@ -33,6 +33,9 @@ services:
       - ${MCP_PROJECT_DIR:-.}/resources:/opt/modelintegrator/resources
       - ${MCP_MODEL_DIR_HOST:-./resources/models}:${MCP_MODEL_ROOT_DIR:-/opt/modelintegrator/models}:ro
       - /var/run/docker.sock:/var/run/docker.sock
+    # 让非 root 的 app 用户具备 docker.sock 的组访问权限。
+    group_add:
+      - "${MCP_DOCKER_GID:-998}"
     networks:
       - mcp_net
     restart: unless-stopped

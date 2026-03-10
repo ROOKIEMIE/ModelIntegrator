@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 
@@ -58,12 +59,23 @@ func (h *Handler) ListNodes(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListModels(w http.ResponseWriter, r *http.Request) {
+	if shouldRefreshModels(r) {
+		if err := h.modelService.RefreshModels(r.Context()); err != nil {
+			h.logger.Warn("手动刷新模型失败，返回缓存结果", "path", r.URL.Path, "error", err)
+		}
+	}
+
 	models, err := h.modelService.ListModels(r.Context())
 	if err != nil {
 		Fail(w, http.StatusInternalServerError, "获取模型列表失败", err.Error())
 		return
 	}
 	OK(w, models)
+}
+
+func shouldRefreshModels(r *http.Request) bool {
+	raw := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("refresh")))
+	return raw == "1" || raw == "true" || raw == "yes"
 }
 
 func (h *Handler) GetModel(w http.ResponseWriter, r *http.Request) {

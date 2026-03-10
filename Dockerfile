@@ -1,7 +1,7 @@
 FROM golang:1.22-alpine AS builder
 
 WORKDIR /app
-COPY go.mod ./
+COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
@@ -10,12 +10,15 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/model-integrator ./sr
 FROM alpine:3.20
 WORKDIR /opt/modelintegrator
 
-RUN addgroup -S app && adduser -S app -G app
+RUN addgroup -S app && adduser -S app -G app \
+    && mkdir -p /opt/modelintegrator/resources /opt/modelintegrator/models \
+    && chown -R app:app /opt/modelintegrator
 
-COPY --from=builder /out/model-integrator /opt/modelintegrator/model-integrator
-COPY resources /opt/modelintegrator/resources
+COPY --from=builder --chown=app:app /out/model-integrator /opt/modelintegrator/model-integrator
+COPY --chown=app:app resources /opt/modelintegrator/resources
 
 EXPOSE 8080
 ENV MCP_CONFIG=/opt/modelintegrator/resources/config/config.example.yaml
 
+USER app
 CMD ["/opt/modelintegrator/model-integrator"]

@@ -10,10 +10,13 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"ModelIntegrator/src/pkg/model"
@@ -91,6 +94,7 @@ func (a *Adapter) LoadModel(ctx context.Context, m model.Model) (model.ActionRes
 	if err != nil {
 		return result(false, "运行时模板解析失败", map[string]interface{}{"error": err.Error(), "model_id": m.ID}), nil
 	}
+	tpl = materializeRuntimeTemplate(tpl, m)
 	containerID, created, err := client.ensureContainer(ctx, m, tpl)
 	if err != nil {
 		return result(false, "容器创建失败", map[string]interface{}{"error": err.Error(), "model_id": m.ID}), nil
@@ -99,12 +103,19 @@ func (a *Adapter) LoadModel(ctx context.Context, m model.Model) (model.ActionRes
 	if err != nil {
 		return result(false, "容器状态读取失败", map[string]interface{}{"error": err.Error(), "container_id": containerID}), nil
 	}
+	running := info.State != nil && info.State.Running
+	if running {
+		if err := client.stopContainer(ctx, containerID, 10); err != nil {
+			return result(false, "容器装载后停止失败", map[string]interface{}{"error": err.Error(), "container_id": containerID}), nil
+		}
+		running = false
+	}
 	return result(true, "容器模板已装载", map[string]interface{}{
 		"model_id":             m.ID,
 		"runtime_container_id": containerID,
 		"runtime_container":    firstNonEmpty(strings.TrimPrefix(info.Name, "/"), containerNameForModel(m)),
 		"runtime_created":      created,
-		"runtime_running":      info.State != nil && info.State.Running,
+		"runtime_running":      running,
 		"runtime_image":        tpl.Image,
 		"backend":              a.name,
 	}), nil
@@ -143,6 +154,7 @@ func (a *Adapter) StartModel(ctx context.Context, m model.Model) (model.ActionRe
 	if err != nil {
 		return result(false, "运行时模板解析失败", map[string]interface{}{"error": err.Error(), "model_id": m.ID}), nil
 	}
+	tpl = materializeRuntimeTemplate(tpl, m)
 	containerID, _, err := client.ensureContainer(ctx, m, tpl)
 	if err != nil {
 		return result(false, "容器准备失败", map[string]interface{}{"error": err.Error(), "model_id": m.ID}), nil
@@ -160,6 +172,15 @@ func (a *Adapter) StartModel(ctx context.Context, m model.Model) (model.ActionRe
 	}
 	if err := client.startContainer(ctx, containerID); err != nil {
 		return result(false, "启动容器失败", map[string]interface{}{"error": err.Error(), "container_id": containerID}), nil
+	}
+	finalStatus, waitErr := client.waitUntilContainerRunning(ctx, containerID, 8*time.Second)
+	if waitErr != nil {
+		return result(false, "容器启动后未保持运行", map[string]interface{}{
+			"error":                waitErr.Error(),
+			"runtime_status":       firstNonEmpty(finalStatus, "unknown"),
+			"runtime_container_id": containerID,
+			"backend":              a.name,
+		}), nil
 	}
 	return result(true, "容器已启动", map[string]interface{}{
 		"runtime_container_id": containerID,
@@ -265,6 +286,112 @@ func parseRuntimeTemplateFromModel(m model.Model) (model.RuntimeTemplate, error)
 	return tpl, nil
 }
 
+func materializeRuntimeTemplate(tpl model.RuntimeTemplate, m model.Model) model.RuntimeTemplate {
+	vars := runtimeTemplateVars(m)
+
+	out := tpl
+	out.Image = replaceTemplateVars(out.Image, vars)
+	out.Command = replaceTemplateVarList(out.Command, vars)
+	out.Volumes = normalizeVolumeBindings(replaceTemplateVarList(out.Volumes, vars))
+	out.Ports = replaceTemplateVarList(out.Ports, vars)
+	if len(out.Env) > 0 {
+		env := make(map[string]string, len(out.Env))
+		for k, v := range out.Env {
+			env[k] = replaceTemplateVars(v, vars)
+		}
+		out.Env = env
+	}
+	return out
+}
+
+func runtimeTemplateVars(m model.Model) map[string]string {
+	modelPath := strings.TrimSpace(readMetadata(m.Metadata, "path"))
+	modelBase := strings.TrimSpace(filepath.Base(modelPath))
+	if modelBase == "." || modelBase == "/" {
+		modelBase = ""
+	}
+	if modelBase == "" {
+		modelBase = strings.TrimSpace(m.ID)
+	}
+	if modelBase == "" {
+		modelBase = strings.TrimSpace(m.Name)
+	}
+	if modelBase == "" {
+		modelBase = "model"
+	}
+
+	modelPathInContainer := path.Join("/models", modelBase)
+	return map[string]string{
+		"{{MODEL_ID}}":             strings.TrimSpace(m.ID),
+		"{{MODEL_NAME}}":           strings.TrimSpace(m.Name),
+		"{{MODEL_PATH}}":           modelPath,
+		"{{MODEL_BASENAME}}":       modelBase,
+		"{{MODEL_PATH_CONTAINER}}": modelPathInContainer,
+	}
+}
+
+func replaceTemplateVarList(items []string, vars map[string]string) []string {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		out = append(out, replaceTemplateVars(item, vars))
+	}
+	return out
+}
+
+func normalizeVolumeBindings(items []string) []string {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		out = append(out, normalizeVolumeBinding(item))
+	}
+	return out
+}
+
+func normalizeVolumeBinding(binding string) string {
+	parts := strings.Split(binding, ":")
+	if len(parts) < 2 {
+		return binding
+	}
+
+	mode := ""
+	if last := strings.TrimSpace(parts[len(parts)-1]); last == "ro" || last == "rw" {
+		mode = last
+		parts = parts[:len(parts)-1]
+	}
+	if len(parts) < 2 {
+		return binding
+	}
+
+	containerPath := strings.TrimSpace(parts[len(parts)-1])
+	hostPath := strings.TrimSpace(strings.Join(parts[:len(parts)-1], ":"))
+	if hostPath == "" || containerPath == "" {
+		return binding
+	}
+	if !filepath.IsAbs(hostPath) {
+		if abs, err := filepath.Abs(hostPath); err == nil {
+			hostPath = abs
+		}
+	}
+
+	if mode != "" {
+		return hostPath + ":" + containerPath + ":" + mode
+	}
+	return hostPath + ":" + containerPath
+}
+
+func replaceTemplateVars(input string, vars map[string]string) string {
+	out := input
+	for key, value := range vars {
+		out = strings.ReplaceAll(out, key, value)
+	}
+	return out
+}
+
 func result(success bool, message string, detail map[string]interface{}) model.ActionResult {
 	return model.ActionResult{
 		Success:   success,
@@ -279,6 +406,14 @@ type dockerHTTPClient struct {
 	apiPrefix      string
 	httpClient     *http.Client
 	defaultHeaders map[string]string
+
+	selfMountOnce sync.Once
+	selfMounts    []containerMount
+}
+
+type containerMount struct {
+	Source      string `json:"Source"`
+	Destination string `json:"Destination"`
 }
 
 func newDockerHTTPClient(adapterName, endpoint, token string, timeout time.Duration) (*dockerHTTPClient, error) {
@@ -399,8 +534,19 @@ func (c *dockerHTTPClient) ping(ctx context.Context) error {
 
 func (c *dockerHTTPClient) ensureContainer(ctx context.Context, m model.Model, tpl model.RuntimeTemplate) (string, bool, error) {
 	if id := strings.TrimSpace(m.Metadata["runtime_container_id"]); id != "" {
-		if _, err := c.inspectContainer(ctx, id); err == nil {
-			return id, false, nil
+		if info, err := c.inspectContainer(ctx, id); err == nil {
+			if !isContainerOwnedByModel(info, m) {
+				return "", false, fmt.Errorf("容器 %s 非当前模型受管容器，拒绝接管", id)
+			}
+			recreate, checkErr := c.containerNeedsRecreate(ctx, id, m, tpl)
+			if checkErr != nil {
+				return "", false, checkErr
+			}
+			if !recreate {
+				return id, false, nil
+			}
+			_ = c.stopContainer(ctx, id, 5)
+			_ = c.removeContainer(ctx, id, true)
 		}
 	}
 
@@ -412,7 +558,26 @@ func (c *dockerHTTPClient) ensureContainer(ctx context.Context, m model.Model, t
 		return "", false, err
 	}
 	if len(list) > 0 {
-		return list[0].ID, false, nil
+		existingID := list[0].ID
+		info, inspectErr := c.inspectContainer(ctx, existingID)
+		if inspectErr != nil {
+			return "", false, inspectErr
+		}
+		if !isModelIntegratorManagedContainer(info) {
+			return "", false, fmt.Errorf("存在同名非受管容器 (%s)，拒绝覆盖", existingID)
+		}
+		if !isContainerOwnedByModel(info, m) {
+			return "", false, fmt.Errorf("容器名称冲突：%s 属于其他模型 (%s)", existingID, strings.TrimSpace(info.Config.Labels["com.modelintegrator.model_id"]))
+		}
+		recreate, checkErr := c.containerNeedsRecreate(ctx, existingID, m, tpl)
+		if checkErr != nil {
+			return "", false, checkErr
+		}
+		if !recreate {
+			return existingID, false, nil
+		}
+		_ = c.stopContainer(ctx, existingID, 5)
+		_ = c.removeContainer(ctx, existingID, true)
 	}
 
 	id, err := c.createContainer(ctx, m, tpl, containerName)
@@ -429,11 +594,39 @@ func (c *dockerHTTPClient) ensureContainer(ctx context.Context, m model.Model, t
 	return id, true, nil
 }
 
+func (c *dockerHTTPClient) containerNeedsRecreate(ctx context.Context, containerID string, m model.Model, tpl model.RuntimeTemplate) (bool, error) {
+	info, err := c.inspectContainer(ctx, containerID)
+	if err != nil {
+		return true, nil
+	}
+
+	expectedTemplateID := firstNonEmpty(strings.TrimSpace(tpl.ID), strings.TrimSpace(m.Metadata["runtime_template_id"]))
+	actualTemplateID := strings.TrimSpace(info.Config.Labels["com.modelintegrator.template_id"])
+	if expectedTemplateID != "" && actualTemplateID != "" && expectedTemplateID != actualTemplateID {
+		return true, nil
+	}
+	if strings.TrimSpace(info.Config.Image) != strings.TrimSpace(tpl.Image) {
+		return true, nil
+	}
+	if !stringSlicesEqual(info.Config.Cmd, tpl.Command) {
+		return true, nil
+	}
+
+	expectedBinds := c.normalizeBindsForDockerHost(ctx, tpl.Volumes)
+	if !stringSlicesAsSetEqual(info.HostConfig.Binds, expectedBinds) {
+		return true, nil
+	}
+	return false, nil
+}
+
 func (c *dockerHTTPClient) resolveContainerID(ctx context.Context, m model.Model) (string, bool, error) {
 	if m.Metadata != nil {
 		if id := strings.TrimSpace(m.Metadata["runtime_container_id"]); id != "" {
-			if _, err := c.inspectContainer(ctx, id); err == nil {
-				return id, true, nil
+			if info, err := c.inspectContainer(ctx, id); err == nil {
+				if isContainerOwnedByModel(info, m) {
+					return id, true, nil
+				}
+				return "", false, nil
 			}
 		}
 	}
@@ -447,7 +640,35 @@ func (c *dockerHTTPClient) resolveContainerID(ctx context.Context, m model.Model
 	if len(list) == 0 {
 		return "", false, nil
 	}
+	info, inspectErr := c.inspectContainer(ctx, list[0].ID)
+	if inspectErr != nil {
+		return "", false, nil
+	}
+	if !isContainerOwnedByModel(info, m) {
+		return "", false, nil
+	}
 	return list[0].ID, true, nil
+}
+
+func isModelIntegratorManagedContainer(info containerInspect) bool {
+	labels := info.Config.Labels
+	if labels == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(labels["com.modelintegrator.managed"]), "true")
+}
+
+func isContainerOwnedByModel(info containerInspect, m model.Model) bool {
+	if !isModelIntegratorManagedContainer(info) {
+		return false
+	}
+	labels := info.Config.Labels
+	if labels == nil {
+		return false
+	}
+	modelID := strings.TrimSpace(labels["com.modelintegrator.model_id"])
+	expectedID := strings.TrimSpace(m.ID)
+	return modelID != "" && expectedID != "" && modelID == expectedID
 }
 
 type containerListItem struct {
@@ -486,8 +707,13 @@ type containerInspect struct {
 	ID     string `json:"Id"`
 	Name   string `json:"Name"`
 	Config struct {
-		Image string `json:"Image"`
+		Image  string            `json:"Image"`
+		Cmd    []string          `json:"Cmd"`
+		Labels map[string]string `json:"Labels"`
 	} `json:"Config"`
+	HostConfig struct {
+		Binds []string `json:"Binds"`
+	} `json:"HostConfig"`
 	State *struct {
 		Status  string `json:"Status"`
 		Running bool   `json:"Running"`
@@ -575,7 +801,7 @@ func (c *dockerHTTPClient) createContainer(ctx context.Context, m model.Model, t
 		},
 		ExposedPorts: exposedPorts,
 		HostConfig: hostConfig{
-			Binds:        tpl.Volumes,
+			Binds:        c.normalizeBindsForDockerHost(ctx, tpl.Volumes),
 			PortBindings: portBindings,
 		},
 	}
@@ -616,6 +842,174 @@ func (c *dockerHTTPClient) createContainer(ctx context.Context, m model.Model, t
 	return resp.ID, nil
 }
 
+func (c *dockerHTTPClient) normalizeBindsForDockerHost(ctx context.Context, binds []string) []string {
+	if len(binds) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(binds))
+	for _, bind := range binds {
+		out = append(out, c.normalizeBindForDockerHost(ctx, bind))
+	}
+	return out
+}
+
+func (c *dockerHTTPClient) normalizeBindForDockerHost(ctx context.Context, bind string) string {
+	hostPath, containerPath, mode, ok := splitVolumeBinding(bind)
+	if !ok {
+		return bind
+	}
+	hostPath = translateHostPathForDockerDaemon(ctx, c, hostPath)
+	return joinVolumeBinding(hostPath, containerPath, mode)
+}
+
+func translateHostPathForDockerDaemon(ctx context.Context, c *dockerHTTPClient, hostPath string) string {
+	normalized := strings.TrimSpace(hostPath)
+	if normalized == "" {
+		return hostPath
+	}
+	if !filepath.IsAbs(normalized) {
+		if abs, err := filepath.Abs(normalized); err == nil {
+			normalized = abs
+		}
+	}
+	if c == nil {
+		return normalized
+	}
+	translated, ok := c.translateContainerPathToHost(ctx, normalized)
+	if !ok {
+		return normalized
+	}
+	return translated
+}
+
+func (c *dockerHTTPClient) translateContainerPathToHost(ctx context.Context, containerPath string) (string, bool) {
+	mounts := c.loadSelfMounts(ctx)
+	if len(mounts) == 0 {
+		return "", false
+	}
+
+	in := filepath.Clean(strings.TrimSpace(containerPath))
+	bestDest := ""
+	bestSource := ""
+	for _, m := range mounts {
+		dest := filepath.Clean(strings.TrimSpace(m.Destination))
+		source := filepath.Clean(strings.TrimSpace(m.Source))
+		if dest == "" || source == "" {
+			continue
+		}
+		if in != dest && !strings.HasPrefix(in, dest+string(filepath.Separator)) {
+			continue
+		}
+		if len(dest) > len(bestDest) {
+			bestDest = dest
+			bestSource = source
+		}
+	}
+	if bestDest == "" || bestSource == "" {
+		return "", false
+	}
+
+	rel := strings.TrimPrefix(in, bestDest)
+	rel = strings.TrimPrefix(rel, string(filepath.Separator))
+	if rel == "" {
+		return bestSource, true
+	}
+	return filepath.Join(bestSource, rel), true
+}
+
+func (c *dockerHTTPClient) loadSelfMounts(ctx context.Context) []containerMount {
+	c.selfMountOnce.Do(func() {
+		containerID := strings.TrimSpace(selfContainerID())
+		if containerID == "" {
+			return
+		}
+		status, body, err := c.request(ctx, http.MethodGet, "/containers/"+url.PathEscape(containerID)+"/json", nil, nil)
+		if err != nil || status < 200 || status >= 300 {
+			return
+		}
+		var inspect struct {
+			Mounts []containerMount `json:"Mounts"`
+		}
+		if err := json.Unmarshal(body, &inspect); err != nil {
+			return
+		}
+		c.selfMounts = inspect.Mounts
+	})
+	return c.selfMounts
+}
+
+func selfContainerID() string {
+	if v := strings.TrimSpace(os.Getenv("HOSTNAME")); v != "" {
+		return v
+	}
+	v, _ := os.Hostname()
+	return strings.TrimSpace(v)
+}
+
+func splitVolumeBinding(binding string) (hostPath, containerPath, mode string, ok bool) {
+	parts := strings.Split(binding, ":")
+	if len(parts) < 2 {
+		return "", "", "", false
+	}
+
+	if last := strings.TrimSpace(parts[len(parts)-1]); last == "ro" || last == "rw" {
+		mode = last
+		parts = parts[:len(parts)-1]
+	}
+	if len(parts) < 2 {
+		return "", "", "", false
+	}
+
+	containerPath = strings.TrimSpace(parts[len(parts)-1])
+	hostPath = strings.TrimSpace(strings.Join(parts[:len(parts)-1], ":"))
+	if hostPath == "" || containerPath == "" {
+		return "", "", "", false
+	}
+	return hostPath, containerPath, mode, true
+}
+
+func joinVolumeBinding(hostPath, containerPath, mode string) string {
+	if strings.TrimSpace(mode) == "" {
+		return strings.TrimSpace(hostPath) + ":" + strings.TrimSpace(containerPath)
+	}
+	return strings.TrimSpace(hostPath) + ":" + strings.TrimSpace(containerPath) + ":" + strings.TrimSpace(mode)
+}
+
+func stringSlicesEqual(a []string, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if strings.TrimSpace(a[i]) != strings.TrimSpace(b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func stringSlicesAsSetEqual(a []string, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	countA := map[string]int{}
+	countB := map[string]int{}
+	for _, item := range a {
+		countA[strings.TrimSpace(item)]++
+	}
+	for _, item := range b {
+		countB[strings.TrimSpace(item)]++
+	}
+	if len(countA) != len(countB) {
+		return false
+	}
+	for k, v := range countA {
+		if countB[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
 func (c *dockerHTTPClient) startContainer(ctx context.Context, containerID string) error {
 	status, body, err := c.request(ctx, http.MethodPost, "/containers/"+url.PathEscape(containerID)+"/start", nil, nil)
 	if err != nil {
@@ -625,6 +1019,38 @@ func (c *dockerHTTPClient) startContainer(ctx context.Context, containerID strin
 		return nil
 	}
 	return fmt.Errorf("start container failed: status=%d body=%s", status, strings.TrimSpace(string(body)))
+}
+
+func (c *dockerHTTPClient) waitUntilContainerRunning(ctx context.Context, containerID string, timeout time.Duration) (string, error) {
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	lastStatus := "unknown"
+
+	for {
+		info, err := c.inspectContainer(ctx, containerID)
+		if err != nil {
+			return lastStatus, err
+		}
+		if info.State != nil {
+			lastStatus = firstNonEmpty(info.State.Status, lastStatus)
+			if info.State.Running {
+				return lastStatus, nil
+			}
+			if lastStatus == "exited" || lastStatus == "dead" {
+				return lastStatus, fmt.Errorf("容器状态=%s", lastStatus)
+			}
+		}
+		if time.Now().After(deadline) {
+			return lastStatus, fmt.Errorf("等待超时，当前状态=%s", lastStatus)
+		}
+		select {
+		case <-ctx.Done():
+			return lastStatus, ctx.Err()
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
 }
 
 func (c *dockerHTTPClient) stopContainer(ctx context.Context, containerID string, timeoutSeconds int) error {
@@ -658,8 +1084,12 @@ func (c *dockerHTTPClient) removeContainer(ctx context.Context, containerID stri
 }
 
 func (c *dockerHTTPClient) pullImage(ctx context.Context, image string) error {
+	repo, tag := splitImageReference(image)
 	q := url.Values{}
-	q.Set("fromImage", image)
+	q.Set("fromImage", repo)
+	if tag != "" {
+		q.Set("tag", tag)
+	}
 	status, body, err := c.request(ctx, http.MethodPost, "/images/create", q, nil)
 	if err != nil {
 		return err
@@ -668,6 +1098,23 @@ func (c *dockerHTTPClient) pullImage(ctx context.Context, image string) error {
 		return fmt.Errorf("pull image failed: status=%d body=%s", status, strings.TrimSpace(string(body)))
 	}
 	return nil
+}
+
+func splitImageReference(image string) (repo string, tag string) {
+	ref := strings.TrimSpace(image)
+	if ref == "" {
+		return "", ""
+	}
+	if strings.Contains(ref, "@") {
+		return ref, ""
+	}
+
+	lastSlash := strings.LastIndex(ref, "/")
+	lastColon := strings.LastIndex(ref, ":")
+	if lastColon > lastSlash {
+		return ref[:lastColon], ref[lastColon+1:]
+	}
+	return ref, ""
 }
 
 func (c *dockerHTTPClient) request(ctx context.Context, method, apiPath string, q url.Values, payload interface{}) (int, []byte, error) {
