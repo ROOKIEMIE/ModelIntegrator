@@ -4,7 +4,7 @@ import (
 	"sort"
 	"sync"
 
-	"ModelIntegrator/src/pkg/model"
+	"model-control-plane/src/pkg/model"
 )
 
 type NodeRegistry struct {

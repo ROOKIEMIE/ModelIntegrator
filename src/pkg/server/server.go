@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"time"
 
-	"ModelIntegrator/src/pkg/config"
+	"model-control-plane/src/pkg/config"
 )
 
 type Server struct {

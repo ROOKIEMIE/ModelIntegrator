@@ -3,13 +3,15 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"ModelIntegrator/src/pkg/model"
+	"model-control-plane/src/pkg/model"
+	sqlitestore "model-control-plane/src/pkg/store/sqlite"
 )
 
 var (
@@ -22,6 +24,7 @@ type AgentService struct {
 	agentsByID        map[string]model.Agent
 	heartbeatTTL      time.Duration
 	heartbeatInterval time.Duration
+	store             *sqlitestore.Store
 	logger            *slog.Logger
 }
 
@@ -43,7 +46,17 @@ func NewAgentService(heartbeatTTL, heartbeatInterval time.Duration, logger *slog
 	}
 }
 
-func (s *AgentService) Register(_ context.Context, req model.AgentRegisterRequest) (model.AgentRegisterResponse, error) {
+func (s *AgentService) SetStore(store *sqlitestore.Store) error {
+	s.mu.Lock()
+	s.store = store
+	s.mu.Unlock()
+	if store == nil {
+		return nil
+	}
+	return s.loadFromStore(context.Background())
+}
+
+func (s *AgentService) Register(ctx context.Context, req model.AgentRegisterRequest) (model.AgentRegisterResponse, error) {
 	agentID := strings.TrimSpace(req.ID)
 	if agentID == "" {
 		agentID = strings.TrimSpace(req.AgentID)
@@ -56,7 +69,6 @@ func (s *AgentService) Register(_ context.Context, req model.AgentRegisterReques
 	now := time.Now().UTC()
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	existing, existed := s.agentsByID[agentID]
 	registeredAt := existing.RegisteredAt
@@ -98,6 +110,12 @@ func (s *AgentService) Register(_ context.Context, req model.AgentRegisterReques
 	}
 
 	s.agentsByID[agentID] = agent
+	store := s.store
+	s.mu.Unlock()
+
+	if err := persistAgent(ctx, store, agent); err != nil {
+		return model.AgentRegisterResponse{}, err
+	}
 
 	return model.AgentRegisterResponse{
 		Agent:                    agent,
@@ -106,7 +124,7 @@ func (s *AgentService) Register(_ context.Context, req model.AgentRegisterReques
 	}, nil
 }
 
-func (s *AgentService) Heartbeat(_ context.Context, agentID string, req model.AgentHeartbeatRequest) (model.AgentHeartbeatResponse, error) {
+func (s *AgentService) Heartbeat(ctx context.Context, agentID string, req model.AgentHeartbeatRequest) (model.AgentHeartbeatResponse, error) {
 	agentID = strings.TrimSpace(agentID)
 	if agentID == "" {
 		return model.AgentHeartbeatResponse{}, ErrInvalidAgent
@@ -114,12 +132,19 @@ func (s *AgentService) Heartbeat(_ context.Context, agentID string, req model.Ag
 
 	now := time.Now().UTC()
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	s.mu.RLock()
 	agent, ok := s.agentsByID[agentID]
+	store := s.store
+	s.mu.RUnlock()
 	if !ok {
-		return model.AgentHeartbeatResponse{}, ErrAgentNotFound
+		dbAgent, dbOK, err := getAgentByIDFromStore(ctx, store, agentID)
+		if err != nil {
+			return model.AgentHeartbeatResponse{}, err
+		}
+		if !dbOK {
+			return model.AgentHeartbeatResponse{}, ErrAgentNotFound
+		}
+		agent = dbAgent
 	}
 
 	if nodeID := strings.TrimSpace(req.NodeID); nodeID != "" {
@@ -133,7 +158,15 @@ func (s *AgentService) Heartbeat(_ context.Context, agentID string, req model.Ag
 		agent.Status = model.AgentStatusOnline
 	}
 	agent.Metadata = mergeMaps(agent.Metadata, req.Metadata)
+
+	s.mu.Lock()
 	s.agentsByID[agentID] = agent
+	store = s.store
+	s.mu.Unlock()
+
+	if err := persistAgent(ctx, store, agent); err != nil {
+		return model.AgentHeartbeatResponse{}, err
+	}
 
 	return model.AgentHeartbeatResponse{
 		ID:             agent.ID,
@@ -145,7 +178,7 @@ func (s *AgentService) Heartbeat(_ context.Context, agentID string, req model.Ag
 	}, nil
 }
 
-func (s *AgentService) ReportCapabilities(_ context.Context, agentID string, req model.AgentCapabilitiesReportRequest) (model.AgentCapabilitiesReportResponse, error) {
+func (s *AgentService) ReportCapabilities(ctx context.Context, agentID string, req model.AgentCapabilitiesReportRequest) (model.AgentCapabilitiesReportResponse, error) {
 	agentID = strings.TrimSpace(agentID)
 	nodeID := strings.TrimSpace(req.NodeID)
 	if agentID == "" {
@@ -155,7 +188,6 @@ func (s *AgentService) ReportCapabilities(_ context.Context, agentID string, req
 	now := time.Now().UTC()
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	agent, exists := s.agentsByID[agentID]
 	if !exists {
@@ -173,6 +205,7 @@ func (s *AgentService) ReportCapabilities(_ context.Context, agentID string, req
 		agent.NodeID = nodeID
 	}
 	if strings.TrimSpace(agent.NodeID) == "" {
+		s.mu.Unlock()
 		return model.AgentCapabilitiesReportResponse{}, ErrInvalidAgent
 	}
 	if strings.TrimSpace(agent.ID) == "" {
@@ -189,6 +222,12 @@ func (s *AgentService) ReportCapabilities(_ context.Context, agentID string, req
 	agent.RuntimeCapabilities = normalizeRuntimeCapabilities(req.RuntimeCapabilities)
 
 	s.agentsByID[agentID] = agent
+	store := s.store
+	s.mu.Unlock()
+
+	if err := persistAgent(ctx, store, agent); err != nil {
+		return model.AgentCapabilitiesReportResponse{}, err
+	}
 	return model.AgentCapabilitiesReportResponse{
 		Agent:            agent,
 		CapabilitySource: capabilitySourceForAgent(agent),
@@ -196,7 +235,13 @@ func (s *AgentService) ReportCapabilities(_ context.Context, agentID string, req
 	}, nil
 }
 
-func (s *AgentService) List(_ context.Context) []model.AgentState {
+func (s *AgentService) List(ctx context.Context) []model.AgentState {
+	if fromStore, err := s.listFromStore(ctx); err != nil {
+		s.logger.Warn("从 sqlite 读取 agent 列表失败，回退到内存状态", "error", err)
+	} else if len(fromStore) > 0 {
+		return fromStore
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -217,6 +262,13 @@ func (s *AgentService) GetByID(agentID string) (*model.AgentState, bool) {
 		return nil, false
 	}
 
+	if fromStore, ok, err := s.getByIDFromStore(context.Background(), agentID); err != nil {
+		s.logger.Warn("从 sqlite 读取 agent 失败，回退到内存状态", "agent_id", agentID, "error", err)
+	} else if ok {
+		withStatus := s.withComputedStatus(fromStore, time.Now().UTC())
+		return &withStatus, true
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -232,6 +284,12 @@ func (s *AgentService) ListByNodeID(nodeID string) []model.AgentState {
 	nodeID = strings.TrimSpace(nodeID)
 	if nodeID == "" {
 		return nil
+	}
+
+	if fromStore, err := s.listByNodeIDFromStore(context.Background(), nodeID); err != nil {
+		s.logger.Warn("从 sqlite 读取 node agent 列表失败，回退到内存状态", "node_id", nodeID, "error", err)
+	} else if len(fromStore) > 0 {
+		return fromStore
 	}
 
 	s.mu.RLock()
@@ -368,4 +426,113 @@ func capabilitySourceForAgent(agent model.AgentState) model.CapabilitySource {
 		return model.CapabilitySourceUnknown
 	}
 	return model.CapabilitySourceAgentReported
+}
+
+func persistAgent(ctx context.Context, store *sqlitestore.Store, agent model.Agent) error {
+	if store == nil {
+		return nil
+	}
+	if err := store.UpsertAgent(ctx, agent); err != nil {
+		return fmt.Errorf("写入 agent 持久化状态失败: %w", err)
+	}
+	return nil
+}
+
+func (s *AgentService) loadFromStore(ctx context.Context) error {
+	s.mu.RLock()
+	store := s.store
+	s.mu.RUnlock()
+	if store == nil {
+		return nil
+	}
+	items, err := store.ListAgents(ctx)
+	if err != nil {
+		return fmt.Errorf("加载 agent 持久化状态失败: %w", err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, item := range items {
+		agent := item
+		if strings.TrimSpace(agent.ID) == "" {
+			continue
+		}
+		s.agentsByID[agent.ID] = agent
+	}
+	return nil
+}
+
+func (s *AgentService) listFromStore(ctx context.Context) ([]model.AgentState, error) {
+	s.mu.RLock()
+	store := s.store
+	s.mu.RUnlock()
+	if store == nil {
+		return nil, nil
+	}
+	items, err := store.ListAgents(ctx)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	out := make([]model.AgentState, 0, len(items))
+	s.mu.Lock()
+	for _, item := range items {
+		computed := s.withComputedStatus(item, now)
+		out = append(out, computed)
+		s.agentsByID[computed.ID] = computed
+	}
+	s.mu.Unlock()
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].ID < out[j].ID
+	})
+	return out, nil
+}
+
+func (s *AgentService) getByIDFromStore(ctx context.Context, agentID string) (model.AgentState, bool, error) {
+	s.mu.RLock()
+	store := s.store
+	s.mu.RUnlock()
+	item, ok, err := getAgentByIDFromStore(ctx, store, agentID)
+	if err != nil || !ok {
+		return model.AgentState{}, ok, err
+	}
+	s.mu.Lock()
+	s.agentsByID[item.ID] = item
+	s.mu.Unlock()
+	return item, true, nil
+}
+
+func getAgentByIDFromStore(ctx context.Context, store *sqlitestore.Store, agentID string) (model.AgentState, bool, error) {
+	if store == nil {
+		return model.AgentState{}, false, nil
+	}
+	return store.GetAgentByID(ctx, agentID)
+}
+
+func (s *AgentService) listByNodeIDFromStore(ctx context.Context, nodeID string) ([]model.AgentState, error) {
+	s.mu.RLock()
+	store := s.store
+	s.mu.RUnlock()
+	if store == nil {
+		return nil, nil
+	}
+	items, err := store.ListAgentsByNodeID(ctx, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	out := make([]model.AgentState, 0, len(items))
+	s.mu.Lock()
+	for _, item := range items {
+		computed := s.withComputedStatus(item, now)
+		out = append(out, computed)
+		s.agentsByID[computed.ID] = computed
+	}
+	s.mu.Unlock()
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Status != out[j].Status {
+			return out[i].Status == model.AgentStatusOnline
+		}
+		return out[i].LastHeartbeatAt.After(out[j].LastHeartbeatAt)
+	})
+	return out, nil
 }

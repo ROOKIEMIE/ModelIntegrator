@@ -8,7 +8,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"ModelIntegrator/src/pkg/model"
+	"model-control-plane/src/pkg/model"
 )
 
 const DefaultConfigPath = "./resources/config/config.example.yaml"
@@ -79,7 +79,7 @@ func DefaultConfig() *Config {
 			Format: "text",
 		},
 		Storage: StorageConfig{
-			SQLitePath:   "./resources/config/modelintegrator.db",
+			SQLitePath:   "./resources/config/controller.db",
 			ModelRootDir: "./resources/models",
 		},
 		Integrations: IntegrationsConfig{
@@ -210,7 +210,7 @@ func (c *Config) Validate() error {
 		c.Server.ShutdownTimeoutSeconds = 10
 	}
 	if c.Storage.SQLitePath == "" {
-		c.Storage.SQLitePath = "./resources/config/modelintegrator.db"
+		c.Storage.SQLitePath = "./resources/config/controller.db"
 	}
 	if c.Storage.ModelRootDir == "" {
 		c.Storage.ModelRootDir = "./resources/models"

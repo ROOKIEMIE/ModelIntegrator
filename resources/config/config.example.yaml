@@ -10,7 +10,7 @@ log:
   format: "text"
 
 storage:
-  sqlite_path: "./resources/config/modelintegrator.db"
+  sqlite_path: "./resources/config/controller.db"
   model_root_dir: "./resources/models"
 
 auth:

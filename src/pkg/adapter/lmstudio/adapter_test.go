@@ -3,7 +3,7 @@ package lmstudio
 import (
 	"testing"
 
-	"ModelIntegrator/src/pkg/model"
+	"model-control-plane/src/pkg/model"
 )
 
 func TestParseModelState(t *testing.T) {

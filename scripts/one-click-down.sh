@@ -14,8 +14,13 @@ if ! docker compose version >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "[INFO] 检查并清理 ModelIntegrator 管理的模型容器..."
-mapfile -t MODEL_CONTAINERS < <(docker ps -aq --filter label=com.modelintegrator.managed=true)
+echo "[INFO] 检查并清理 controller 管理的模型容器..."
+mapfile -t MODEL_CONTAINERS < <(
+  {
+    docker ps -aq --filter label=com.controller.managed=true
+    docker ps -aq --filter label=com.modelintegrator.managed=true
+  } | awk 'NF' | sort -u
+)
 if [ "${#MODEL_CONTAINERS[@]}" -gt 0 ]; then
   docker rm -f "${MODEL_CONTAINERS[@]}" >/dev/null
   echo "[INFO] 已清理 ${#MODEL_CONTAINERS[@]} 个模型容器"

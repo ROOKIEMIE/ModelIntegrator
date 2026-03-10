@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"ModelIntegrator/src/pkg/model"
+	"model-control-plane/src/pkg/model"
 )
 
 func TestParsePortMapping(t *testing.T) {
@@ -158,16 +158,16 @@ func TestTranslateContainerPathToHost(t *testing.T) {
 	c.selfMountOnce.Do(func() {})
 	c.selfMounts = []containerMount{
 		{
-			Source:      "/home/whoami/Dev/ModelIntegrator/resources",
-			Destination: "/opt/modelintegrator/resources",
+			Source:      "/home/whoami/Dev/model-control-plane/resources",
+			Destination: "/opt/controller/resources",
 		},
 	}
 
-	got, ok := c.translateContainerPathToHost(context.Background(), "/opt/modelintegrator/resources/models")
+	got, ok := c.translateContainerPathToHost(context.Background(), "/opt/controller/resources/models")
 	if !ok {
 		t.Fatalf("expected path translation")
 	}
-	if got != "/home/whoami/Dev/ModelIntegrator/resources/models" {
+	if got != "/home/whoami/Dev/model-control-plane/resources/models" {
 		t.Fatalf("unexpected translated path: %s", got)
 	}
 }
@@ -187,17 +187,17 @@ func TestSplitAndJoinVolumeBinding(t *testing.T) {
 	}
 }
 
-func TestIsModelIntegratorManagedContainer(t *testing.T) {
+func TestIsControllerManagedContainer(t *testing.T) {
 	info := containerInspect{}
 	info.Config.Labels = map[string]string{
-		"com.modelintegrator.managed": "true",
+		labelControllerManaged: "true",
 	}
-	if !isModelIntegratorManagedContainer(info) {
+	if !isControllerManagedContainer(info) {
 		t.Fatalf("container should be recognized as managed")
 	}
 
-	info.Config.Labels["com.modelintegrator.managed"] = "false"
-	if isModelIntegratorManagedContainer(info) {
+	info.Config.Labels[labelControllerManaged] = "false"
+	if isControllerManagedContainer(info) {
 		t.Fatalf("container should not be recognized as managed")
 	}
 }
@@ -206,14 +206,14 @@ func TestIsContainerOwnedByModel(t *testing.T) {
 	m := model.Model{ID: "local-embed"}
 	info := containerInspect{}
 	info.Config.Labels = map[string]string{
-		"com.modelintegrator.managed":  "true",
-		"com.modelintegrator.model_id": "local-embed",
+		labelControllerManaged: "true",
+		labelControllerModelID: "local-embed",
 	}
 	if !isContainerOwnedByModel(info, m) {
 		t.Fatalf("container should be recognized as owned by model")
 	}
 
-	info.Config.Labels["com.modelintegrator.model_id"] = "another-model"
+	info.Config.Labels[labelControllerModelID] = "another-model"
 	if isContainerOwnedByModel(info, m) {
 		t.Fatalf("container should not be recognized as owned by model")
 	}

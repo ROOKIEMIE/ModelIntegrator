@@ -1,9 +1,9 @@
-# ModelIntegrator (MVP)
+# Local LLM Control Plane (Controller)
 
 - [中文（默认）](./README.md)
 - English (current)
 
-ModelIntegrator is a local multi-node LLM control plane for Linux server + LAN Mac mini runtime management.
+Local LLM Control Plane is a local multi-node LLM control plane for Linux server + LAN Mac mini runtime management.
 
 ## Implementation Snapshot
 
@@ -69,20 +69,20 @@ ModelIntegrator is a local multi-node LLM control plane for Linux server + LAN M
 
 ## Zero-to-Deployment
 
-Target directory: `/tank/docker_data/model_intergrator`
+Target directory: `/tank/docker_data/model_control_plane`
 
 ```bash
-sudo mkdir -p /tank/docker_data/model_intergrator
-sudo chown -R $USER:$USER /tank/docker_data/model_intergrator
-rsync -a --delete /home/whoami/Dev/ModelIntegrator/ /tank/docker_data/model_intergrator/
-cd /tank/docker_data/model_intergrator
+sudo mkdir -p /tank/docker_data/model_control_plane
+sudo chown -R $USER:$USER /tank/docker_data/model_control_plane
+rsync -a --delete /home/whoami/Dev/model-control-plane/ /tank/docker_data/model_control_plane/
+cd /tank/docker_data/model_control_plane
 ```
 
 ```bash
 cp resources/docker/compose.example.env .env
 mkdir -p resources/config resources/models
-touch resources/config/modelintegrator.db
-chmod 666 resources/config/modelintegrator.db
+touch resources/config/controller.db
+chmod 666 resources/config/controller.db
 ```
 
 ```bash
@@ -152,6 +152,16 @@ Stop:
 - `MCP_VLLM_MAX_MODEL_LEN` (vLLM max context length)
 - `HUGGING_FACE_HUB_TOKEN` (optional token for private/gated HF models)
 
+### SQLite Persistence Notes (Control Plane State)
+
+- The control plane persists key state into the SQLite file configured by `MCP_SQLITE_PATH`:
+  - agent registration, latest heartbeat, and capability reports
+  - node base info and latest aggregated state (classification/tier/source/agent status)
+  - model base registration and latest runtime state
+  - minimal runtime linkage state (status/capabilities/actions/last seen)
+- It is recommended to mount `resources/config/controller.db` as a persistent volume.
+- After controller restart, key state is reloaded from SQLite and continues with an in-memory cache + SQLite persistence mode.
+
 ## nodes Config Notes (Important)
 
 - Manual `id` is no longer required in `nodes`.
@@ -213,7 +223,7 @@ Example payload:
 ## Confirmed Roadmap
 
 - Docker/Portainer adapter: NVIDIA-first implementation, then expand to other hardware.
-- SQLite: persistent model/node read-write will be added in the next phase (currently path/file prep only).
+- SQLite: key agent/node/model/runtime state persistence is now enabled; migration tooling and action audit tables are next.
 
 ## API
 

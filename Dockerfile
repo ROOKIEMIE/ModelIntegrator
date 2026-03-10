@@ -8,17 +8,17 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/controller ./src/cmd/controller
 
 FROM alpine:3.20
-WORKDIR /opt/modelintegrator
+WORKDIR /opt/controller
 
 RUN addgroup -S app && adduser -S app -G app \
-    && mkdir -p /opt/modelintegrator/resources /opt/modelintegrator/models \
-    && chown -R app:app /opt/modelintegrator
+    && mkdir -p /opt/controller/resources /opt/controller/models \
+    && chown -R app:app /opt/controller
 
-COPY --from=builder --chown=app:app /out/controller /opt/modelintegrator/controller
-COPY --chown=app:app resources /opt/modelintegrator/resources
+COPY --from=builder --chown=app:app /out/controller /opt/controller/controller
+COPY --chown=app:app resources /opt/controller/resources
 
 EXPOSE 8080
-ENV MCP_CONFIG=/opt/modelintegrator/resources/config/config.example.yaml
+ENV MCP_CONFIG=/opt/controller/resources/config/config.example.yaml
 
 USER app
-CMD ["/opt/modelintegrator/controller"]
+CMD ["/opt/controller/controller"]

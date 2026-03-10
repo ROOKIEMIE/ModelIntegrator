@@ -19,7 +19,24 @@ import (
 	"sync"
 	"time"
 
-	"ModelIntegrator/src/pkg/model"
+	"model-control-plane/src/pkg/model"
+)
+
+const (
+	labelControllerManaged      = "com.controller.managed"
+	labelControllerModelID      = "com.controller.model_id"
+	labelControllerModelName    = "com.controller.model_name"
+	labelControllerRuntimeID    = "com.controller.runtime_id"
+	labelControllerTemplateID   = "com.controller.template_id"
+	labelControllerTemplateName = "com.controller.template_name"
+
+	// 兼容历史已落库/已运行容器标签，后续可在迁移窗口后移除。
+	legacyLabelManaged      = "com.modelintegrator.managed"
+	legacyLabelModelID      = "com.modelintegrator.model_id"
+	legacyLabelModelName    = "com.modelintegrator.model_name"
+	legacyLabelTemplateID   = "com.modelintegrator.template_id"
+	legacyLabelRuntimeID    = "com.modelintegrator.runtime_id"
+	legacyLabelTemplateName = "com.modelintegrator.template_name"
 )
 
 type Adapter struct {
@@ -55,9 +72,7 @@ func (a *Adapter) ListModels(ctx context.Context) ([]model.Model, error) {
 	if err != nil {
 		return nil, err
 	}
-	containers, err := client.listContainers(ctx, true, map[string][]string{
-		"label": {"com.modelintegrator.managed=true"},
-	})
+	containers, err := client.listManagedContainers(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -68,8 +83,8 @@ func (a *Adapter) ListModels(ctx context.Context) ([]model.Model, error) {
 			state = model.ModelStateRunning
 		}
 		m := model.Model{
-			ID:          firstNonEmpty(c.Labels["com.modelintegrator.model_id"], strings.TrimPrefix(strings.TrimSpace(firstContainerName(c.Names)), "/")),
-			Name:        firstNonEmpty(c.Labels["com.modelintegrator.model_name"], c.Image),
+			ID:          firstNonEmpty(readContainerLabel(c.Labels, labelControllerModelID, legacyLabelModelID), strings.TrimPrefix(strings.TrimSpace(firstContainerName(c.Names)), "/")),
+			Name:        firstNonEmpty(readContainerLabel(c.Labels, labelControllerModelName, legacyLabelModelName), c.Image),
 			Provider:    "docker",
 			BackendType: model.RuntimeTypeDocker,
 			State:       state,
@@ -563,11 +578,11 @@ func (c *dockerHTTPClient) ensureContainer(ctx context.Context, m model.Model, t
 		if inspectErr != nil {
 			return "", false, inspectErr
 		}
-		if !isModelIntegratorManagedContainer(info) {
+		if !isControllerManagedContainer(info) {
 			return "", false, fmt.Errorf("存在同名非受管容器 (%s)，拒绝覆盖", existingID)
 		}
 		if !isContainerOwnedByModel(info, m) {
-			return "", false, fmt.Errorf("容器名称冲突：%s 属于其他模型 (%s)", existingID, strings.TrimSpace(info.Config.Labels["com.modelintegrator.model_id"]))
+			return "", false, fmt.Errorf("容器名称冲突：%s 属于其他模型 (%s)", existingID, readContainerLabel(info.Config.Labels, labelControllerModelID, legacyLabelModelID))
 		}
 		recreate, checkErr := c.containerNeedsRecreate(ctx, existingID, m, tpl)
 		if checkErr != nil {
@@ -601,7 +616,7 @@ func (c *dockerHTTPClient) containerNeedsRecreate(ctx context.Context, container
 	}
 
 	expectedTemplateID := firstNonEmpty(strings.TrimSpace(tpl.ID), strings.TrimSpace(m.Metadata["runtime_template_id"]))
-	actualTemplateID := strings.TrimSpace(info.Config.Labels["com.modelintegrator.template_id"])
+	actualTemplateID := readContainerLabel(info.Config.Labels, labelControllerTemplateID, legacyLabelTemplateID)
 	if expectedTemplateID != "" && actualTemplateID != "" && expectedTemplateID != actualTemplateID {
 		return true, nil
 	}
@@ -650,23 +665,23 @@ func (c *dockerHTTPClient) resolveContainerID(ctx context.Context, m model.Model
 	return list[0].ID, true, nil
 }
 
-func isModelIntegratorManagedContainer(info containerInspect) bool {
+func isControllerManagedContainer(info containerInspect) bool {
 	labels := info.Config.Labels
 	if labels == nil {
 		return false
 	}
-	return strings.EqualFold(strings.TrimSpace(labels["com.modelintegrator.managed"]), "true")
+	return strings.EqualFold(readContainerLabel(labels, labelControllerManaged, legacyLabelManaged), "true")
 }
 
 func isContainerOwnedByModel(info containerInspect, m model.Model) bool {
-	if !isModelIntegratorManagedContainer(info) {
+	if !isControllerManagedContainer(info) {
 		return false
 	}
 	labels := info.Config.Labels
 	if labels == nil {
 		return false
 	}
-	modelID := strings.TrimSpace(labels["com.modelintegrator.model_id"])
+	modelID := readContainerLabel(labels, labelControllerModelID, legacyLabelModelID)
 	expectedID := strings.TrimSpace(m.ID)
 	return modelID != "" && expectedID != "" && modelID == expectedID
 }
@@ -678,6 +693,57 @@ type containerListItem struct {
 	State  string            `json:"State"`
 	Status string            `json:"Status"`
 	Labels map[string]string `json:"Labels"`
+}
+
+func readContainerLabel(labels map[string]string, keys ...string) string {
+	if labels == nil {
+		return ""
+	}
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		if v := strings.TrimSpace(labels[key]); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func (c *dockerHTTPClient) listManagedContainers(ctx context.Context) ([]containerListItem, error) {
+	managedByController, err := c.listContainers(ctx, true, map[string][]string{
+		"label": {labelControllerManaged + "=true"},
+	})
+	if err != nil {
+		return nil, err
+	}
+	managedByLegacy, err := c.listContainers(ctx, true, map[string][]string{
+		"label": {legacyLabelManaged + "=true"},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	merged := make([]containerListItem, 0, len(managedByController)+len(managedByLegacy))
+	seen := make(map[string]struct{}, len(managedByController)+len(managedByLegacy))
+	for _, item := range managedByController {
+		if strings.TrimSpace(item.ID) == "" {
+			continue
+		}
+		seen[item.ID] = struct{}{}
+		merged = append(merged, item)
+	}
+	for _, item := range managedByLegacy {
+		if strings.TrimSpace(item.ID) == "" {
+			continue
+		}
+		if _, ok := seen[item.ID]; ok {
+			continue
+		}
+		seen[item.ID] = struct{}{}
+		merged = append(merged, item)
+	}
+	return merged, nil
 }
 
 func (c *dockerHTTPClient) listContainers(ctx context.Context, all bool, filters map[string][]string) ([]containerListItem, error) {
@@ -792,12 +858,18 @@ func (c *dockerHTTPClient) createContainer(ctx context.Context, m model.Model, t
 		Cmd:   tpl.Command,
 		Env:   envItems,
 		Labels: map[string]string{
-			"com.modelintegrator.managed":       "true",
-			"com.modelintegrator.model_id":      m.ID,
-			"com.modelintegrator.model_name":    m.Name,
-			"com.modelintegrator.runtime_id":    m.RuntimeID,
-			"com.modelintegrator.template_id":   firstNonEmpty(tpl.ID, m.Metadata["runtime_template_id"]),
-			"com.modelintegrator.template_name": tpl.Name,
+			labelControllerManaged:      "true",
+			labelControllerModelID:      m.ID,
+			labelControllerModelName:    m.Name,
+			labelControllerRuntimeID:    m.RuntimeID,
+			labelControllerTemplateID:   firstNonEmpty(tpl.ID, m.Metadata["runtime_template_id"]),
+			labelControllerTemplateName: tpl.Name,
+			legacyLabelManaged:          "true",
+			legacyLabelModelID:          m.ID,
+			legacyLabelModelName:        m.Name,
+			legacyLabelRuntimeID:        m.RuntimeID,
+			legacyLabelTemplateID:       firstNonEmpty(tpl.ID, m.Metadata["runtime_template_id"]),
+			legacyLabelTemplateName:     tpl.Name,
 		},
 		ExposedPorts: exposedPorts,
 		HostConfig: hostConfig{

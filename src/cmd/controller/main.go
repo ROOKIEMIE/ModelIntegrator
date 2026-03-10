@@ -7,20 +7,21 @@ import (
 	"syscall"
 	"time"
 
-	"ModelIntegrator/src/pkg/adapter"
-	"ModelIntegrator/src/pkg/adapter/dockerctl"
-	"ModelIntegrator/src/pkg/adapter/lmstudio"
-	"ModelIntegrator/src/pkg/api"
-	"ModelIntegrator/src/pkg/config"
-	"ModelIntegrator/src/pkg/logger"
-	"ModelIntegrator/src/pkg/model"
-	"ModelIntegrator/src/pkg/preflight"
-	"ModelIntegrator/src/pkg/registry"
-	"ModelIntegrator/src/pkg/scheduler"
-	"ModelIntegrator/src/pkg/server"
-	"ModelIntegrator/src/pkg/service"
-	"ModelIntegrator/src/pkg/storage"
-	"ModelIntegrator/src/pkg/version"
+	"model-control-plane/src/pkg/adapter"
+	"model-control-plane/src/pkg/adapter/dockerctl"
+	"model-control-plane/src/pkg/adapter/lmstudio"
+	"model-control-plane/src/pkg/api"
+	"model-control-plane/src/pkg/config"
+	"model-control-plane/src/pkg/logger"
+	"model-control-plane/src/pkg/model"
+	"model-control-plane/src/pkg/preflight"
+	"model-control-plane/src/pkg/registry"
+	"model-control-plane/src/pkg/scheduler"
+	"model-control-plane/src/pkg/server"
+	"model-control-plane/src/pkg/service"
+	"model-control-plane/src/pkg/storage"
+	sqlitestore "model-control-plane/src/pkg/store/sqlite"
+	"model-control-plane/src/pkg/version"
 )
 
 func main() {
@@ -37,10 +38,21 @@ func main() {
 	applyNodePlatformInfo(cfg, gpuReport)
 
 	if err := storage.EnsureSQLitePath(cfg.Storage.SQLitePath); err != nil {
-		log.Warn("SQLite 路径准备失败", "path", cfg.Storage.SQLitePath, "error", err)
-	} else {
-		log.Info("SQLite 路径准备完成", "path", cfg.Storage.SQLitePath)
+		log.Error("SQLite 路径准备失败", "path", cfg.Storage.SQLitePath, "error", err)
+		os.Exit(1)
 	}
+	log.Info("SQLite 路径准备完成", "path", cfg.Storage.SQLitePath)
+
+	sqliteStore, err := sqlitestore.Open(cfg.Storage.SQLitePath, log)
+	if err != nil {
+		log.Error("SQLite 初始化失败", "path", cfg.Storage.SQLitePath, "error", err)
+		os.Exit(1)
+	}
+	defer func() {
+		if closeErr := sqliteStore.Close(); closeErr != nil {
+			log.Warn("关闭 SQLite 失败", "error", closeErr)
+		}
+	}()
 	if err := storage.EnsureDirectory(cfg.Storage.ModelRootDir); err != nil {
 		log.Warn("模型目录检查失败", "path", cfg.Storage.ModelRootDir, "error", err)
 	} else {
@@ -87,8 +99,20 @@ func main() {
 	}
 
 	agentService := service.NewAgentService(45*time.Second, 15*time.Second, log)
+	if err := agentService.SetStore(sqliteStore); err != nil {
+		log.Error("agent 持久化状态加载失败", "error", err)
+		os.Exit(1)
+	}
 	nodeService := service.NewNodeService(nodeRegistry, adapterManager, agentService, log)
+	nodeService.SetStore(sqliteStore)
+	if err := nodeService.SyncRegistryToStore(context.Background()); err != nil {
+		log.Warn("节点初始配置同步到 SQLite 失败", "error", err)
+	}
 	modelService := service.NewModelService(modelRegistry, nodeRegistry, runtimeTemplateService, schedulerInstance, adapterManager, log, cfg.Storage.ModelRootDir)
+	if err := modelService.SetStore(sqliteStore); err != nil {
+		log.Error("模型持久化状态加载失败", "error", err)
+		os.Exit(1)
+	}
 
 	handler := api.NewHandler(nodeService, modelService, runtimeTemplateService, agentService, log, version.Get())
 	router := api.NewRouter(handler, cfg.Server.StaticDir, cfg.Auth.Token, log)

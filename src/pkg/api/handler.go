@@ -11,10 +11,10 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"ModelIntegrator/src/pkg/health"
-	"ModelIntegrator/src/pkg/model"
-	"ModelIntegrator/src/pkg/service"
-	"ModelIntegrator/src/pkg/version"
+	"model-control-plane/src/pkg/health"
+	"model-control-plane/src/pkg/model"
+	"model-control-plane/src/pkg/service"
+	"model-control-plane/src/pkg/version"
 )
 
 type Handler struct {

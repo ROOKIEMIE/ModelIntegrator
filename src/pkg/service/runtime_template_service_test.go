@@ -3,8 +3,8 @@ package service
 import (
 	"testing"
 
-	"ModelIntegrator/src/pkg/model"
-	"ModelIntegrator/src/pkg/registry"
+	"model-control-plane/src/pkg/model"
+	"model-control-plane/src/pkg/registry"
 )
 
 func TestValidateTemplateSuccess(t *testing.T) {

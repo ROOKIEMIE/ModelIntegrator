@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"ModelIntegrator/src/pkg/version"
+	"model-control-plane/src/pkg/version"
 )
 
 func testLogger() *slog.Logger {

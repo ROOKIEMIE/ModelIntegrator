@@ -18,20 +18,20 @@ services:
       dockerfile: Dockerfile
     container_name: controller
     environment:
-      MCP_CONFIG: /opt/modelintegrator/resources/config/config.example.yaml
+      MCP_CONFIG: /opt/controller/resources/config/config.example.yaml
       MCP_SERVER_ADDRESS: ":8080"
       MCP_LOG_LEVEL: ${MCP_LOG_LEVEL:-info}
       MCP_LOG_FORMAT: ${MCP_LOG_FORMAT:-text}
-      MCP_SQLITE_PATH: ${MCP_SQLITE_PATH:-/opt/modelintegrator/resources/config/modelintegrator.db}
-      MCP_MODEL_ROOT_DIR: ${MCP_MODEL_ROOT_DIR:-/opt/modelintegrator/models}
+      MCP_SQLITE_PATH: ${MCP_SQLITE_PATH:-/opt/controller/resources/config/controller.db}
+      MCP_MODEL_ROOT_DIR: ${MCP_MODEL_ROOT_DIR:-/opt/controller/models}
       MCP_LMSTUDIO_ENDPOINT: ${MCP_LMSTUDIO_ENDPOINT:-http://192.168.50.241:1234}
       MCP_LMSTUDIO_CACHE_ENABLED: ${MCP_LMSTUDIO_CACHE_ENABLED:-true}
       MCP_LMSTUDIO_CACHE_REFRESH_SECONDS: ${MCP_LMSTUDIO_CACHE_REFRESH_SECONDS:-30}
       MCP_DOCKER_ENDPOINT: ${MCP_DOCKER_ENDPOINT:-unix:///var/run/docker.sock}
       MCP_PORTAINER_ENDPOINT: ${MCP_PORTAINER_ENDPOINT:-http://portainer:9000}
     volumes:
-      - ${MCP_PROJECT_DIR:-.}/resources:/opt/modelintegrator/resources
-      - ${MCP_MODEL_DIR_HOST:-./resources/models}:${MCP_MODEL_ROOT_DIR:-/opt/modelintegrator/models}:ro
+      - ${MCP_PROJECT_DIR:-.}/resources:/opt/controller/resources
+      - ${MCP_MODEL_DIR_HOST:-./resources/models}:${MCP_MODEL_ROOT_DIR:-/opt/controller/models}:ro
       - /var/run/docker.sock:/var/run/docker.sock
     # 让非 root 的 app 用户具备 docker.sock 的组访问权限。
     group_add:
@@ -167,4 +167,5 @@ services:
 
 networks:
   mcp_net:
+    name: controller_mcp_net
     driver: bridge

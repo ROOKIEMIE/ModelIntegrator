@@ -8,8 +8,8 @@ import (
 	"strconv"
 	"strings"
 
-	"ModelIntegrator/src/pkg/model"
-	"ModelIntegrator/src/pkg/registry"
+	"model-control-plane/src/pkg/model"
+	"model-control-plane/src/pkg/registry"
 )
 
 const (

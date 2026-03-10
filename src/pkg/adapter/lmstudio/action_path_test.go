@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"ModelIntegrator/src/pkg/model"
+	"model-control-plane/src/pkg/model"
 )
 
 func TestLoadModelUsesAPIPathFirst(t *testing.T) {

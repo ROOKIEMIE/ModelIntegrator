@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"ModelIntegrator/src/pkg/model"
+	"model-control-plane/src/pkg/model"
 )
 
 type Adapter struct {

@@ -1,13 +1,13 @@
-# ModelIntegrator（MVP）
+# Local LLM Control Plane（Controller）
 
 - 中文（当前）
 - [English](./README.en.md)
 
-ModelIntegrator 是一个本地多节点 LLM 控制平面，用于统一管理 Linux 服务器与局域网 Mac mini 上的模型运行时。
+Local LLM Control Plane 是一个本地多节点 LLM 控制平面，用于统一管理 Linux 服务器与局域网 Mac mini 上的模型运行时。
 
 ## 项目定位
 
-ModelIntegrator 的定位是“本地多节点 LLM 控制平面”，核心目标是统一管理：
+Local LLM Control Plane 的定位是“本地多节点 LLM 控制平面”，核心目标是统一管理：
 
 - 主节点上的 Docker 化模型服务
 - 从节点上的 LM Studio / Ollama / vLLM 等运行时
@@ -208,20 +208,20 @@ src/pkg/
 
 ## 从 0 开始部署
 
-目标目录：`/tank/docker_data/model_intergrator`
+目标目录：`/tank/docker_data/model_control_plane`
 
 ```bash
-sudo mkdir -p /tank/docker_data/model_intergrator
-sudo chown -R $USER:$USER /tank/docker_data/model_intergrator
-rsync -a --delete /home/whoami/Dev/ModelIntegrator/ /tank/docker_data/model_intergrator/
-cd /tank/docker_data/model_intergrator
+sudo mkdir -p /tank/docker_data/model_control_plane
+sudo chown -R $USER:$USER /tank/docker_data/model_control_plane
+rsync -a --delete /home/whoami/Dev/model-control-plane/ /tank/docker_data/model_control_plane/
+cd /tank/docker_data/model_control_plane
 ```
 
 ```bash
 cp resources/docker/compose.example.env .env
 mkdir -p resources/config resources/models
-touch resources/config/modelintegrator.db
-chmod 666 resources/config/modelintegrator.db
+touch resources/config/controller.db
+chmod 666 resources/config/controller.db
 ```
 
 ```bash
@@ -274,7 +274,7 @@ curl -sS http://127.0.0.1:59081/api/v1/nodes
 - `MCP_EXTERNAL_PORT`：外部网关端口（默认 `59081`）
 - `MCP_SQLITE_PATH`：SQLite 文件路径
 - `MCP_MODEL_DIR_HOST`：宿主机模型目录（默认 `./resources/models`）
-- `MCP_MODEL_ROOT_DIR`：容器内模型目录（默认 `/opt/modelintegrator/models`）
+- `MCP_MODEL_ROOT_DIR`：容器内模型目录（默认 `/opt/controller/models`）
 - `MCP_LMSTUDIO_ENDPOINT`：LM Studio 地址
 - `MCP_LMSTUDIO_CACHE_ENABLED`：是否启用 LM Studio 模型缓存
 - `MCP_LMSTUDIO_CACHE_REFRESH_SECONDS`：缓存刷新间隔秒数
@@ -290,6 +290,16 @@ curl -sS http://127.0.0.1:59081/api/v1/nodes
 - `MCP_VLLM_GPU_MEMORY_UTILIZATION`：vLLM GPU 显存占用上限
 - `MCP_VLLM_MAX_MODEL_LEN`：vLLM 最大上下文长度
 - `HUGGING_FACE_HUB_TOKEN`：访问私有/gated 模型用 token（可选）
+
+### SQLite 持久化说明（控制平面状态）
+
+- 控制平面会将关键状态持久化到 `MCP_SQLITE_PATH` 指定的 SQLite 文件：
+  - agent 注册信息、最近心跳、能力上报结果
+  - node 基础信息与最近聚合状态（含分类/能力分级/能力来源/agent 状态）
+  - model 基础注册信息与最近状态
+  - runtime 最小关联状态（状态/能力/动作/最近探测时间）
+- 推荐将 `resources/config/controller.db` 挂载到持久卷，避免容器重建后丢失状态。
+- controller 重启后会从 SQLite 回填关键状态，并继续以“内存缓存 + SQLite 持久化”模式运行。
 
 ## nodes 配置说明（重要）
 

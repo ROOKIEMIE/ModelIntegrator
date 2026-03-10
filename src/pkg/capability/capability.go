@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"ModelIntegrator/src/pkg/model"
+	"model-control-plane/src/pkg/model"
 )
 
 func EnrichNode(node *model.Node, agent *model.AgentState) {

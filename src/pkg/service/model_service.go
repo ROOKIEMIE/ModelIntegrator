@@ -8,15 +8,17 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
 
-	"ModelIntegrator/src/pkg/adapter"
-	"ModelIntegrator/src/pkg/model"
-	"ModelIntegrator/src/pkg/registry"
-	"ModelIntegrator/src/pkg/scheduler"
+	"model-control-plane/src/pkg/adapter"
+	"model-control-plane/src/pkg/model"
+	"model-control-plane/src/pkg/registry"
+	"model-control-plane/src/pkg/scheduler"
+	sqlitestore "model-control-plane/src/pkg/store/sqlite"
 )
 
 var ErrModelNotFound = errors.New("model not found")
@@ -27,6 +29,7 @@ type ModelService struct {
 	templates     *RuntimeTemplateService
 	scheduler     *scheduler.Scheduler
 	adapters      *adapter.Manager
+	store         *sqlitestore.Store
 	logger        *slog.Logger
 	refreshMu     sync.Mutex
 	modelRootDir  string
@@ -56,17 +59,79 @@ func NewModelService(
 }
 
 func (s *ModelService) ListModels(ctx context.Context) ([]model.Model, error) {
-	_ = ctx
-	return s.modelRegistry.List(), nil
+	models := s.modelRegistry.List()
+	if s.store == nil {
+		return models, nil
+	}
+
+	dbModels, err := s.store.ListModels(ctx)
+	if err != nil {
+		s.logger.Warn("从 sqlite 读取模型状态失败，返回内存状态", "error", err)
+		return models, nil
+	}
+	merged := mergeModels(models, dbModels)
+	for _, item := range merged {
+		s.modelRegistry.Upsert(item)
+	}
+	return merged, nil
 }
 
 func (s *ModelService) GetModel(ctx context.Context, id string) (model.Model, error) {
-	_ = ctx
 	m, ok := s.modelRegistry.Get(id)
+	if s.store == nil {
+		if !ok {
+			return model.Model{}, ErrModelNotFound
+		}
+		return m, nil
+	}
+
+	dbModel, dbOK, err := s.store.GetModelByID(ctx, id)
+	if err != nil {
+		s.logger.Warn("从 sqlite 读取模型详情失败，回退内存状态", "model_id", id, "error", err)
+		if !ok {
+			return model.Model{}, ErrModelNotFound
+		}
+		return m, nil
+	}
+	if ok && dbOK {
+		merged := mergeOneModel(m, dbModel)
+		s.modelRegistry.Upsert(merged)
+		return merged, nil
+	}
+	if dbOK {
+		s.modelRegistry.Upsert(dbModel)
+		return dbModel, nil
+	}
 	if !ok {
 		return model.Model{}, ErrModelNotFound
 	}
 	return m, nil
+}
+
+func (s *ModelService) SetStore(store *sqlitestore.Store) error {
+	s.store = store
+	if store == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	dbModels, err := store.ListModels(ctx)
+	if err != nil {
+		return err
+	}
+	merged := mergeModels(s.modelRegistry.List(), dbModels)
+	for _, item := range merged {
+		s.modelRegistry.Upsert(item)
+	}
+	return store.UpsertModels(ctx, merged)
+}
+
+func (s *ModelService) SyncRegistryToStore(ctx context.Context) error {
+	if s.store == nil {
+		return nil
+	}
+	return s.store.UpsertModels(ctx, s.modelRegistry.List())
 }
 
 func (s *ModelService) LoadModel(ctx context.Context, id string) (model.ActionResult, error) {
@@ -122,6 +187,7 @@ func (s *ModelService) RefreshModels(ctx context.Context) error {
 	recordStepErr("refresh_local_models", s.refreshLocalModels(ctx))
 	recordStepErr("refresh_container_runtime_states", s.refreshContainerRuntimeStates(ctx))
 	recordStepErr("refresh_lmstudio_models", s.refreshLMStudioModels(ctx))
+	recordStepErr("persist_models", s.SyncRegistryToStore(ctx))
 
 	return errors.Join(refreshErrors...)
 }
@@ -224,6 +290,9 @@ func (s *ModelService) executeAction(ctx context.Context, id, action string) (mo
 			applyContainerRuntimeDetail(stopResult.Detail, &m)
 			m.State = model.ModelStateLoaded
 			s.modelRegistry.Upsert(m)
+			if err := s.persistModel(ctx, m); err != nil {
+				return actionResult(false, "写入模型持久化状态失败", map[string]interface{}{"error": err.Error(), "model_id": m.ID}), nil
+			}
 		}
 		result, err = adapterInstance.UnloadModel(ctx, actionModel)
 		if result.Success {
@@ -271,6 +340,9 @@ func (s *ModelService) executeAction(ctx context.Context, id, action string) (mo
 	applyContainerRuntimeDetail(result.Detail, &m)
 
 	s.modelRegistry.Upsert(m)
+	if err := s.persistModel(ctx, m); err != nil {
+		return actionResult(false, "写入模型持久化状态失败", map[string]interface{}{"error": err.Error(), "model_id": m.ID}), nil
+	}
 	return result, nil
 }
 
@@ -602,6 +674,13 @@ func (s *ModelService) refreshContainerRuntimeStates(ctx context.Context) error 
 	return errors.Join(refreshErrors...)
 }
 
+func (s *ModelService) persistModel(ctx context.Context, item model.Model) error {
+	if s.store == nil {
+		return nil
+	}
+	return s.store.UpsertModel(ctx, item)
+}
+
 func normalizeModelName(name string) string {
 	ext := strings.ToLower(filepath.Ext(name))
 	base := name
@@ -838,4 +917,67 @@ func hasNonEmptyDetail(detail map[string]interface{}, key string) bool {
 	}
 	value := strings.TrimSpace(fmt.Sprint(raw))
 	return value != "" && value != "<nil>"
+}
+
+func mergeModels(base []model.Model, persisted []model.Model) []model.Model {
+	if len(persisted) == 0 {
+		return base
+	}
+	out := make([]model.Model, 0, len(base)+len(persisted))
+	indexByID := make(map[string]int, len(base))
+	for _, item := range base {
+		out = append(out, item)
+		indexByID[item.ID] = len(out) - 1
+	}
+	for _, item := range persisted {
+		idx, ok := indexByID[item.ID]
+		if !ok {
+			out = append(out, item)
+			indexByID[item.ID] = len(out) - 1
+			continue
+		}
+		out[idx] = mergeOneModel(out[idx], item)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].ID < out[j].ID
+	})
+	return out
+}
+
+func mergeOneModel(base model.Model, persisted model.Model) model.Model {
+	if strings.TrimSpace(base.ID) == "" {
+		base.ID = persisted.ID
+	}
+	if strings.TrimSpace(base.Name) == "" {
+		base.Name = persisted.Name
+	}
+	if strings.TrimSpace(base.Provider) == "" {
+		base.Provider = persisted.Provider
+	}
+	if strings.TrimSpace(string(base.BackendType)) == "" {
+		base.BackendType = persisted.BackendType
+	}
+	if strings.TrimSpace(base.HostNodeID) == "" {
+		base.HostNodeID = persisted.HostNodeID
+	}
+	if strings.TrimSpace(base.RuntimeID) == "" {
+		base.RuntimeID = persisted.RuntimeID
+	}
+	if strings.TrimSpace(persisted.Endpoint) != "" {
+		base.Endpoint = persisted.Endpoint
+	}
+	if persisted.ContextLength > 0 {
+		base.ContextLength = persisted.ContextLength
+	}
+	if strings.TrimSpace(string(persisted.State)) != "" {
+		base.State = persisted.State
+	}
+	if base.Metadata == nil {
+		base.Metadata = cloneMetadataMap(persisted.Metadata)
+		return base
+	}
+	for k, v := range persisted.Metadata {
+		base.Metadata[k] = v
+	}
+	return base
 }

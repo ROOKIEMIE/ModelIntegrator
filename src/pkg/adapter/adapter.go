@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sync"
 
-	"ModelIntegrator/src/pkg/model"
+	"model-control-plane/src/pkg/model"
 )
 
 type RuntimeAdapter interface {

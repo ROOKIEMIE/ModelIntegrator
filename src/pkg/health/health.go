@@ -3,7 +3,7 @@ package health
 import (
 	"time"
 
-	"ModelIntegrator/src/pkg/version"
+	"model-control-plane/src/pkg/version"
 )
 
 type Status struct {

@@ -58,7 +58,7 @@ async function requestJSON(url, options = {}) {
 
   if (!resp.ok || payload.success === false) {
     if (resp.status === 401) {
-      throw new Error("未授权，请在 URL 添加 ?token=<api-token> 或设置 localStorage.mi_api_token");
+      throw new Error("未授权，请在 URL 添加 ?token=<api-token> 或设置 localStorage.lcp_api_token");
     }
     const msg = payload.message || `请求失败: ${resp.status}`;
     throw new Error(msg);
@@ -69,8 +69,14 @@ async function requestJSON(url, options = {}) {
 function resolveAPIToken() {
   const fromQuery = String(new URLSearchParams(window.location.search).get("token") || "").trim();
   if (fromQuery) {
+    localStorage.setItem("lcp_api_token", fromQuery);
+    // 兼容历史本地存储键。
     localStorage.setItem("mi_api_token", fromQuery);
     return fromQuery;
+  }
+  const token = String(localStorage.getItem("lcp_api_token") || "").trim();
+  if (token) {
+    return token;
   }
   return String(localStorage.getItem("mi_api_token") || "").trim();
 }

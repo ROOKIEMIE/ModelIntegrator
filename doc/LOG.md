@@ -2,6 +2,58 @@
 
 ## 2026-03-10
 
+### 控制平面状态持久化接入（SQLite，最小可用）
+
+- 新增 SQLite 持久化层
+  - 新增 `src/pkg/store/sqlite/schema.go`：集中维护 `agents/nodes/models/runtimes` schema 与索引初始化
+  - 新增 `src/pkg/store/sqlite/store.go`：基于 `database/sql` + `modernc.org/sqlite` 实现最小 Store
+  - 新增 `src/pkg/store/sqlite/store_test.go`：覆盖 agent/node+runtime/model 的基本读写回归
+
+- service 接库改造
+  - `src/pkg/service/agent_service.go`
+    - 新增 `SetStore`
+    - register/heartbeat/capabilities 上报写入 SQLite（upsert）
+    - list/get/listByNode 优先读 SQLite，失败回退内存
+  - `src/pkg/service/node_service.go`
+    - 新增 `SetStore`、`SyncRegistryToStore`
+    - 节点查询支持“配置 + SQLite”融合
+    - 每次聚合后回写 nodes/runtimes 持久化状态
+  - `src/pkg/service/model_service.go`
+    - 新增 `SetStore`、`SyncRegistryToStore`
+    - 模型列表/详情支持“内存 + SQLite”融合
+    - 动作执行后与刷新链路后回写模型状态
+
+- controller 启动 wiring
+  - `src/cmd/controller/main.go` 在启动时完成：
+    - SQLite 路径准备
+    - schema 自动初始化
+    - Store 注入 AgentService / NodeService / ModelService
+    - 节点与模型配置的幂等同步入库
+
+- 文档增量
+  - `README.md` 新增 “SQLite 持久化说明（控制平面状态）” 小节，明确可恢复状态与部署建议
+
+### controller 命名收口（module / import / 构建 / 文案）
+
+- Go module 收口
+  - `go.mod` module 已由 `ModelIntegrator` 调整为 `model-control-plane`
+  - 全仓 Go import 前缀已统一为 `model-control-plane/...`
+
+- 构建与运行入口收口
+  - 主入口统一为 `./src/cmd/controller`
+  - agent 入口保持 `./src/cmd/agent`
+  - Docker/Compose 默认路径收口到 `/opt/controller`
+  - SQLite 默认文件名收口到 `controller.db`
+
+- 前端与文档文案收口
+  - 控制台标题统一为 `Controller - Local LLM Control Plane`
+  - README 中主名称统一为 `Local LLM Control Plane（Controller）`
+  - 示例目录与命令中的旧主命名已同步调整
+
+- 兼容性处理
+  - Docker 容器标签已切换为 `com.controller.*`
+  - 为兼容历史容器，保留对 `com.modelintegrator.*` 的读取与清理兜底
+
 ### agent llmfit managed serve 与健康管理落地（已完成）
 
 - 新增 `src/pkg/fit/managed_serve.go`

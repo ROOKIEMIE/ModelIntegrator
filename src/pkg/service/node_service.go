@@ -5,21 +5,24 @@ import (
 	"log/slog"
 	"os/exec"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
-	"ModelIntegrator/src/pkg/adapter"
-	"ModelIntegrator/src/pkg/adapter/dockerctl"
-	"ModelIntegrator/src/pkg/adapter/lmstudio"
-	"ModelIntegrator/src/pkg/capability"
-	"ModelIntegrator/src/pkg/model"
-	"ModelIntegrator/src/pkg/registry"
+	"model-control-plane/src/pkg/adapter"
+	"model-control-plane/src/pkg/adapter/dockerctl"
+	"model-control-plane/src/pkg/adapter/lmstudio"
+	"model-control-plane/src/pkg/capability"
+	"model-control-plane/src/pkg/model"
+	"model-control-plane/src/pkg/registry"
+	sqlitestore "model-control-plane/src/pkg/store/sqlite"
 )
 
 type NodeService struct {
 	registry     *registry.NodeRegistry
 	adapters     *adapter.Manager
 	agentService *AgentService
+	store        *sqlitestore.Store
 	logger       *slog.Logger
 }
 
@@ -35,8 +38,34 @@ func NewNodeService(reg *registry.NodeRegistry, adapters *adapter.Manager, agent
 	}
 }
 
+func (s *NodeService) SetStore(store *sqlitestore.Store) {
+	s.store = store
+}
+
+func (s *NodeService) SyncRegistryToStore(ctx context.Context) error {
+	if s.store == nil || s.registry == nil {
+		return nil
+	}
+	nodes := s.registry.List()
+	if persisted, err := s.store.ListNodes(ctx); err == nil {
+		nodes = mergeNodes(nodes, persisted)
+		for _, item := range nodes {
+			s.registry.Upsert(item)
+		}
+	}
+	return s.store.UpsertNodesWithRuntimes(ctx, nodes)
+}
+
 func (s *NodeService) ListNodes(ctx context.Context) ([]model.Node, error) {
 	nodes := s.registry.List()
+	if s.store != nil {
+		if dbNodes, err := s.store.ListNodes(ctx); err != nil {
+			s.logger.Warn("读取节点持久化状态失败，将仅返回内存状态", "error", err)
+		} else {
+			nodes = mergeNodes(nodes, dbNodes)
+		}
+	}
+
 	for i := range nodes {
 		now := time.Now().UTC()
 		status, runtimeStatuses := s.detectNodeStatus(ctx, nodes[i])
@@ -69,13 +98,36 @@ func (s *NodeService) ListNodes(ctx context.Context) ([]model.Node, error) {
 			}
 		}
 		capability.EnrichNode(&nodes[i], agentState)
+		if s.registry != nil {
+			s.registry.Upsert(nodes[i])
+		}
 	}
+
+	if s.store != nil {
+		if err := s.store.UpsertNodesWithRuntimes(ctx, nodes); err != nil {
+			s.logger.Warn("回写节点聚合状态到 sqlite 失败", "error", err)
+		}
+	}
+
 	return nodes, nil
 }
 
 func (s *NodeService) GetNode(ctx context.Context, id string) (model.Node, bool) {
-	_ = ctx
-	return s.registry.Get(id)
+	if s.registry != nil {
+		if node, ok := s.registry.Get(id); ok {
+			return node, true
+		}
+	}
+	if s.store != nil {
+		if nodes, err := s.store.ListNodes(ctx); err == nil {
+			for _, item := range nodes {
+				if item.ID == id {
+					return item, true
+				}
+			}
+		}
+	}
+	return model.Node{}, false
 }
 
 func (s *NodeService) detectNodeStatus(ctx context.Context, node model.Node) (model.NodeStatus, map[string]model.RuntimeStatus) {
@@ -234,4 +286,126 @@ func icmpPing(ctx context.Context, host string) (reachable bool, tried bool) {
 
 	err = cmd.Run()
 	return err == nil, true
+}
+
+func mergeNodes(configNodes []model.Node, persistedNodes []model.Node) []model.Node {
+	if len(persistedNodes) == 0 {
+		return configNodes
+	}
+
+	merged := make([]model.Node, 0, len(configNodes)+len(persistedNodes))
+	indexByID := make(map[string]int, len(configNodes))
+	for _, node := range configNodes {
+		merged = append(merged, node)
+		indexByID[node.ID] = len(merged) - 1
+	}
+
+	for _, persisted := range persistedNodes {
+		idx, ok := indexByID[persisted.ID]
+		if !ok {
+			merged = append(merged, persisted)
+			indexByID[persisted.ID] = len(merged) - 1
+			continue
+		}
+		merged[idx] = mergeNode(merged[idx], persisted)
+	}
+
+	sort.Slice(merged, func(i, j int) bool {
+		return merged[i].ID < merged[j].ID
+	})
+	return merged
+}
+
+func mergeNode(base model.Node, persisted model.Node) model.Node {
+	if strings.TrimSpace(base.Name) == "" {
+		base.Name = persisted.Name
+	}
+	if strings.TrimSpace(base.Description) == "" {
+		base.Description = persisted.Description
+	}
+	if strings.TrimSpace(base.Host) == "" {
+		base.Host = persisted.Host
+	}
+	if strings.TrimSpace(string(base.Type)) == "" {
+		base.Type = persisted.Type
+	}
+	if strings.TrimSpace(string(base.Role)) == "" {
+		base.Role = persisted.Role
+	}
+	if base.Metadata == nil {
+		base.Metadata = persisted.Metadata
+	}
+	if base.LastSeenAt.IsZero() {
+		base.LastSeenAt = persisted.LastSeenAt
+	}
+	if base.Status == "" || base.Status == model.NodeStatusUnknown {
+		base.Status = persisted.Status
+	}
+	if base.Classification == "" || base.Classification == model.NodeClassificationUnknown {
+		base.Classification = persisted.Classification
+	}
+	if base.CapabilityTier == "" || base.CapabilityTier == model.CapabilityTierUnknown {
+		base.CapabilityTier = persisted.CapabilityTier
+	}
+	if base.CapabilitySource == "" || base.CapabilitySource == model.CapabilitySourceUnknown {
+		base.CapabilitySource = persisted.CapabilitySource
+	}
+	if base.AgentStatus == "" || base.AgentStatus == model.AgentStatusNone {
+		base.AgentStatus = persisted.AgentStatus
+	}
+	base.Runtimes = mergeRuntimes(base.Runtimes, persisted.Runtimes)
+	return base
+}
+
+func mergeRuntimes(base []model.Runtime, persisted []model.Runtime) []model.Runtime {
+	if len(persisted) == 0 {
+		return base
+	}
+	if len(base) == 0 {
+		return persisted
+	}
+	out := make([]model.Runtime, 0, len(base)+len(persisted))
+	indexByID := make(map[string]int, len(base))
+	for _, item := range base {
+		out = append(out, item)
+		indexByID[item.ID] = len(out) - 1
+	}
+	for _, item := range persisted {
+		idx, ok := indexByID[item.ID]
+		if !ok {
+			out = append(out, item)
+			indexByID[item.ID] = len(out) - 1
+			continue
+		}
+		out[idx] = mergeRuntime(out[idx], item)
+	}
+	return out
+}
+
+func mergeRuntime(base model.Runtime, persisted model.Runtime) model.Runtime {
+	if strings.TrimSpace(string(base.Type)) == "" {
+		base.Type = persisted.Type
+	}
+	if strings.TrimSpace(base.Endpoint) == "" {
+		base.Endpoint = persisted.Endpoint
+	}
+	if base.Metadata == nil {
+		base.Metadata = persisted.Metadata
+	}
+	if base.Status == "" || base.Status == model.RuntimeStatusUnknown {
+		base.Status = persisted.Status
+	}
+	if base.CapabilitySource == "" || base.CapabilitySource == model.CapabilitySourceUnknown {
+		base.CapabilitySource = persisted.CapabilitySource
+	}
+	if len(base.Capabilities) == 0 {
+		base.Capabilities = persisted.Capabilities
+	}
+	if len(base.Actions) == 0 {
+		base.Actions = persisted.Actions
+	}
+	if base.LastSeenAt.IsZero() {
+		base.LastSeenAt = persisted.LastSeenAt
+	}
+	return base
 }

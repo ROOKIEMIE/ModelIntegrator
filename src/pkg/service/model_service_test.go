@@ -8,10 +8,10 @@ import (
 	"path/filepath"
 	"testing"
 
-	"ModelIntegrator/src/pkg/adapter"
-	"ModelIntegrator/src/pkg/model"
-	"ModelIntegrator/src/pkg/registry"
-	"ModelIntegrator/src/pkg/scheduler"
+	"model-control-plane/src/pkg/adapter"
+	"model-control-plane/src/pkg/model"
+	"model-control-plane/src/pkg/registry"
+	"model-control-plane/src/pkg/scheduler"
 )
 
 type captureAdapter struct {

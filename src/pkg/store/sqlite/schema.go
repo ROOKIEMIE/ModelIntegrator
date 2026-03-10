@@ -1,0 +1,65 @@
+package sqlite
+
+var schemaStatements = []string{
+	`CREATE TABLE IF NOT EXISTS agents (
+		id TEXT PRIMARY KEY,
+		node_id TEXT NOT NULL,
+		name TEXT NOT NULL DEFAULT '',
+		version TEXT NOT NULL DEFAULT '',
+		address TEXT NOT NULL DEFAULT '',
+		status TEXT NOT NULL DEFAULT 'unknown',
+		capabilities_json TEXT NOT NULL DEFAULT '[]',
+		runtime_capabilities_json TEXT NOT NULL DEFAULT '{}',
+		metadata_json TEXT NOT NULL DEFAULT '{}',
+		registered_at TEXT NOT NULL DEFAULT '',
+		last_heartbeat_at TEXT NOT NULL DEFAULT '',
+		updated_at TEXT NOT NULL DEFAULT ''
+	);`,
+	`CREATE INDEX IF NOT EXISTS idx_agents_node_id ON agents(node_id);`,
+	`CREATE TABLE IF NOT EXISTS nodes (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL DEFAULT '',
+		description TEXT NOT NULL DEFAULT '',
+		role TEXT NOT NULL DEFAULT '',
+		type TEXT NOT NULL DEFAULT '',
+		host TEXT NOT NULL DEFAULT '',
+		status TEXT NOT NULL DEFAULT 'unknown',
+		classification TEXT NOT NULL DEFAULT 'unknown',
+		capability_tier TEXT NOT NULL DEFAULT 'unknown',
+		capability_source TEXT NOT NULL DEFAULT 'unknown',
+		agent_status TEXT NOT NULL DEFAULT 'none',
+		metadata_json TEXT NOT NULL DEFAULT '{}',
+		last_seen_at TEXT NOT NULL DEFAULT '',
+		updated_at TEXT NOT NULL DEFAULT ''
+	);`,
+	`CREATE TABLE IF NOT EXISTS runtimes (
+		id TEXT PRIMARY KEY,
+		node_id TEXT NOT NULL,
+		type TEXT NOT NULL DEFAULT '',
+		endpoint TEXT NOT NULL DEFAULT '',
+		enabled INTEGER NOT NULL DEFAULT 0,
+		status TEXT NOT NULL DEFAULT 'unknown',
+		capability_source TEXT NOT NULL DEFAULT 'unknown',
+		capabilities_json TEXT NOT NULL DEFAULT '[]',
+		actions_json TEXT NOT NULL DEFAULT '[]',
+		last_seen_at TEXT NOT NULL DEFAULT '',
+		metadata_json TEXT NOT NULL DEFAULT '{}',
+		updated_at TEXT NOT NULL DEFAULT '',
+		FOREIGN KEY(node_id) REFERENCES nodes(id) ON DELETE CASCADE
+	);`,
+	`CREATE INDEX IF NOT EXISTS idx_runtimes_node_id ON runtimes(node_id);`,
+	`CREATE TABLE IF NOT EXISTS models (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL DEFAULT '',
+		provider TEXT NOT NULL DEFAULT '',
+		backend_type TEXT NOT NULL DEFAULT '',
+		host_node_id TEXT NOT NULL DEFAULT '',
+		runtime_id TEXT NOT NULL DEFAULT '',
+		endpoint TEXT NOT NULL DEFAULT '',
+		state TEXT NOT NULL DEFAULT 'unknown',
+		context_length INTEGER NOT NULL DEFAULT 0,
+		metadata_json TEXT NOT NULL DEFAULT '{}',
+		updated_at TEXT NOT NULL DEFAULT ''
+	);`,
+	`CREATE INDEX IF NOT EXISTS idx_models_host_node_id ON models(host_node_id);`,
+}

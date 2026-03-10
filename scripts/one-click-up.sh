@@ -19,8 +19,9 @@ if [ ! -f .env ]; then
   echo "[INFO] 已生成 .env（来自 resources/docker/compose.example.env）"
 fi
 
-if grep -q "/opt/modelintegrator/resource/" .env || grep -q "\./resource/" .env; then
-  sed -i 's|/opt/modelintegrator/resource/|/opt/modelintegrator/resources/|g' .env
+if grep -q "/opt/controller/resource/" .env || grep -q "/opt/modelintegrator/resource/" .env || grep -q "\./resource/" .env; then
+  sed -i 's|/opt/controller/resource/|/opt/controller/resources/|g' .env
+  sed -i 's|/opt/modelintegrator/resource/|/opt/controller/resources/|g' .env
   sed -i 's|\./resource/|./resources/|g' .env
   echo "[INFO] 已自动迁移 .env 中旧 resource 路径到 resources"
 fi
@@ -50,8 +51,8 @@ fi
 
 mkdir -p resources/config resources/models resources/download-cache/hf resources/download-cache/aria2-config
 
-touch resources/config/modelintegrator.db
-chmod 666 resources/config/modelintegrator.db || true
+touch resources/config/controller.db
+chmod 666 resources/config/controller.db || true
 
 if command -v nvidia-smi >/dev/null 2>&1; then
   echo "[INFO] 检测到 nvidia-smi，CUDA 平台信息如下："

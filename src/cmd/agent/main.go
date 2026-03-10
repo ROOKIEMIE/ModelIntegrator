@@ -15,8 +15,8 @@ import (
 	"syscall"
 	"time"
 
-	"ModelIntegrator/src/pkg/fit"
-	"ModelIntegrator/src/pkg/model"
+	"model-control-plane/src/pkg/fit"
+	"model-control-plane/src/pkg/model"
 )
 
 type llmfitConfig struct {

@@ -4,10 +4,12 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"testing"
 	"time"
 
-	"ModelIntegrator/src/pkg/model"
+	"model-control-plane/src/pkg/model"
+	sqlitestore "model-control-plane/src/pkg/store/sqlite"
 )
 
 func newTestAgentService(ttl time.Duration) *AgentService {
@@ -87,5 +89,64 @@ func TestAgentStatusTurnsOfflineWhenHeartbeatExpired(t *testing.T) {
 	}
 	if agent.Status != model.AgentStatusOffline {
 		t.Fatalf("expected offline status after ttl, got=%s", agent.Status)
+	}
+}
+
+func TestAgentServiceSQLitePersistenceAndRecover(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "controller.db")
+
+	store1, err := sqlitestore.Open(dbPath, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("open store1 failed: %v", err)
+	}
+
+	svc1 := newTestAgentService(2 * time.Second)
+	if err := svc1.SetStore(store1); err != nil {
+		t.Fatalf("set store1 failed: %v", err)
+	}
+
+	ctx := context.Background()
+	if _, err := svc1.Register(ctx, model.AgentRegisterRequest{
+		AgentID:      "agent-persist",
+		NodeID:       "node-main",
+		Capabilities: []string{"fit"},
+	}); err != nil {
+		t.Fatalf("register failed: %v", err)
+	}
+	if _, err := svc1.ReportCapabilities(ctx, "agent-persist", model.AgentCapabilitiesReportRequest{
+		NodeID:              "node-main",
+		RuntimeCapabilities: map[string][]string{"docker": {"load", "start"}},
+	}); err != nil {
+		t.Fatalf("report capabilities failed: %v", err)
+	}
+	if err := store1.Close(); err != nil {
+		t.Fatalf("close store1 failed: %v", err)
+	}
+
+	store2, err := sqlitestore.Open(dbPath, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("open store2 failed: %v", err)
+	}
+	defer func() {
+		_ = store2.Close()
+	}()
+
+	svc2 := newTestAgentService(2 * time.Second)
+	if err := svc2.SetStore(store2); err != nil {
+		t.Fatalf("set store2 failed: %v", err)
+	}
+
+	restored, ok := svc2.GetByID("agent-persist")
+	if !ok {
+		t.Fatalf("expected restored agent")
+	}
+	if restored.NodeID != "node-main" {
+		t.Fatalf("unexpected restored node id: %s", restored.NodeID)
+	}
+	if len(restored.Capabilities) == 0 {
+		t.Fatalf("expected restored capabilities")
+	}
+	if len(restored.RuntimeCapabilities["docker"]) == 0 {
+		t.Fatalf("expected restored runtime capabilities")
 	}
 }
