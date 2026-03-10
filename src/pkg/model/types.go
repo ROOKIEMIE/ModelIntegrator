@@ -24,12 +24,61 @@ const (
 	NodeRoleSub  NodeRole = "sub"
 )
 
+type NodeClassification string
+
+const (
+	NodeClassificationController NodeClassification = "controller"
+	NodeClassificationWorker     NodeClassification = "worker"
+	NodeClassificationAgentHost  NodeClassification = "agent-host"
+	NodeClassificationHybrid     NodeClassification = "hybrid"
+	NodeClassificationUnknown    NodeClassification = "unknown"
+)
+
+type CapabilityTier string
+
+const (
+	CapabilityTierUnknown CapabilityTier = "unknown"
+	CapabilityTier0       CapabilityTier = "tier-0"
+	CapabilityTier1       CapabilityTier = "tier-1"
+	CapabilityTier2       CapabilityTier = "tier-2"
+	CapabilityTier3       CapabilityTier = "tier-3"
+)
+
+type CapabilitySource string
+
+const (
+	CapabilitySourceStatic        CapabilitySource = "static"
+	CapabilitySourceRuntime       CapabilitySource = "runtime"
+	CapabilitySourceAgentReported CapabilitySource = "agent-reported"
+	CapabilitySourceMerged        CapabilitySource = "merged"
+	CapabilitySourceUnknown       CapabilitySource = "unknown"
+)
+
 type RuntimeType string
 
 const (
 	RuntimeTypeDocker    RuntimeType = "docker"
 	RuntimeTypeLMStudio  RuntimeType = "lmstudio"
 	RuntimeTypePortainer RuntimeType = "portainer"
+	RuntimeTypeOllama    RuntimeType = "ollama"
+	RuntimeTypeVLLM      RuntimeType = "vllm"
+	RuntimeTypeOpenAI    RuntimeType = "openai"
+)
+
+type RuntimeStatus string
+
+const (
+	RuntimeStatusUnknown RuntimeStatus = "unknown"
+	RuntimeStatusOnline  RuntimeStatus = "online"
+	RuntimeStatusOffline RuntimeStatus = "offline"
+)
+
+type AgentConnectionStatus string
+
+const (
+	AgentStatusNone    AgentConnectionStatus = "none"
+	AgentStatusOnline  AgentConnectionStatus = "online"
+	AgentStatusOffline AgentConnectionStatus = "offline"
 )
 
 type ModelState string
@@ -44,17 +93,24 @@ const (
 )
 
 type Node struct {
-	ID          string       `json:"id" yaml:"id"`
-	Name        string       `json:"name" yaml:"name"`
-	Description string       `json:"description,omitempty" yaml:"description,omitempty"`
-	Role        NodeRole     `json:"role" yaml:"role"`
-	Type        NodeType     `json:"type" yaml:"type"`
-	Host        string       `json:"host" yaml:"host"`
-	Status      NodeStatus   `json:"status" yaml:"status"`
-	Platform    PlatformInfo `json:"platform" yaml:"platform"`
-	Runtimes    []Runtime    `json:"runtimes" yaml:"runtimes"`
-	LastSeenAt  time.Time    `json:"last_seen_at" yaml:"last_seen_at"`
-	Metadata    interface{}  `json:"metadata,omitempty" yaml:"metadata,omitempty"`
+	ID               string                `json:"id" yaml:"id"`
+	Name             string                `json:"name" yaml:"name"`
+	Description      string                `json:"description,omitempty" yaml:"description,omitempty"`
+	Role             NodeRole              `json:"role" yaml:"role"`
+	Type             NodeType              `json:"type" yaml:"type"`
+	Host             string                `json:"host" yaml:"host"`
+	Status           NodeStatus            `json:"status" yaml:"status"`
+	Platform         PlatformInfo          `json:"platform" yaml:"platform"`
+	Runtimes         []Runtime             `json:"runtimes" yaml:"runtimes"`
+	LastSeenAt       time.Time             `json:"last_seen_at" yaml:"last_seen_at"`
+	Metadata         interface{}           `json:"metadata,omitempty" yaml:"metadata,omitempty"`
+	Classification   NodeClassification    `json:"classification,omitempty" yaml:"-"`
+	CapabilityTier   CapabilityTier        `json:"capability_tier,omitempty" yaml:"-"`
+	CapabilitySource CapabilitySource      `json:"capability_source,omitempty" yaml:"-"`
+	AgentStatus      AgentConnectionStatus `json:"agent_status,omitempty" yaml:"-"`
+	CapabilityNote   string                `json:"capability_note,omitempty" yaml:"-"`
+	OperationLevel   string                `json:"operation_level,omitempty" yaml:"-"`
+	Agent            *Agent                `json:"agent,omitempty" yaml:"-"`
 }
 
 type PlatformInfo struct {
@@ -65,12 +121,85 @@ type PlatformInfo struct {
 }
 
 type Runtime struct {
-	ID       string            `json:"id" yaml:"id"`
-	Type     RuntimeType       `json:"type" yaml:"type"`
-	Endpoint string            `json:"endpoint" yaml:"endpoint"`
-	Enabled  bool              `json:"enabled" yaml:"enabled"`
-	Metadata map[string]string `json:"metadata,omitempty" yaml:"metadata,omitempty"`
+	ID               string            `json:"id" yaml:"id"`
+	Type             RuntimeType       `json:"type" yaml:"type"`
+	Endpoint         string            `json:"endpoint" yaml:"endpoint"`
+	Enabled          bool              `json:"enabled" yaml:"enabled"`
+	Metadata         map[string]string `json:"metadata,omitempty" yaml:"metadata,omitempty"`
+	Status           RuntimeStatus     `json:"status,omitempty" yaml:"-"`
+	CapabilitySource CapabilitySource  `json:"capability_source,omitempty" yaml:"-"`
+	LastSeenAt       time.Time         `json:"last_seen_at,omitempty" yaml:"-"`
+	CapabilityNote   string            `json:"capability_note,omitempty" yaml:"-"`
+	Capabilities     []string          `json:"capabilities,omitempty" yaml:"-"`
+	Actions          []string          `json:"actions,omitempty" yaml:"-"`
 }
+
+type Agent struct {
+	ID                  string                `json:"id"`
+	AgentID             string                `json:"agent_id,omitempty"`
+	NodeID              string                `json:"node_id"`
+	Name                string                `json:"name,omitempty"`
+	Version             string                `json:"version,omitempty"`
+	Status              AgentConnectionStatus `json:"status"`
+	Address             string                `json:"address,omitempty"`
+	Host                string                `json:"host,omitempty"`
+	Capabilities        []string              `json:"capabilities,omitempty"`
+	RuntimeCapabilities map[string][]string   `json:"runtime_capabilities,omitempty"`
+	LastHeartbeatAt     time.Time             `json:"last_heartbeat_at"`
+	RegisteredAt        time.Time             `json:"registered_at"`
+	HeartbeatTTLSeconds int                   `json:"heartbeat_ttl_seconds,omitempty"`
+	Metadata            map[string]string     `json:"metadata,omitempty"`
+}
+
+type AgentState = Agent
+
+type AgentRegisterRequest struct {
+	ID           string            `json:"id,omitempty"`
+	AgentID      string            `json:"agent_id,omitempty"`
+	NodeID       string            `json:"node_id"`
+	Name         string            `json:"name,omitempty"`
+	Version      string            `json:"version,omitempty"`
+	Address      string            `json:"address,omitempty"`
+	Host         string            `json:"host,omitempty"`
+	Capabilities []string          `json:"capabilities,omitempty"`
+	Metadata     map[string]string `json:"metadata,omitempty"`
+}
+
+type AgentRegisterResponse struct {
+	Agent                    Agent     `json:"agent"`
+	ServerTime               time.Time `json:"server_time"`
+	HeartbeatIntervalSeconds int       `json:"heartbeat_interval_seconds"`
+}
+
+type AgentHeartbeatRequest struct {
+	NodeID   string                `json:"node_id,omitempty"`
+	Status   AgentConnectionStatus `json:"status,omitempty"`
+	Metadata map[string]string     `json:"metadata,omitempty"`
+}
+
+type AgentHeartbeatResponse struct {
+	ID             string                `json:"id"`
+	AgentID        string                `json:"agent_id,omitempty"`
+	NodeID         string                `json:"node_id"`
+	Status         AgentConnectionStatus `json:"status"`
+	ServerTime     time.Time             `json:"server_time"`
+	NextDeadlineAt time.Time             `json:"next_deadline_at"`
+}
+
+type AgentCapabilitiesReportRequest struct {
+	NodeID              string              `json:"node_id"`
+	Capabilities        []string            `json:"capabilities,omitempty"`
+	RuntimeCapabilities map[string][]string `json:"runtime_capabilities,omitempty"`
+	Metadata            map[string]string   `json:"metadata,omitempty"`
+}
+
+type AgentCapabilitiesReportResponse struct {
+	Agent            Agent            `json:"agent"`
+	CapabilitySource CapabilitySource `json:"capability_source"`
+	UpdatedAt        time.Time        `json:"updated_at"`
+}
+
+type AgentCapabilityReportRequest = AgentCapabilitiesReportRequest
 
 type RuntimeTemplate struct {
 	ID          string            `json:"id" yaml:"id"`

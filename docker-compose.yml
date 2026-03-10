@@ -3,7 +3,7 @@ services:
     image: nginx:1.28-alpine
     container_name: mcp-nginx
     depends_on:
-      - model-integrator
+      - controller
     ports:
       - "${MCP_EXTERNAL_PORT:-59081}:80"
     volumes:
@@ -12,11 +12,11 @@ services:
       - mcp_net
     restart: unless-stopped
 
-  model-integrator:
+  controller:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: model-integrator
+    container_name: controller
     environment:
       MCP_CONFIG: /opt/modelintegrator/resources/config/config.example.yaml
       MCP_SERVER_ADDRESS: ":8080"

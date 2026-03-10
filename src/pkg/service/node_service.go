@@ -11,34 +11,64 @@ import (
 	"ModelIntegrator/src/pkg/adapter"
 	"ModelIntegrator/src/pkg/adapter/dockerctl"
 	"ModelIntegrator/src/pkg/adapter/lmstudio"
+	"ModelIntegrator/src/pkg/capability"
 	"ModelIntegrator/src/pkg/model"
 	"ModelIntegrator/src/pkg/registry"
 )
 
 type NodeService struct {
-	registry *registry.NodeRegistry
-	adapters *adapter.Manager
-	logger   *slog.Logger
+	registry     *registry.NodeRegistry
+	adapters     *adapter.Manager
+	agentService *AgentService
+	logger       *slog.Logger
 }
 
-func NewNodeService(reg *registry.NodeRegistry, adapters *adapter.Manager, logger *slog.Logger) *NodeService {
+func NewNodeService(reg *registry.NodeRegistry, adapters *adapter.Manager, agentService *AgentService, logger *slog.Logger) *NodeService {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &NodeService{
-		registry: reg,
-		adapters: adapters,
-		logger:   logger,
+		registry:     reg,
+		adapters:     adapters,
+		agentService: agentService,
+		logger:       logger,
 	}
 }
 
 func (s *NodeService) ListNodes(ctx context.Context) ([]model.Node, error) {
 	nodes := s.registry.List()
 	for i := range nodes {
-		nodes[i].Status = s.detectNodeStatus(ctx, nodes[i])
-		if nodes[i].Status == model.NodeStatusOnline {
-			nodes[i].LastSeenAt = time.Now().UTC()
+		now := time.Now().UTC()
+		status, runtimeStatuses := s.detectNodeStatus(ctx, nodes[i])
+		nodes[i].Status = status
+		for j := range nodes[i].Runtimes {
+			runtimeID := nodes[i].Runtimes[j].ID
+			rtStatus, ok := runtimeStatuses[runtimeID]
+			if !ok {
+				rtStatus = model.RuntimeStatusUnknown
+			}
+			nodes[i].Runtimes[j].Status = rtStatus
+			if rtStatus == model.RuntimeStatusOnline || rtStatus == model.RuntimeStatusOffline {
+				nodes[i].Runtimes[j].LastSeenAt = now
+			}
 		}
+		if status == model.NodeStatusOnline {
+			nodes[i].LastSeenAt = now
+		}
+
+		agentState := &model.AgentState{
+			NodeID: nodes[i].ID,
+			Status: model.AgentStatusNone,
+		}
+		if s.agentService != nil {
+			if activeAgent, ok := s.agentService.GetByNodeID(nodes[i].ID); ok {
+				agentState = activeAgent
+				if activeAgent.LastHeartbeatAt.After(nodes[i].LastSeenAt) {
+					nodes[i].LastSeenAt = activeAgent.LastHeartbeatAt
+				}
+			}
+		}
+		capability.EnrichNode(&nodes[i], agentState)
 	}
 	return nodes, nil
 }
@@ -48,37 +78,54 @@ func (s *NodeService) GetNode(ctx context.Context, id string) (model.Node, bool)
 	return s.registry.Get(id)
 }
 
-func (s *NodeService) detectNodeStatus(ctx context.Context, node model.Node) model.NodeStatus {
-	if online, checked := s.runtimeHealthCheckFirst(ctx, node); checked {
+func (s *NodeService) detectNodeStatus(ctx context.Context, node model.Node) (model.NodeStatus, map[string]model.RuntimeStatus) {
+	runtimeStatuses := make(map[string]model.RuntimeStatus, len(node.Runtimes))
+	if online, checked := s.runtimeHealthCheckFirst(ctx, node, runtimeStatuses); checked {
 		if online {
-			return model.NodeStatusOnline
+			return model.NodeStatusOnline, runtimeStatuses
 		}
-		return model.NodeStatusOffline
+		return model.NodeStatusOffline, runtimeStatuses
+	}
+
+	for _, rt := range node.Runtimes {
+		if _, ok := runtimeStatuses[rt.ID]; !ok {
+			runtimeStatuses[rt.ID] = model.RuntimeStatusUnknown
+		}
 	}
 
 	host := strings.TrimSpace(node.Host)
 	if host == "" {
-		return model.NodeStatusUnknown
+		return model.NodeStatusUnknown, runtimeStatuses
 	}
 	reachable, pingTried := icmpPing(ctx, host)
 	if !pingTried {
-		return model.NodeStatusUnknown
+		return model.NodeStatusUnknown, runtimeStatuses
 	}
 	if reachable {
-		return model.NodeStatusOnline
+		return model.NodeStatusOnline, runtimeStatuses
 	}
-	return model.NodeStatusOffline
+	return model.NodeStatusOffline, runtimeStatuses
 }
 
 // 优先使用 runtime 健康检查来判断节点可用性；只有没有可用 runtime 检查能力时才 fallback 到 ping。
-func (s *NodeService) runtimeHealthCheckFirst(ctx context.Context, node model.Node) (online bool, checked bool) {
+func (s *NodeService) runtimeHealthCheckFirst(ctx context.Context, node model.Node, runtimeStatuses map[string]model.RuntimeStatus) (online bool, checked bool) {
 	for _, rt := range node.Runtimes {
+		if runtimeStatuses != nil {
+			runtimeStatuses[rt.ID] = model.RuntimeStatusUnknown
+		}
 		if !rt.Enabled {
 			continue
 		}
 		rtOnline, rtChecked := s.healthCheckRuntime(ctx, node, rt)
 		if !rtChecked {
 			continue
+		}
+		if runtimeStatuses != nil {
+			if rtOnline {
+				runtimeStatuses[rt.ID] = model.RuntimeStatusOnline
+			} else {
+				runtimeStatuses[rt.ID] = model.RuntimeStatusOffline
+			}
 		}
 		if rtOnline {
 			return true, true

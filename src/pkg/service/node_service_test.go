@@ -17,6 +17,7 @@ func newTestNodeService(nodes []model.Node) *NodeService {
 	return NewNodeService(
 		registry.NewNodeRegistry(nodes),
 		adapter.NewManager(),
+		nil,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
 }

@@ -21,6 +21,7 @@ type Handler struct {
 	nodeService            *service.NodeService
 	modelService           *service.ModelService
 	runtimeTemplateService *service.RuntimeTemplateService
+	agentService           *service.AgentService
 	logger                 *slog.Logger
 	version                version.Info
 }
@@ -29,6 +30,7 @@ func NewHandler(
 	nodeService *service.NodeService,
 	modelService *service.ModelService,
 	runtimeTemplateService *service.RuntimeTemplateService,
+	agentService *service.AgentService,
 	logger *slog.Logger,
 	v version.Info,
 ) *Handler {
@@ -36,6 +38,7 @@ func NewHandler(
 		nodeService:            nodeService,
 		modelService:           modelService,
 		runtimeTemplateService: runtimeTemplateService,
+		agentService:           agentService,
 		logger:                 logger,
 		version:                v,
 	}
@@ -149,6 +152,85 @@ func (h *Handler) RegisterRuntimeTemplate(w http.ResponseWriter, r *http.Request
 	OK(w, res)
 }
 
+func (h *Handler) ListAgents(w http.ResponseWriter, r *http.Request) {
+	if h.agentService == nil {
+		Fail(w, http.StatusServiceUnavailable, "agent 服务未就绪", nil)
+		return
+	}
+	OK(w, h.agentService.List(r.Context()))
+}
+
+func (h *Handler) RegisterAgent(w http.ResponseWriter, r *http.Request) {
+	if h.agentService == nil {
+		Fail(w, http.StatusServiceUnavailable, "agent 服务未就绪", nil)
+		return
+	}
+	req, err := parseAgentRegisterPayload(r)
+	if err != nil {
+		Fail(w, http.StatusBadRequest, "agent 注册请求体错误", err.Error())
+		return
+	}
+	res, err := h.agentService.Register(r.Context(), req)
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidAgent) {
+			Fail(w, http.StatusBadRequest, "agent 注册参数错误", err.Error())
+			return
+		}
+		Fail(w, http.StatusInternalServerError, "agent 注册失败", err.Error())
+		return
+	}
+	OK(w, res)
+}
+
+func (h *Handler) AgentHeartbeat(w http.ResponseWriter, r *http.Request) {
+	if h.agentService == nil {
+		Fail(w, http.StatusServiceUnavailable, "agent 服务未就绪", nil)
+		return
+	}
+	agentID := agentIDFromPath(r)
+	req, err := parseAgentHeartbeatPayload(r)
+	if err != nil {
+		Fail(w, http.StatusBadRequest, "agent 心跳请求体错误", err.Error())
+		return
+	}
+	res, err := h.agentService.Heartbeat(r.Context(), agentID, req)
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrInvalidAgent):
+			Fail(w, http.StatusBadRequest, "agent 参数错误", err.Error())
+		case errors.Is(err, service.ErrAgentNotFound):
+			Fail(w, http.StatusNotFound, "agent 不存在", map[string]string{"agent_id": agentID})
+		default:
+			Fail(w, http.StatusInternalServerError, "agent 心跳失败", err.Error())
+		}
+		return
+	}
+	OK(w, res)
+}
+
+func (h *Handler) ReportAgentCapabilities(w http.ResponseWriter, r *http.Request) {
+	if h.agentService == nil {
+		Fail(w, http.StatusServiceUnavailable, "agent 服务未就绪", nil)
+		return
+	}
+	agentID := agentIDFromPath(r)
+	req, err := parseAgentCapabilityPayload(r)
+	if err != nil {
+		Fail(w, http.StatusBadRequest, "agent 能力上报请求体错误", err.Error())
+		return
+	}
+	res, err := h.agentService.ReportCapabilities(r.Context(), agentID, req)
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidAgent) {
+			Fail(w, http.StatusBadRequest, "agent 能力上报参数错误", err.Error())
+			return
+		}
+		Fail(w, http.StatusInternalServerError, "agent 能力上报失败", err.Error())
+		return
+	}
+	OK(w, res)
+}
+
 func (h *Handler) modelAction(w http.ResponseWriter, r *http.Request, action string) {
 	id := chi.URLParam(r, "id")
 
@@ -204,6 +286,59 @@ func parseTemplatePayload(r *http.Request) (model.RuntimeTemplate, error) {
 		return envelope.Template, nil
 	}
 	return model.RuntimeTemplate{}, fmt.Errorf("模板字段解析失败，期望 JSON 对象或 {\"template\": {...}}")
+}
+
+func parseAgentRegisterPayload(r *http.Request) (model.AgentRegisterRequest, error) {
+	var payload model.AgentRegisterRequest
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		return payload, fmt.Errorf("读取请求体失败: %w", err)
+	}
+	if len(strings.TrimSpace(string(body))) == 0 {
+		return payload, fmt.Errorf("请求体不能为空")
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return payload, fmt.Errorf("解析 JSON 失败: %w", err)
+	}
+	return payload, nil
+}
+
+func parseAgentHeartbeatPayload(r *http.Request) (model.AgentHeartbeatRequest, error) {
+	var payload model.AgentHeartbeatRequest
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		return payload, fmt.Errorf("读取请求体失败: %w", err)
+	}
+	if len(strings.TrimSpace(string(body))) == 0 {
+		return payload, nil
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return payload, fmt.Errorf("解析 JSON 失败: %w", err)
+	}
+	return payload, nil
+}
+
+func parseAgentCapabilityPayload(r *http.Request) (model.AgentCapabilitiesReportRequest, error) {
+	var payload model.AgentCapabilitiesReportRequest
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		return payload, fmt.Errorf("读取请求体失败: %w", err)
+	}
+	if len(strings.TrimSpace(string(body))) == 0 {
+		return payload, fmt.Errorf("请求体不能为空")
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return payload, fmt.Errorf("解析 JSON 失败: %w", err)
+	}
+	return payload, nil
+}
+
+func agentIDFromPath(r *http.Request) string {
+	id := strings.TrimSpace(chi.URLParam(r, "id"))
+	if id != "" {
+		return id
+	}
+	return strings.TrimSpace(chi.URLParam(r, "agentID"))
 }
 
 func runtimeTemplateIsZero(tpl model.RuntimeTemplate) bool {

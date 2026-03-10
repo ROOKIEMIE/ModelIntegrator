@@ -314,7 +314,7 @@ func (c *dockerHTTPClient) createProbeContainer(ctx context.Context, image strin
 	}
 
 	q := url.Values{}
-	q.Set("name", fmt.Sprintf("model-integrator-gpu-probe-%d", time.Now().UnixNano()))
+	q.Set("name", fmt.Sprintf("controller-gpu-probe-%d", time.Now().UnixNano()))
 	status, body, err := c.request(ctx, http.MethodPost, "/containers/create", q, reqBody)
 	if err != nil {
 		return "", fmt.Errorf("创建 GPU 探针容器失败: %w", err)

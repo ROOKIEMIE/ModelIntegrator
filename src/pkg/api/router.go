@@ -35,11 +35,18 @@ func NewRouter(h *Handler, staticDir, authToken string, logger *slog.Logger) htt
 		r.Get("/runtime-templates", h.ListRuntimeTemplates)
 		r.Post("/runtime-templates/validate", h.ValidateRuntimeTemplate)
 		r.Post("/runtime-templates", h.RegisterRuntimeTemplate)
+		r.Get("/agents", h.ListAgents)
+		r.Post("/agents/register", h.RegisterAgent)
+		r.Post("/agents/{id}/heartbeat", h.AgentHeartbeat)
+		r.Post("/agents/{id}/capabilities", h.ReportAgentCapabilities)
+		// 兼容旧路由参数名，后续可移除。
+		r.Post("/agents/{agentID}/heartbeat", h.AgentHeartbeat)
+		r.Post("/agents/{agentID}/capabilities", h.ReportAgentCapabilities)
 	})
 
 	if staticDir == "" {
 		r.Get("/", func(w http.ResponseWriter, r *http.Request) {
-			_, _ = io.WriteString(w, "model-integrator is running")
+			_, _ = io.WriteString(w, "controller is running")
 		})
 		return r
 	}

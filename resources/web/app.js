@@ -85,18 +85,44 @@ function renderNodes() {
   state.nodes.forEach((node) => {
     const nodeLoadedCount = countLoadedModelsByNode(node.id);
     const runtimeSummary = summarizeRuntimeLoad(node);
+    const agentStatus = node.agent_status || (node.agent && node.agent.status) || "none";
+    const heartbeatAt = (node.agent && node.agent.last_heartbeat_at) || node.last_seen_at;
     const item = document.createElement("div");
     item.className = "list-item";
     item.innerHTML = `
-      <div class="item-title">${node.name} (${node.id})</div>
-      <div class="meta">描述: ${node.description || "-"}</div>
-      <div class="meta">类型: ${node.type} | 主机: ${node.host} | 状态: ${node.status}</div>
+      <div class="item-title">${escapeHTML(node.name)} (${escapeHTML(node.id)})</div>
+      <div class="meta">描述: ${escapeHTML(node.description || "-")}</div>
+      <div class="meta">分类: ${escapeHTML(node.classification || "-")} | 状态: ${escapeHTML(node.status || "unknown")} | 类型: ${escapeHTML(node.type || "-")} | 主机: ${escapeHTML(node.host || "-")}</div>
+      <div class="meta">能力分级: ${escapeHTML(node.capability_tier || "unknown")} | 能力来源: ${escapeHTML(node.capability_source || "unknown")} | 操作级别: ${escapeHTML(node.operation_level || "-")}</div>
+      <div class="meta">Agent 状态: ${escapeHTML(agentStatus)} | 最近心跳: ${escapeHTML(formatTime(heartbeatAt))}</div>
+      <div class="meta">能力说明: ${escapeHTML(node.capability_note || "-")}</div>
       <div class="meta">平台: ${(node.platform && node.platform.accelerator) || "unknown"} | GPU: ${(node.platform && node.platform.gpu) || "unknown"} | CUDA: ${(node.platform && node.platform.cuda_version) || "unknown"} | Driver: ${(node.platform && node.platform.driver) || "unknown"}</div>
       <div class="meta">Runtime 数量: ${(node.runtimes || []).length} | 已装载模型: ${nodeLoadedCount}</div>
       <div class="meta">Runtime 状态: ${runtimeSummary || "-"}</div>
+      ${buildRuntimeCapabilityBlock(node)}
     `;
     nodesEl.appendChild(item);
   });
+}
+
+function buildRuntimeCapabilityBlock(node) {
+  const runtimes = Array.isArray(node.runtimes) ? node.runtimes : [];
+  if (runtimes.length === 0) {
+    return `<div class="meta">Runtime 明细: -</div>`;
+  }
+  const parts = runtimes.map((rt) => {
+    const capabilities = Array.isArray(rt.capabilities) && rt.capabilities.length > 0 ? rt.capabilities.join(", ") : "-";
+    const actions = Array.isArray(rt.actions) && rt.actions.length > 0 ? rt.actions.join(", ") : "-";
+    const lastSeen = rt.last_seen_at ? formatTime(rt.last_seen_at) : "-";
+    return `<div class="runtime-capability-item">
+      <div class="meta"><strong>${escapeHTML(rt.type || "unknown")}</strong> (${escapeHTML(rt.id || "-")}) | endpoint: ${escapeHTML(rt.endpoint || "-")}</div>
+      <div class="meta">状态: ${escapeHTML(rt.status || "unknown")} | 最近可见: ${escapeHTML(lastSeen)}</div>
+      <div class="meta">来源: ${escapeHTML(rt.capability_source || "-")} | 说明: ${escapeHTML(rt.capability_note || "-")}</div>
+      <div class="meta">能力: ${escapeHTML(capabilities)}</div>
+      <div class="meta">可操作: ${escapeHTML(actions)}</div>
+    </div>`;
+  });
+  return `<div class="runtime-capability-list">${parts.join("")}</div>`;
 }
 
 function renderPageTabs() {
@@ -263,7 +289,8 @@ function summarizeRuntimeLoad(node) {
     const loaded = countLoadedModelsByNodeAndBackend(node.id, rt.type);
     const rtType = normalizeBackendType(rt.type) || "unknown";
     const enabled = rt.enabled === false ? "disabled" : "enabled";
-    parts.push(`${rtType}:${enabled}, loaded=${loaded}`);
+    const status = rt.status || "unknown";
+    parts.push(`${rtType}:${enabled}/${status}, loaded=${loaded}`);
   });
   return parts.join(" | ");
 }
@@ -346,6 +373,27 @@ function buildActionButton(modelId, action, nodeId, modelState, backendType) {
     }
   });
   return button;
+}
+
+function escapeHTML(raw) {
+  return String(raw || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll("\"", "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function formatTime(raw) {
+  const text = String(raw || "").trim();
+  if (!text) {
+    return "-";
+  }
+  const ts = Date.parse(text);
+  if (Number.isNaN(ts)) {
+    return text;
+  }
+  return new Date(ts).toLocaleString();
 }
 
 function parseLineList(text) {

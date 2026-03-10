@@ -15,7 +15,7 @@ func testLogger() *slog.Logger {
 }
 
 func TestRouterHealthzNoAuthRequired(t *testing.T) {
-	handler := NewHandler(nil, nil, nil, testLogger(), version.Get())
+	handler := NewHandler(nil, nil, nil, nil, testLogger(), version.Get())
 	router := NewRouter(handler, "", "secret-token", testLogger())
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
@@ -28,7 +28,7 @@ func TestRouterHealthzNoAuthRequired(t *testing.T) {
 }
 
 func TestRouterAPIRequiresBearerTokenWhenConfigured(t *testing.T) {
-	handler := NewHandler(nil, nil, nil, testLogger(), version.Get())
+	handler := NewHandler(nil, nil, nil, nil, testLogger(), version.Get())
 	router := NewRouter(handler, "", "secret-token", testLogger())
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/version", nil)
@@ -48,7 +48,7 @@ func TestRouterAPIRequiresBearerTokenWhenConfigured(t *testing.T) {
 }
 
 func TestRouterAPIAllowsAnonymousWhenTokenEmpty(t *testing.T) {
-	handler := NewHandler(nil, nil, nil, testLogger(), version.Get())
+	handler := NewHandler(nil, nil, nil, nil, testLogger(), version.Get())
 	router := NewRouter(handler, "", "", testLogger())
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/version", nil)

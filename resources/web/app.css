@@ -211,6 +211,20 @@ main {
   margin-bottom: 10px;
 }
 
+.runtime-capability-list {
+  margin-top: 8px;
+  border-top: 1px dashed #d1d5db;
+  padding-top: 8px;
+}
+
+.runtime-capability-item {
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 8px;
+  margin-bottom: 8px;
+  background: #fafcff;
+}
+
 .item-title {
   font-weight: 700;
   margin-bottom: 8px;

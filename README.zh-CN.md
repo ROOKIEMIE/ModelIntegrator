@@ -17,7 +17,7 @@ ModelIntegrator 是一个本地多节点 LLM 控制平面，用于统一管理 L
   - 节点卡片显示 Runtime 数量、已装载模型数、Runtime 状态摘要
   - 模型标签页显示每个节点已装载模型数（`Main (N)` / `Sub1 (N)`）
 - 模型列表支持按节点标签切换，默认显示第一个节点
-- Docker Compose 编排（`nginx` 网关 + `model-integrator`，其余组件作为 `addons` / `download` / `vllm` profile）
+- Docker Compose 编排（`nginx` 网关 + `controller`，其余组件作为 `addons` / `download` / `vllm` profile）
 
 - LM Studio 适配器：
   - 查询模型列表优先 `GET /api/v1/models`，兼容回退 `GET /v1/models`

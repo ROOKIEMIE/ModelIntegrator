@@ -17,7 +17,7 @@ ModelIntegrator is a local multi-node LLM control plane for Linux server + LAN M
   - Node cards show runtime count, loaded model count, and runtime status summary
   - Model tabs show loaded model count per node (`Main (N)` / `Sub1 (N)`)
 - Model list supports node tabs, with the first node selected by default
-- Docker Compose stack (`nginx` gateway + `model-integrator`, other services via `addons` / `download` / `vllm` profiles)
+- Docker Compose stack (`nginx` gateway + `controller`, other services via `addons` / `download` / `vllm` profiles)
 
 - LM Studio adapter:
   - model list query prefers `GET /api/v1/models`, with fallback to `GET /v1/models`

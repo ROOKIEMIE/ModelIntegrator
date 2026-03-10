@@ -2,6 +2,118 @@
 
 ## 2026-03-10
 
+### agent llmfit managed serve 与健康管理落地（已完成）
+
+- 新增 `src/pkg/fit/managed_serve.go`
+  - 提供 llmfit 托管管理器（`ManagedServe`），支持：
+    - 托管启动 `llmfit serve`
+    - 启动期健康检查（超时失败）
+    - 周期健康探测
+    - 连续失败阈值触发自动重启
+    - 运行状态快照（endpoint/health/pid/last_error/healthy）
+  - 停机时由 agent 统一触发进程回收
+
+- 新增 `src/pkg/fit/managed_serve_test.go`
+  - 覆盖 llmfit 启动参数构造与 `serve` 参数归一化逻辑
+
+- 改造 `src/cmd/agent/main.go`
+  - 增加 llmfit 配置读取与托管启动链路（可通过环境变量启用）
+  - 当 llmfit 启动成功时，自动补齐 `fit` 能力与 `fit` runtime 能力
+  - 当 llmfit 启动失败时，自动降级移除 `fit` 能力并继续 agent 主流程
+  - 在 `register/capabilities/heartbeat` 请求 metadata 中上报 llmfit 管理状态与健康状态
+
+- 新增 agent llmfit 相关环境变量
+  - `AGENT_LLMFIT_ENABLED`
+  - `AGENT_LLMFIT_BINARY`
+  - `AGENT_LLMFIT_ENDPOINT`
+  - `AGENT_LLMFIT_HEALTH_PATH`
+  - `AGENT_LLMFIT_SERVE_ARGS`
+  - `AGENT_LLMFIT_STARTUP_TIMEOUT_SECONDS`
+  - `AGENT_LLMFIT_HEALTH_INTERVAL_SECONDS`
+  - `AGENT_LLMFIT_HEALTH_TIMEOUT_SECONDS`
+  - `AGENT_LLMFIT_FAILURE_THRESHOLD`
+
+- 回归验证
+  - `gofmt -w`：通过（Docker Go 工具链）
+  - `go test ./...`：通过
+  - `go build ./src/cmd/controller`：通过
+  - `go build ./src/cmd/agent`：通过
+
+### controller 主入口迁移 + agent 最小链路落地（已完成）
+
+- 入口迁移完成
+  - 主入口统一为 `src/cmd/controller/main.go`
+  - 删除旧入口文件：`src/cmd/model-integrator/main.go`
+  - 删除旧入口目录：`src/cmd/model-integrator`
+  - 构建与部署引用已切换为 `controller`：
+    - `Dockerfile`
+    - `docker-compose.yml`
+    - `resources/nginx/nginx.example.conf`
+
+- 后端模型与能力分级落地
+  - 在 `src/pkg/model/types.go` 增量补齐：
+    - `classification`
+    - `capability_tier`
+    - `capability_source`
+    - `agent_status`
+    - runtime 扩展字段：`status/capabilities/actions/last_seen_at`
+  - 新增 agent 领域请求/响应模型：
+    - `AgentRegisterRequest/Response`
+    - `AgentHeartbeatRequest/Response`
+    - `AgentCapabilitiesReportRequest/Response`
+
+- capability 规则实现落地（非占位）
+  - 新增 `src/pkg/capability/capability.go`
+  - 实现最小可运行规则：
+    - 节点分类推导（controller/worker/agent-host/hybrid/unknown）
+    - 能力分级推导（tier-0/tier-1/tier-2/tier-3）
+    - 能力来源推导（static/runtime/agent-reported/merged/unknown）
+    - runtime 能力与动作合成
+
+- controller <-> agent 最小链路打通
+  - 新增 `src/pkg/service/agent_service.go`（内存注册表）
+  - 支持：
+    - `Register`
+    - `Heartbeat`
+    - `ReportCapabilities`
+    - `List/GetByID/ListByNodeID/IsOnline`
+    - TTL 在线判定（超时离线）
+  - `src/pkg/service/node_service.go` 已接入 `AgentService` 并聚合输出节点能力/agent 状态
+
+- API 链路打通
+  - `src/pkg/api/router.go` 新增接口：
+    - `POST /api/v1/agents/register`
+    - `POST /api/v1/agents/{id}/heartbeat`
+    - `POST /api/v1/agents/{id}/capabilities`
+    - `GET /api/v1/agents`
+  - `src/pkg/api/handler.go` 已接入真实服务调用与参数校验，返回统一 JSON 结构
+
+- 前端展示联通
+  - `resources/web/app.js` 节点卡片新增展示：
+    - `classification`
+    - `capability_tier`
+    - `capability_source`
+    - `agent status`
+    - `last_heartbeat_at`
+  - runtime 明细新增展示：
+    - `status`
+    - `capabilities`
+    - `actions`
+    - `last_seen_at`
+  - 空值兜底：`unknown` / `-`
+
+- 兼容与命名收敛
+  - 运行主服务命名统一为 `controller`
+  - GPU 探针容器命名由 `model-integrator-gpu-probe-*` 调整为 `controller-gpu-probe-*`
+  - README/中英文文档中的 compose 服务名描述已同步为 `controller`
+
+- 回归验证结果
+  - `gofmt -w`：已执行（通过 Docker 中 Go 工具链）
+  - `go test ./...`：通过
+  - `go build ./src/cmd/controller`：通过
+  - `docker compose config`：通过
+  - 前端静态资源引用检查：`index.html` 与 router 路由匹配通过
+
 ### v0.2-prep 架构演进定稿（controller + agent + runtime）
 
 - 背景
@@ -57,10 +169,10 @@
     - 必要时保留 CLI fallback
 
 - 8) 下一阶段方向与未完成事项
-  - 结构上保持过渡兼容并新增双入口：
+  - 结构上保持单主入口并新增 agent 入口：
     - `src/cmd/controller`
     - `src/cmd/agent`
-    - 保留 `src/cmd/model-integrator` 作为过渡入口
+    - 删除旧入口 `src/cmd/model-integrator`
   - 将节点分类与能力分级写入 API 模型与前端数据结构。
   - 建立 controller<->agent 最小注册、心跳、能力上报链路。
   - 在 agent 落地 llmfit managed serve 与健康管理。
@@ -141,7 +253,7 @@
   - `nginx-ui`
   - `litellm`
   - `openwebui`
-  - `model-integrator`
+  - `controller`
   - 其中 `portainer/nginx-ui/litellm/openwebui` 归入 `addons` profile，按需启动
 
 - 网络与端口策略：
@@ -154,7 +266,7 @@
   - 通过 `MCP_PROJECT_DIR` 统一路径前缀
 
 - Nginx 网关配置更新（`resources/nginx/nginx.example.conf`）
-  - `/` -> `model-integrator`
+  - `/` -> `controller`
   - `/openwebui/` -> `openwebui`
   - `/litellm/` -> `litellm`
 
@@ -222,7 +334,7 @@
   - 本地探测失败时，支持通过 Docker endpoint 启动探针容器回退探测 GPU/CUDA/Driver
   - 新增探针镜像环境变量：`MCP_GPU_PROBE_IMAGE`（默认 `nvidia/cuda:12.4.1-base-ubuntu22.04`）
 
-- 节点平台信息填充增强（`src/cmd/model-integrator/main.go`）
+- 节点平台信息填充增强（`src/cmd/controller/main.go`）
   - 对所有启用 `docker` runtime 的节点填充平台信息（不再仅限主节点）
   - Docker 探测 endpoint 优先取 `nodes[].runtimes[]` 中启用的 docker endpoint
 
@@ -366,6 +478,6 @@
 
 - 回归验证
   - `go test ./...` 通过
-  - `go build ./src/cmd/model-integrator` 通过
+  - `go build ./src/cmd/controller` 通过
   - `docker compose config`（含 `download` / `vllm` profile）通过
   - `bash -n scripts/one-click-up.sh scripts/one-click-down.sh` 通过
