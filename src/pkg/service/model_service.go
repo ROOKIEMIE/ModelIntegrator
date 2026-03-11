@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -150,6 +151,63 @@ func (s *ModelService) StopModel(ctx context.Context, id string) (model.ActionRe
 	return s.executeAction(ctx, id, "stop")
 }
 
+func (s *ModelService) RefreshRuntimeStatus(ctx context.Context, id string) (model.ActionResult, error) {
+	m, ok := s.modelRegistry.Get(id)
+	if !ok {
+		return model.ActionResult{}, ErrModelNotFound
+	}
+	if !isContainerRuntime(m.BackendType) {
+		return actionResult(true, "非容器运行时，无需刷新", map[string]interface{}{
+			"model_id":     m.ID,
+			"backend_type": m.BackendType,
+		}), nil
+	}
+	updated, err := s.reconcileContainerModel(ctx, m)
+	if err != nil {
+		return actionResult(false, "刷新 runtime 状态失败", map[string]interface{}{
+			"model_id": updated.ID,
+			"error":    err.Error(),
+		}), nil
+	}
+	return actionResult(true, "runtime 状态刷新成功", map[string]interface{}{
+		"model_id":           updated.ID,
+		"desired_state":      updated.DesiredState,
+		"observed_state":     updated.ObservedState,
+		"readiness":          updated.Readiness,
+		"health_message":     updated.HealthMessage,
+		"last_reconciled_at": updated.LastReconciledAt,
+	}), nil
+}
+
+func (s *ModelService) ApplyAgentReadiness(ctx context.Context, id string, ready bool, message string, detail map[string]interface{}) error {
+	m, ok := s.modelRegistry.Get(id)
+	if !ok {
+		return ErrModelNotFound
+	}
+	now := time.Now().UTC()
+	if ready {
+		m.Readiness = model.ReadinessReady
+		if strings.TrimSpace(m.ObservedState) == "" {
+			m.ObservedState = string(model.ModelStateRunning)
+		}
+		m.HealthMessage = firstNonEmpty(strings.TrimSpace(message), "agent readiness 检查通过")
+	} else {
+		m.Readiness = model.ReadinessNotReady
+		m.HealthMessage = firstNonEmpty(strings.TrimSpace(message), "agent readiness 检查失败")
+		if detail != nil {
+			if raw, ok := detail["observed_state"]; ok {
+				if observed := strings.TrimSpace(fmt.Sprint(raw)); observed != "" {
+					m.ObservedState = observed
+				}
+			}
+		}
+	}
+	m.LastReconciledAt = now
+	applyDrift(&m)
+	s.modelRegistry.Upsert(m)
+	return s.persistModel(ctx, m)
+}
+
 func (s *ModelService) StartAutoRefresh(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = 30 * time.Second
@@ -220,6 +278,16 @@ func (s *ModelService) executeAction(ctx context.Context, id, action string) (mo
 
 	actionModel := m
 	actionModel.Metadata = cloneMetadataMap(m.Metadata)
+	if desired := desiredStateForAction(action, m); desired != "" {
+		m.DesiredState = desired
+		if m.LastReconciledAt.IsZero() {
+			m.LastReconciledAt = time.Now().UTC()
+		}
+		s.modelRegistry.Upsert(m)
+		if err := s.persistModel(ctx, m); err != nil {
+			s.logger.Warn("写入 desired_state 失败，继续执行动作", "model_id", m.ID, "error", err)
+		}
+	}
 	runtimeEndpoint, runtimeToken := s.resolveRuntimeConnection(actionModel)
 	if runtimeEndpoint != "" {
 		actionModel.Endpoint = runtimeEndpoint
@@ -343,6 +411,21 @@ func (s *ModelService) executeAction(ctx context.Context, id, action string) (mo
 	if err := s.persistModel(ctx, m); err != nil {
 		return actionResult(false, "写入模型持久化状态失败", map[string]interface{}{"error": err.Error(), "model_id": m.ID}), nil
 	}
+	if isContainerRuntime(m.BackendType) {
+		if reconciled, recErr := s.reconcileContainerModel(ctx, m); recErr != nil {
+			s.logger.Warn("动作后 runtime reconcile 失败", "model_id", m.ID, "action", action, "error", recErr)
+		} else {
+			m = reconciled
+		}
+	}
+	if result.Detail == nil {
+		result.Detail = map[string]interface{}{}
+	}
+	result.Detail["desired_state"] = m.DesiredState
+	result.Detail["observed_state"] = m.ObservedState
+	result.Detail["readiness"] = m.Readiness
+	result.Detail["health_message"] = m.HealthMessage
+	result.Detail["last_reconciled_at"] = m.LastReconciledAt
 	return result, nil
 }
 
@@ -575,18 +658,45 @@ func (s *ModelService) refreshLocalModels(ctx context.Context) error {
 			"path":                path,
 			"runtime_template_id": templateID,
 		}
+		if strings.TrimSpace(endpoint) != "" {
+			metadata["runtime_endpoint"] = endpoint
+		}
 		preserveContainerMetadata(existing.Metadata, metadata)
+		modelEndpoint := endpoint
+		if inferredEndpoint := s.inferServiceEndpointFromTemplateID(templateID); inferredEndpoint != "" {
+			modelEndpoint = inferredEndpoint
+			metadata["runtime_service_endpoint"] = inferredEndpoint
+		}
+		desiredState := strings.TrimSpace(existing.DesiredState)
+		if desiredState == "" {
+			desiredState = string(state)
+		}
+		observedState := strings.TrimSpace(existing.ObservedState)
+		if observedState == "" {
+			observedState = string(state)
+		}
+		readiness := existing.Readiness
+		if strings.TrimSpace(string(readiness)) == "" {
+			readiness = model.ReadinessUnknown
+		}
+		healthMessage := strings.TrimSpace(existing.HealthMessage)
+		lastReconciledAt := existing.LastReconciledAt
 
 		scanned = append(scanned, model.Model{
-			ID:          modelID,
-			Name:        modelName,
-			Provider:    "localfs",
-			BackendType: backendType,
-			HostNodeID:  hostNodeID,
-			RuntimeID:   runtimeID,
-			Endpoint:    endpoint,
-			State:       state,
-			Metadata:    metadata,
+			ID:               modelID,
+			Name:             modelName,
+			Provider:         "localfs",
+			BackendType:      backendType,
+			HostNodeID:       hostNodeID,
+			RuntimeID:        runtimeID,
+			Endpoint:         modelEndpoint,
+			State:            state,
+			DesiredState:     desiredState,
+			ObservedState:    observedState,
+			Readiness:        readiness,
+			HealthMessage:    healthMessage,
+			LastReconciledAt: lastReconciledAt,
+			Metadata:         metadata,
 		})
 	}
 
@@ -603,24 +713,7 @@ func (s *ModelService) refreshContainerRuntimeStates(ctx context.Context) error 
 		if !isContainerRuntime(item.BackendType) {
 			continue
 		}
-
-		adapterInstance, err := s.adapters.Get(item.BackendType)
-		if err != nil {
-			s.logger.Warn("刷新容器模型状态失败：获取适配器失败",
-				"action", "refresh_container_runtime_status",
-				"model_id", item.ID,
-				"model_name", item.Name,
-				"node_id", item.HostNodeID,
-				"runtime_type", item.BackendType,
-				"runtime_id", item.RuntimeID,
-				"error", err,
-			)
-			refreshErrors = append(refreshErrors, fmt.Errorf("model=%s backend=%s get adapter failed: %w", item.ID, item.BackendType, err))
-			continue
-		}
-
-		status, err := adapterInstance.GetStatus(ctx, item)
-		if err != nil {
+		if _, err := s.reconcileContainerModel(ctx, item); err != nil {
 			s.logger.Warn("刷新容器模型状态失败",
 				"action", "refresh_container_runtime_status",
 				"model_id", item.ID,
@@ -630,46 +723,8 @@ func (s *ModelService) refreshContainerRuntimeStates(ctx context.Context) error 
 				"runtime_id", item.RuntimeID,
 				"error", err,
 			)
-			refreshErrors = append(refreshErrors, fmt.Errorf("model=%s backend=%s status failed: %w", item.ID, item.BackendType, err))
-			continue
+			refreshErrors = append(refreshErrors, fmt.Errorf("model=%s backend=%s reconcile failed: %w", item.ID, item.BackendType, err))
 		}
-		if !status.Success {
-			s.logger.Warn("刷新容器模型状态失败：状态返回失败",
-				"action", "refresh_container_runtime_status",
-				"model_id", item.ID,
-				"model_name", item.Name,
-				"node_id", item.HostNodeID,
-				"runtime_type", item.BackendType,
-				"runtime_id", item.RuntimeID,
-				"message", status.Message,
-			)
-			refreshErrors = append(refreshErrors, fmt.Errorf("model=%s backend=%s status unsuccessful: %s", item.ID, item.BackendType, status.Message))
-			continue
-		}
-
-		updated := item
-		updated.Metadata = cloneMetadataMap(item.Metadata)
-		applyContainerRuntimeDetail(status.Detail, &updated)
-
-		exists, hasExists := boolFromDetail(status.Detail, "runtime_exists")
-		running, hasRunning := boolFromDetail(status.Detail, "runtime_running")
-
-		switch {
-		case hasExists && !exists:
-			updated.State = model.ModelStateStopped
-			clearContainerMetadata(&updated)
-			s.scheduler.MarkStopped(updated.ID)
-		case hasRunning && running:
-			updated.State = model.ModelStateRunning
-			s.scheduler.MarkRunning(updated)
-		case (hasExists && exists) || hasNonEmptyDetail(status.Detail, "runtime_container_id"):
-			updated.State = model.ModelStateLoaded
-			s.scheduler.MarkStopped(updated.ID)
-		default:
-			continue
-		}
-
-		s.modelRegistry.Upsert(updated)
 	}
 	return errors.Join(refreshErrors...)
 }
@@ -679,6 +734,261 @@ func (s *ModelService) persistModel(ctx context.Context, item model.Model) error
 		return nil
 	}
 	return s.store.UpsertModel(ctx, item)
+}
+
+func desiredStateForAction(action string, m model.Model) string {
+	switch action {
+	case "start":
+		return string(model.ModelStateRunning)
+	case "stop", "unload":
+		return string(model.ModelStateStopped)
+	case "load":
+		if isContainerRuntime(m.BackendType) {
+			return string(model.ModelStateLoaded)
+		}
+		return string(model.ModelStateRunning)
+	default:
+		return strings.TrimSpace(m.DesiredState)
+	}
+}
+
+func (s *ModelService) reconcileContainerModel(ctx context.Context, item model.Model) (model.Model, error) {
+	adapterInstance, err := s.adapters.Get(item.BackendType)
+	if err != nil {
+		return item, fmt.Errorf("get adapter failed: %w", err)
+	}
+	status, err := adapterInstance.GetStatus(ctx, item)
+	if err != nil {
+		item.Readiness = model.ReadinessNotReady
+		item.HealthMessage = fmt.Sprintf("runtime status 查询失败: %v", err)
+		item.LastReconciledAt = time.Now().UTC()
+		applyDrift(&item)
+		s.modelRegistry.Upsert(item)
+		_ = s.persistModel(ctx, item)
+		return item, err
+	}
+	if !status.Success {
+		item.Readiness = model.ReadinessNotReady
+		item.HealthMessage = firstNonEmpty(strings.TrimSpace(status.Message), "runtime status 返回失败")
+		item.LastReconciledAt = time.Now().UTC()
+		applyDrift(&item)
+		s.modelRegistry.Upsert(item)
+		_ = s.persistModel(ctx, item)
+		return item, fmt.Errorf("runtime status unsuccessful: %s", status.Message)
+	}
+
+	updated := item
+	updated.Metadata = cloneMetadataMap(item.Metadata)
+	applyContainerRuntimeDetail(status.Detail, &updated)
+
+	exists, hasExists := boolFromDetail(status.Detail, "runtime_exists")
+	running, hasRunning := boolFromDetail(status.Detail, "runtime_running")
+	updated.ObservedState = string(model.ModelStateUnknown)
+
+	switch {
+	case hasExists && !exists:
+		updated.State = model.ModelStateStopped
+		updated.ObservedState = string(model.ModelStateStopped)
+		updated.Readiness = model.ReadinessNotReady
+		updated.HealthMessage = "runtime 容器不存在"
+		clearContainerMetadata(&updated)
+		s.scheduler.MarkStopped(updated.ID)
+	case hasRunning && running:
+		updated.State = model.ModelStateRunning
+		updated.ObservedState = string(model.ModelStateRunning)
+		s.scheduler.MarkRunning(updated)
+		ready, message, endpoint := s.checkRuntimeReadiness(ctx, updated)
+		if endpoint != "" {
+			updated.Endpoint = endpoint
+		}
+		if ready {
+			updated.Readiness = model.ReadinessReady
+			updated.HealthMessage = firstNonEmpty(message, "runtime ready")
+		} else {
+			updated.Readiness = model.ReadinessNotReady
+			updated.HealthMessage = firstNonEmpty(message, "runtime running but not ready")
+		}
+	case (hasExists && exists) || hasNonEmptyDetail(status.Detail, "runtime_container_id"):
+		updated.State = model.ModelStateLoaded
+		updated.ObservedState = string(model.ModelStateLoaded)
+		updated.Readiness = model.ReadinessNotReady
+		updated.HealthMessage = "runtime 已装载但未运行"
+		s.scheduler.MarkStopped(updated.ID)
+	default:
+		updated.Readiness = model.ReadinessUnknown
+		updated.HealthMessage = "runtime 状态未知"
+	}
+
+	if strings.TrimSpace(updated.DesiredState) == "" {
+		updated.DesiredState = string(updated.State)
+	}
+	updated.LastReconciledAt = time.Now().UTC()
+	applyDrift(&updated)
+	s.modelRegistry.Upsert(updated)
+	if err := s.persistModel(ctx, updated); err != nil {
+		return updated, err
+	}
+	return updated, nil
+}
+
+func applyDrift(item *model.Model) {
+	if item == nil {
+		return
+	}
+	desired := strings.TrimSpace(strings.ToLower(item.DesiredState))
+	observed := strings.TrimSpace(strings.ToLower(item.ObservedState))
+	if desired == "" || observed == "" || desired == observed {
+		return
+	}
+	if strings.Contains(strings.ToLower(item.HealthMessage), "drift") {
+		return
+	}
+	if strings.TrimSpace(item.HealthMessage) == "" {
+		item.HealthMessage = fmt.Sprintf("drift: desired=%s observed=%s", item.DesiredState, item.ObservedState)
+		return
+	}
+	item.HealthMessage = fmt.Sprintf("%s; drift: desired=%s observed=%s", item.HealthMessage, item.DesiredState, item.ObservedState)
+}
+
+func (s *ModelService) checkRuntimeReadiness(ctx context.Context, item model.Model) (bool, string, string) {
+	templateID := strings.TrimSpace(readMetadataValue(item.Metadata, "runtime_template_id"))
+	endpoint := strings.TrimSpace(firstNonEmpty(
+		readMetadataValue(item.Metadata, "runtime_service_endpoint"),
+		item.Endpoint,
+	))
+	if endpoint == "" {
+		if inferred := s.inferServiceEndpointFromTemplateID(templateID); inferred != "" {
+			endpoint = inferred
+		}
+	}
+	if endpoint == "" {
+		return true, "runtime running（无 endpoint）", endpoint
+	}
+	probeEndpoint := normalizeControllerAccessibleEndpoint(endpoint)
+	// 只有 embedding 样板做严格 readiness，其他容器默认 running 即 ready。
+	if !s.requiresStrictEmbeddingReadiness(ctx, item, templateID) {
+		return true, "runtime running", endpoint
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, strings.TrimRight(probeEndpoint, "/")+"/health", nil)
+	if err != nil {
+		return false, fmt.Sprintf("health request build failed: %v", err), endpoint
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false, fmt.Sprintf("health request failed: %v", err), endpoint
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return true, fmt.Sprintf("healthz ok: %d", resp.StatusCode), endpoint
+	}
+	return false, fmt.Sprintf("healthz status=%d", resp.StatusCode), endpoint
+}
+
+func (s *ModelService) requiresStrictEmbeddingReadiness(ctx context.Context, item model.Model, templateID string) bool {
+	if isEmbeddingTemplateHint(templateID) {
+		return true
+	}
+	if isEmbeddingTemplateHint(readMetadataValue(item.Metadata, "runtime_template_id")) {
+		return true
+	}
+	if isEmbeddingTemplateHint(readMetadataValue(item.Metadata, "category")) {
+		return true
+	}
+	if isEmbeddingTemplateHint(readMetadataValue(item.Metadata, "runtime_category")) {
+		return true
+	}
+	if isEmbeddingTemplateHint(item.ID) || isEmbeddingTemplateHint(item.Name) {
+		return true
+	}
+	if s.templates == nil || strings.TrimSpace(templateID) == "" {
+		return false
+	}
+	tpl, ok := s.templates.GetTemplate(ctx, templateID)
+	if !ok {
+		return false
+	}
+	if isEmbeddingTemplateHint(readMetadataValue(tpl.Metadata, "category")) {
+		return true
+	}
+	return isEmbeddingTemplateHint(tpl.ID) || isEmbeddingTemplateHint(tpl.Name) || isEmbeddingTemplateHint(tpl.Description)
+}
+
+func isEmbeddingTemplateHint(input string) bool {
+	lower := strings.ToLower(strings.TrimSpace(input))
+	if lower == "" {
+		return false
+	}
+	hints := []string{"embedding", "embed", "e5", "bge", "gte", "m3e", "jina"}
+	for _, hint := range hints {
+		if strings.Contains(lower, hint) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *ModelService) inferServiceEndpointFromTemplateID(templateID string) string {
+	if s.templates == nil || strings.TrimSpace(templateID) == "" {
+		return ""
+	}
+	tpl, ok := s.templates.GetTemplate(context.Background(), templateID)
+	if !ok {
+		return ""
+	}
+	return inferServiceEndpointFromTemplate(tpl)
+}
+
+func inferServiceEndpointFromTemplate(tpl model.RuntimeTemplate) string {
+	if len(tpl.Ports) == 0 {
+		return ""
+	}
+	for _, mapping := range tpl.Ports {
+		if endpoint := inferServiceEndpointFromPortMapping(mapping); endpoint != "" {
+			return endpoint
+		}
+	}
+	return ""
+}
+
+func inferServiceEndpointFromPortMapping(mapping string) string {
+	main := strings.TrimSpace(mapping)
+	if main == "" {
+		return ""
+	}
+	if idx := strings.Index(main, "/"); idx > 0 {
+		main = main[:idx]
+	}
+	parts := strings.Split(main, ":")
+	if len(parts) == 2 {
+		if port := strings.TrimSpace(parts[0]); isDigits(port) {
+			return "http://127.0.0.1:" + port
+		}
+	}
+	if len(parts) == 3 {
+		if port := strings.TrimSpace(parts[1]); isDigits(port) {
+			host := strings.TrimSpace(parts[0])
+			if host == "" || host == "0.0.0.0" {
+				host = "127.0.0.1"
+			}
+			return "http://" + host + ":" + port
+		}
+	}
+	return ""
+}
+
+func isDigits(value string) bool {
+	if strings.TrimSpace(value) == "" {
+		return false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func normalizeModelName(name string) string {
@@ -718,6 +1028,7 @@ func preserveContainerMetadata(existing map[string]string, target map[string]str
 		"runtime_container_id",
 		"runtime_container",
 		"runtime_image",
+		"runtime_service_endpoint",
 	}
 	for _, key := range keys {
 		if v := strings.TrimSpace(existing[key]); v != "" {
@@ -806,6 +1117,12 @@ func applyContainerRuntimeDetail(detail map[string]interface{}, m *model.Model) 
 			m.Metadata["runtime_image"] = s
 		}
 	}
+	if v, ok := detail["runtime_service_endpoint"]; ok {
+		if s := strings.TrimSpace(fmt.Sprint(v)); s != "" && s != "<nil>" {
+			m.Metadata["runtime_service_endpoint"] = s
+			m.Endpoint = s
+		}
+	}
 }
 
 func clearContainerMetadata(m *model.Model) {
@@ -815,6 +1132,7 @@ func clearContainerMetadata(m *model.Model) {
 	delete(m.Metadata, "runtime_container_id")
 	delete(m.Metadata, "runtime_container")
 	delete(m.Metadata, "runtime_image")
+	delete(m.Metadata, "runtime_service_endpoint")
 }
 
 func cloneMetadataMap(in map[string]string) map[string]string {
@@ -850,7 +1168,12 @@ func actionAllowedForBackendAndState(action string, backendType model.RuntimeTyp
 		case "unload":
 			return normalized == model.ModelStateLoaded || normalized == model.ModelStateRunning || normalized == model.ModelStateBusy
 		case "start":
-			return normalized == model.ModelStateLoaded
+			return normalized == model.ModelStateLoaded ||
+				normalized == model.ModelStateStopped ||
+				normalized == model.ModelStateUnknown ||
+				normalized == model.ModelStateError ||
+				normalized == model.ModelStateRunning ||
+				normalized == model.ModelStateBusy
 		case "stop":
 			return normalized == model.ModelStateRunning || normalized == model.ModelStateBusy
 		default:
@@ -971,6 +1294,21 @@ func mergeOneModel(base model.Model, persisted model.Model) model.Model {
 	}
 	if strings.TrimSpace(string(persisted.State)) != "" {
 		base.State = persisted.State
+	}
+	if strings.TrimSpace(persisted.DesiredState) != "" {
+		base.DesiredState = persisted.DesiredState
+	}
+	if strings.TrimSpace(persisted.ObservedState) != "" {
+		base.ObservedState = persisted.ObservedState
+	}
+	if strings.TrimSpace(string(persisted.Readiness)) != "" {
+		base.Readiness = persisted.Readiness
+	}
+	if strings.TrimSpace(persisted.HealthMessage) != "" {
+		base.HealthMessage = persisted.HealthMessage
+	}
+	if !persisted.LastReconciledAt.IsZero() {
+		base.LastReconciledAt = persisted.LastReconciledAt
 	}
 	if base.Metadata == nil {
 		base.Metadata = cloneMetadataMap(persisted.Metadata)

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"model-control-plane/src/pkg/adapter"
@@ -72,7 +73,9 @@ func (a *captureAdapter) StopModel(ctx context.Context, m model.Model) (model.Ac
 func (a *captureAdapter) GetStatus(ctx context.Context, m model.Model) (model.ActionResult, error) {
 	_ = ctx
 	a.markCall("status")
-	a.lastModel = m
+	if strings.TrimSpace(a.lastModel.ID) == "" {
+		a.lastModel = m
+	}
 	return a.resultFor("status"), nil
 }
 
@@ -458,7 +461,9 @@ func TestActionAllowedForBackendAndStateContainerRuntime(t *testing.T) {
 		{name: "stopped_load", action: "load", state: model.ModelStateStopped, allowed: true},
 		{name: "unknown_load", action: "load", state: model.ModelStateUnknown, allowed: true},
 		{name: "error_load", action: "load", state: model.ModelStateError, allowed: true},
-		{name: "stopped_start", action: "start", state: model.ModelStateStopped, allowed: false},
+		{name: "stopped_start", action: "start", state: model.ModelStateStopped, allowed: true},
+		{name: "unknown_start", action: "start", state: model.ModelStateUnknown, allowed: true},
+		{name: "error_start", action: "start", state: model.ModelStateError, allowed: true},
 		{name: "stopped_unload", action: "unload", state: model.ModelStateStopped, allowed: false},
 		{name: "stopped_stop", action: "stop", state: model.ModelStateStopped, allowed: false},
 		{name: "loaded_load", action: "load", state: model.ModelStateLoaded, allowed: false},
@@ -466,9 +471,10 @@ func TestActionAllowedForBackendAndStateContainerRuntime(t *testing.T) {
 		{name: "loaded_unload", action: "unload", state: model.ModelStateLoaded, allowed: true},
 		{name: "loaded_stop", action: "stop", state: model.ModelStateLoaded, allowed: false},
 		{name: "running_load", action: "load", state: model.ModelStateRunning, allowed: false},
-		{name: "running_start", action: "start", state: model.ModelStateRunning, allowed: false},
+		{name: "running_start", action: "start", state: model.ModelStateRunning, allowed: true},
 		{name: "running_unload", action: "unload", state: model.ModelStateRunning, allowed: true},
 		{name: "running_stop", action: "stop", state: model.ModelStateRunning, allowed: true},
+		{name: "busy_start", action: "start", state: model.ModelStateBusy, allowed: true},
 		{name: "busy_unload", action: "unload", state: model.ModelStateBusy, allowed: true},
 		{name: "busy_stop", action: "stop", state: model.ModelStateBusy, allowed: true},
 	}
@@ -483,9 +489,61 @@ func TestActionAllowedForBackendAndStateContainerRuntime(t *testing.T) {
 	}
 }
 
-func TestStartModelDisallowedWhenContainerModelStopped(t *testing.T) {
+func TestRequiresStrictEmbeddingReadiness(t *testing.T) {
+	svc := &ModelService{}
+	tests := []struct {
+		name       string
+		templateID string
+		item       model.Model
+		expected   bool
+	}{
+		{
+			name:       "default_embedding_template",
+			templateID: DefaultEmbeddingTemplateID,
+			expected:   true,
+		},
+		{
+			name:       "custom_embedding_template_id",
+			templateID: "tei-embedding-e5-local",
+			expected:   true,
+		},
+		{
+			name:       "metadata_embedding_category",
+			templateID: "custom-template",
+			item: model.Model{
+				Metadata: map[string]string{"category": "embedding"},
+			},
+			expected: true,
+		},
+		{
+			name:       "generic_template",
+			templateID: "docker-generic-local",
+			item: model.Model{
+				ID:   "local-llm",
+				Name: "llm-generic",
+			},
+			expected: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := svc.requiresStrictEmbeddingReadiness(context.Background(), tc.item, tc.templateID)
+			if got != tc.expected {
+				t.Fatalf("unexpected strict readiness decision, template_id=%s expected=%t got=%t", tc.templateID, tc.expected, got)
+			}
+		})
+	}
+}
+
+func TestStartModelAllowedWhenContainerModelStopped(t *testing.T) {
 	capture := &captureAdapter{}
-	capture.setResult("start", model.ActionResult{Success: true})
+	capture.setResult("start", model.ActionResult{
+		Success: true,
+		Detail: map[string]interface{}{
+			"runtime_running": true,
+		},
+	})
 
 	adapters := adapter.NewManager()
 	adapters.Register(model.RuntimeTypeDocker, capture)
@@ -521,15 +579,15 @@ func TestStartModelDisallowedWhenContainerModelStopped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartModel returned error: %v", err)
 	}
-	if res.Success {
-		t.Fatalf("StartModel should be rejected when state is stopped")
+	if !res.Success {
+		t.Fatalf("StartModel should succeed when state is stopped, message=%s", res.Message)
 	}
-	if capture.countCall("start") != 0 {
-		t.Fatalf("adapter start should not be called when action is disallowed")
+	if capture.countCall("start") != 1 {
+		t.Fatalf("adapter start should be called once, got=%d", capture.countCall("start"))
 	}
 	got, _ := svc.modelRegistry.Get("local-embed")
-	if got.State != model.ModelStateStopped {
-		t.Fatalf("state should remain stopped, got=%s", got.State)
+	if got.State != model.ModelStateRunning {
+		t.Fatalf("state should become running after start, got=%s", got.State)
 	}
 }
 

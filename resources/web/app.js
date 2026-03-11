@@ -12,11 +12,17 @@ const runtimeTemplateResultEl = document.getElementById("runtime-template-result
 const runtimeTemplateFormEl = document.getElementById("runtime-template-form");
 const templateValidateBtn = document.getElementById("tpl-validate-btn");
 const templateRegisterBtn = document.getElementById("tpl-register-btn");
+const tasksEl = document.getElementById("tasks");
+const testRunsEl = document.getElementById("test-runs");
+const runE5TestBtn = document.getElementById("run-e5-test-btn");
+const refreshRuntimeTaskBtn = document.getElementById("refresh-runtime-task-btn");
 
 const state = {
   nodes: [],
   models: [],
   runtimeTemplates: [],
+  tasks: [],
+  testRuns: [],
   activeNodeId: "",
   activePage: "runtime",
   activeRuntimeTab: "list",
@@ -64,6 +70,22 @@ async function requestJSON(url, options = {}) {
     throw new Error(msg);
   }
   return payload.data;
+}
+
+async function waitTaskDone(taskId, timeoutMs = 120000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const task = await requestJSON(`/api/v1/tasks/${encodeURIComponent(taskId)}`);
+    const status = String(task.status || "").toLowerCase();
+    if (["success", "failed", "timeout", "canceled"].includes(status)) {
+      if (status !== "success") {
+        throw new Error(`任务失败: ${task.message || status}${task.error ? ` (${task.error})` : ""}`);
+      }
+      return task;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+  }
+  throw new Error("等待任务超时");
 }
 
 function resolveAPIToken() {
@@ -216,6 +238,62 @@ function renderRuntimeTemplates() {
   });
 }
 
+function statusPill(status) {
+  const value = String(status || "unknown").trim() || "unknown";
+  const cls = value.toLowerCase().replace(/[^a-z0-9_]+/g, "_");
+  return `<span class="status-pill status-${escapeHTML(cls)}">${escapeHTML(value)}</span>`;
+}
+
+function renderTasks() {
+  if (!tasksEl) {
+    return;
+  }
+  if (!Array.isArray(state.tasks) || state.tasks.length === 0) {
+    tasksEl.textContent = "暂无任务";
+    return;
+  }
+  tasksEl.innerHTML = "";
+  state.tasks.slice(0, 10).forEach((task) => {
+    const item = document.createElement("div");
+    item.className = "list-item";
+    const detail = task.detail && typeof task.detail === "object" ? JSON.stringify(task.detail) : "";
+    item.innerHTML = `
+      <div class="item-title">${escapeHTML(task.type)} (${escapeHTML(task.id)})</div>
+      <div class="meta">状态: ${statusPill(task.status)} | 进度: ${escapeHTML(String(task.progress || 0))}%</div>
+      <div class="meta">目标: ${escapeHTML(task.target_type || "-")} / ${escapeHTML(task.target_id || "-")}</div>
+      <div class="meta">执行者: ${escapeHTML(task.worker_id || task.assigned_agent_id || "-")} | 开始: ${escapeHTML(formatTime(task.started_at))} | 结束: ${escapeHTML(formatTime(task.finished_at))}</div>
+      <div class="meta">消息: ${escapeHTML(task.message || "-")}</div>
+      <div class="meta">错误: ${escapeHTML(task.error || "-")}</div>
+      <div class="meta">明细: ${escapeHTML(detail || "-")}</div>
+    `;
+    tasksEl.appendChild(item);
+  });
+}
+
+function renderTestRuns() {
+  if (!testRunsEl) {
+    return;
+  }
+  if (!Array.isArray(state.testRuns) || state.testRuns.length === 0) {
+    testRunsEl.textContent = "暂无测试运行记录";
+    return;
+  }
+  testRunsEl.innerHTML = "";
+  state.testRuns.slice(0, 10).forEach((run) => {
+    const item = document.createElement("div");
+    item.className = "list-item";
+    item.innerHTML = `
+      <div class="item-title">${escapeHTML(run.scenario || "-")} (${escapeHTML(run.test_run_id || "-")})</div>
+      <div class="meta">状态: ${statusPill(run.status)} | 触发人: ${escapeHTML(run.triggered_by || "-")}</div>
+      <div class="meta">开始: ${escapeHTML(formatTime(run.started_at))} | 结束: ${escapeHTML(formatTime(run.finished_at))}</div>
+      <div class="meta">摘要: ${escapeHTML(run.summary || "-")}</div>
+      <div class="meta">日志: ${escapeHTML(run.log_path || "-")}</div>
+      <div class="meta">错误: ${escapeHTML(run.error || "-")}</div>
+    `;
+    testRunsEl.appendChild(item);
+  });
+}
+
 function renderModelTabs() {
   if (!Array.isArray(state.nodes) || state.nodes.length === 0) {
     modelTabsEl.textContent = "";
@@ -306,7 +384,7 @@ function actionsForModelBackend(backendType) {
   if (normalized === "lmstudio") {
     return ["load", "unload"];
   }
-  return ["load", "unload", "start", "stop"];
+  return ["load", "unload", "start", "stop", "refresh"];
 }
 
 function actionAllowedByState(action, rawState) {
@@ -316,6 +394,9 @@ function actionAllowedByState(action, rawState) {
   }
   if (action === "unload" || action === "stop") {
     return isLoadedState(stateValue);
+  }
+  if (action === "refresh") {
+    return true;
   }
   return true;
 }
@@ -339,6 +420,9 @@ function actionAllowedByBackendAndState(action, backendType, rawState) {
   }
   if (action === "stop") {
     return stateValue === "running" || stateValue === "busy";
+  }
+  if (action === "refresh") {
+    return true;
   }
   return true;
 }
@@ -364,14 +448,32 @@ function buildActionButton(modelId, action, nodeId, modelState, backendType) {
     }
     setNodeLock(nodeId, true);
     try {
-      const data = await requestJSON(`/api/v1/models/${encodeURIComponent(modelId)}/${action}`, {
-        method: "POST",
-      });
-      showToast(`${action} -> ${data.message || "ok"}`);
+      let message = "ok";
+      if (action === "start" || action === "stop" || action === "refresh") {
+        const task = await requestJSON(`/api/v1/tasks/runtime/${action}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model_id: modelId,
+            triggered_by: "web-console",
+          }),
+        });
+        const finalTask = await waitTaskDone(task.id);
+        message = `${action} task=${task.id} ${finalTask.status}`;
+      } else {
+        const data = await requestJSON(`/api/v1/models/${encodeURIComponent(modelId)}/${action}`, {
+          method: "POST",
+        });
+        message = `${action} -> ${data.message || "ok"}`;
+      }
+      showToast(message);
       await loadModels({ refresh: true });
+      await Promise.all([loadTasks(), loadTestRuns()]);
       renderNodes();
       renderModelTabs();
       renderModels();
+      renderTasks();
+      renderTestRuns();
     } catch (err) {
       showToast(`${action} 失败: ${err.message}`);
     } finally {
@@ -532,12 +634,18 @@ function renderModels() {
       `后端: ${m.backend_type}`,
       `节点: ${m.host_node_id}`,
       `状态: ${displayModelState(m.state, m.backend_type)}`,
+      `期望: ${m.desired_state || "-"}`,
+      `实际: ${m.observed_state || "-"}`,
+      `Readiness: ${m.readiness || "unknown"}`,
       `装载: ${isLoadedState(m.state) ? "已装载" : "未装载"}`,
     ];
     if (normalizeBackendType(m.backend_type) !== "lmstudio") {
       metaParts.push(`模板: ${templateID}`);
     }
     meta.textContent = metaParts.join(" | ");
+    const health = document.createElement("div");
+    health.className = "meta";
+    health.innerHTML = `健康信息: ${statusPill(m.readiness || "unknown")} ${escapeHTML(m.health_message || "-")} | endpoint: ${escapeHTML(m.endpoint || "-")} | 最近协调: ${escapeHTML(formatTime(m.last_reconciled_at))}`;
 
     const actions = document.createElement("div");
     actions.className = "actions";
@@ -547,6 +655,7 @@ function renderModels() {
 
     item.appendChild(title);
     item.appendChild(meta);
+    item.appendChild(health);
     item.appendChild(actions);
     modelsEl.appendChild(item);
   });
@@ -572,12 +681,67 @@ async function loadRuntimeTemplates() {
   state.runtimeTemplates = Array.isArray(templates) ? templates : [];
 }
 
+async function loadTasks() {
+  const tasks = await requestJSON("/api/v1/tasks?limit=20");
+  state.tasks = Array.isArray(tasks) ? tasks : [];
+}
+
+async function loadTestRuns() {
+  const runs = await requestJSON("/api/v1/test-runs?limit=20");
+  state.testRuns = Array.isArray(runs) ? runs : [];
+}
+
+function bindTestActions() {
+  runE5TestBtn?.addEventListener("click", async () => {
+    try {
+      const run = await requestJSON("/api/v1/test-runs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          scenario: "e5_embedding_smoke",
+          triggered_by: "web-console",
+        }),
+      });
+      showToast(`已创建测试运行: ${run.test_run_id}`);
+      await Promise.all([loadTasks(), loadTestRuns()]);
+      renderTasks();
+      renderTestRuns();
+    } catch (err) {
+      showToast(`创建测试运行失败: ${err.message}`);
+    }
+  });
+
+  refreshRuntimeTaskBtn?.addEventListener("click", async () => {
+    try {
+      const model = Array.isArray(state.models) ? state.models.find((item) => item.id === "local-multilingual-e5-base") || state.models[0] : null;
+      if (!model || !model.id) {
+        throw new Error("未找到可刷新的模型");
+      }
+      const task = await requestJSON("/api/v1/tasks/runtime/refresh", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model_id: model.id,
+          triggered_by: "web-console",
+        }),
+      });
+      await waitTaskDone(task.id, 90000);
+      await Promise.all([loadModels({ refresh: true }), loadTasks()]);
+      renderModels();
+      renderTasks();
+      showToast(`刷新完成: ${task.id}`);
+    } catch (err) {
+      showToast(`刷新失败: ${err.message}`);
+    }
+  });
+}
+
 (async function init() {
   try {
     state.apiToken = resolveAPIToken();
 
     let runtimeTemplatesLoadFailed = false;
-    await Promise.all([loadNodes(), loadModels()]);
+    await Promise.all([loadNodes(), loadModels(), loadTasks(), loadTestRuns()]);
     try {
       await loadRuntimeTemplates();
     } catch (err) {
@@ -588,18 +752,37 @@ async function loadRuntimeTemplates() {
       }
     }
     bindDownloadActions();
+    bindTestActions();
     renderPageTabs();
     renderRuntimeSubTabs();
     renderActivePage();
     renderNodes();
     renderModelTabs();
     renderModels();
+    renderTasks();
+    renderTestRuns();
     if (!runtimeTemplatesLoadFailed) {
       renderRuntimeTemplates();
     }
+
+    setInterval(async () => {
+      try {
+        await Promise.all([loadTasks(), loadTestRuns()]);
+        renderTasks();
+        renderTestRuns();
+      } catch (err) {
+        // no-op
+      }
+    }, 5000);
   } catch (err) {
     nodesEl.textContent = `加载失败: ${err.message}`;
     modelsEl.textContent = `加载失败: ${err.message}`;
+    if (tasksEl) {
+      tasksEl.textContent = `加载失败: ${err.message}`;
+    }
+    if (testRunsEl) {
+      testRunsEl.textContent = `加载失败: ${err.message}`;
+    }
     if (runtimeTemplatesEl) {
       runtimeTemplatesEl.textContent = `加载失败: ${err.message}`;
     }

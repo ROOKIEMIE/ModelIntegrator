@@ -110,6 +110,7 @@ func (a *Adapter) LoadModel(ctx context.Context, m model.Model) (model.ActionRes
 		return result(false, "运行时模板解析失败", map[string]interface{}{"error": err.Error(), "model_id": m.ID}), nil
 	}
 	tpl = materializeRuntimeTemplate(tpl, m)
+	serviceEndpoint := inferHTTPServiceEndpointFromTemplate(tpl)
 	containerID, created, err := client.ensureContainer(ctx, m, tpl)
 	if err != nil {
 		return result(false, "容器创建失败", map[string]interface{}{"error": err.Error(), "model_id": m.ID}), nil
@@ -126,13 +127,14 @@ func (a *Adapter) LoadModel(ctx context.Context, m model.Model) (model.ActionRes
 		running = false
 	}
 	return result(true, "容器模板已装载", map[string]interface{}{
-		"model_id":             m.ID,
-		"runtime_container_id": containerID,
-		"runtime_container":    firstNonEmpty(strings.TrimPrefix(info.Name, "/"), containerNameForModel(m)),
-		"runtime_created":      created,
-		"runtime_running":      running,
-		"runtime_image":        tpl.Image,
-		"backend":              a.name,
+		"model_id":                 m.ID,
+		"runtime_container_id":     containerID,
+		"runtime_container":        firstNonEmpty(strings.TrimPrefix(info.Name, "/"), containerNameForModel(m)),
+		"runtime_created":          created,
+		"runtime_running":          running,
+		"runtime_image":            tpl.Image,
+		"runtime_service_endpoint": serviceEndpoint,
+		"backend":                  a.name,
 	}), nil
 }
 
@@ -170,6 +172,7 @@ func (a *Adapter) StartModel(ctx context.Context, m model.Model) (model.ActionRe
 		return result(false, "运行时模板解析失败", map[string]interface{}{"error": err.Error(), "model_id": m.ID}), nil
 	}
 	tpl = materializeRuntimeTemplate(tpl, m)
+	serviceEndpoint := inferHTTPServiceEndpointFromTemplate(tpl)
 	containerID, _, err := client.ensureContainer(ctx, m, tpl)
 	if err != nil {
 		return result(false, "容器准备失败", map[string]interface{}{"error": err.Error(), "model_id": m.ID}), nil
@@ -180,9 +183,10 @@ func (a *Adapter) StartModel(ctx context.Context, m model.Model) (model.ActionRe
 	}
 	if info.State != nil && info.State.Running {
 		return result(true, "容器已在运行", map[string]interface{}{
-			"runtime_container_id": containerID,
-			"runtime_running":      true,
-			"backend":              a.name,
+			"runtime_container_id":     containerID,
+			"runtime_running":          true,
+			"runtime_service_endpoint": serviceEndpoint,
+			"backend":                  a.name,
 		}), nil
 	}
 	if err := client.startContainer(ctx, containerID); err != nil {
@@ -198,9 +202,10 @@ func (a *Adapter) StartModel(ctx context.Context, m model.Model) (model.ActionRe
 		}), nil
 	}
 	return result(true, "容器已启动", map[string]interface{}{
-		"runtime_container_id": containerID,
-		"runtime_running":      true,
-		"backend":              a.name,
+		"runtime_container_id":     containerID,
+		"runtime_running":          true,
+		"runtime_service_endpoint": serviceEndpoint,
+		"backend":                  a.name,
 	}), nil
 }
 
@@ -249,17 +254,25 @@ func (a *Adapter) GetStatus(ctx context.Context, m model.Model) (model.ActionRes
 			"backend":        a.name,
 		}), nil
 	}
+	serviceEndpoint := strings.TrimSpace(readMetadata(m.Metadata, "runtime_service_endpoint"))
+	if tpl, tplErr := parseRuntimeTemplateFromModel(m); tplErr == nil {
+		tpl = materializeRuntimeTemplate(tpl, m)
+		if inferred := inferHTTPServiceEndpointFromTemplate(tpl); inferred != "" {
+			serviceEndpoint = inferred
+		}
+	}
 	info, err := client.inspectContainer(ctx, containerID)
 	if err != nil {
 		return result(false, "容器状态读取失败", map[string]interface{}{"error": err.Error(), "container_id": containerID}), nil
 	}
 	return result(true, "容器状态查询成功", map[string]interface{}{
-		"runtime_exists":       true,
-		"runtime_container_id": containerID,
-		"runtime_running":      info.State != nil && info.State.Running,
-		"runtime_status":       firstNonEmpty(info.State.Status, "unknown"),
-		"runtime_image":        info.Config.Image,
-		"backend":              a.name,
+		"runtime_exists":           true,
+		"runtime_container_id":     containerID,
+		"runtime_running":          info.State != nil && info.State.Running,
+		"runtime_status":           firstNonEmpty(info.State.Status, "unknown"),
+		"runtime_image":            info.Config.Image,
+		"runtime_service_endpoint": serviceEndpoint,
+		"backend":                  a.name,
 	}), nil
 }
 
@@ -1275,6 +1288,17 @@ func parsePortMapping(item string) (string, portBinding, error) {
 	}
 	key := containerPort + "/" + proto
 	return key, portBinding{HostPort: hostPort}, nil
+}
+
+func inferHTTPServiceEndpointFromTemplate(tpl model.RuntimeTemplate) string {
+	for _, mapping := range tpl.Ports {
+		if _, binding, err := parsePortMapping(mapping); err == nil {
+			if strings.TrimSpace(binding.HostPort) != "" {
+				return "http://127.0.0.1:" + strings.TrimSpace(binding.HostPort)
+			}
+		}
+	}
+	return ""
 }
 
 func isValidPort(v string) bool {

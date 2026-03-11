@@ -1,5 +1,41 @@
 # 变更日志
 
+## 2026-03-11
+
+### one-click-up 后前端 502 + 一键 E5 测试失败修复（已验证）
+
+- 问题现象
+  - 执行 `./scripts/one-click-up.sh` 后，前端出现 `502`。
+  - 控制台“一键测试 E5”失败，错误为：
+    - `mkdir /opt/controller/test-logs/<run-id>: permission denied`
+    - `dial tcp 127.0.0.1:58001: connect: connection refused`
+
+- 根因拆解
+  - 历史 `.env` 残留旧路径（`/opt/modelintegrator/...`）与旧 sqlite 文件名，导致 controller 启动异常或数据库只读。
+  - 测试日志宿主机挂载目录权限不足，容器内 `app` 用户无法写入。
+  - controller 运行在容器内时，`127.0.0.1` 指向容器自身，无法访问宿主机 TEI 端口。
+  - runtime `start` 在 `stopped/running` 状态下非幂等，导致一键测试重复触发时任务容易失败。
+
+- 修复内容
+  - `scripts/one-click-up.sh`
+    - 增加旧路径/旧数据库文件名自动迁移。
+    - 增加 sqlite 目录写权限处理（目录 + 文件）。
+    - 增加测试日志目录创建、权限设置与可写性探测（失败即中止）。
+  - `docker-compose.yml` / `resources/docker/compose.example.env`
+    - 增加 `MCP_CONTAINER_HOST_ALIAS`。
+    - controller 增加 `extra_hosts`：`host-gateway` 映射（默认 `host.docker.internal`）。
+  - `src/pkg/service/model_service.go`
+    - 容器 runtime `start` 改为幂等（`stopped/loaded/running/busy/unknown/error` 均可触发）。
+    - embedding 模板 readiness 判定改为严格健康检查（含自定义 E5 模板 id）。
+  - `src/pkg/service/test_run_service.go` + `src/pkg/service/endpoint_util.go`
+    - 在 controller 容器内自动将 loopback endpoint 重写为宿主机别名，避免 `127.0.0.1` 误指向容器自身。
+    - `failRun` 补充 `started_at` 兜底，避免前端显示 `0001-01-01`。
+
+- 验证结果
+  - `e5_embedding_smoke` 成功：`status=success`，`dim=768`。
+  - 测试日志目录正常写入：`./testsystem/logs/<run-id>/`。
+  - 前端 502 消失（容器重建切换窗口内短暂抖动除外）。
+
 ## 2026-03-10
 
 ### 控制平面状态持久化接入（SQLite，最小可用）

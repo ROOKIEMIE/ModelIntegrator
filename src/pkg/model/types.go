@@ -92,6 +92,53 @@ const (
 	ModelStateError   ModelState = "error"
 )
 
+type ReadinessState string
+
+const (
+	ReadinessUnknown  ReadinessState = "unknown"
+	ReadinessReady    ReadinessState = "ready"
+	ReadinessNotReady ReadinessState = "not_ready"
+)
+
+type TaskStatus string
+
+const (
+	TaskStatusPending    TaskStatus = "pending"
+	TaskStatusDispatched TaskStatus = "dispatched"
+	TaskStatusRunning    TaskStatus = "running"
+	TaskStatusSuccess    TaskStatus = "success"
+	TaskStatusFailed     TaskStatus = "failed"
+	TaskStatusTimeout    TaskStatus = "timeout"
+	TaskStatusCanceled   TaskStatus = "canceled"
+)
+
+type TaskType string
+
+const (
+	TaskTypeRuntimeStart          TaskType = "runtime.start"
+	TaskTypeRuntimeStop           TaskType = "runtime.stop"
+	TaskTypeRuntimeRestart        TaskType = "runtime.restart"
+	TaskTypeRuntimeRefresh        TaskType = "runtime.refresh"
+	TaskTypeAgentRuntimeReadiness TaskType = "agent.runtime_readiness_check"
+)
+
+type TaskTargetType string
+
+const (
+	TaskTargetRuntime TaskTargetType = "runtime"
+	TaskTargetNode    TaskTargetType = "node"
+	TaskTargetAgent   TaskTargetType = "agent"
+)
+
+type TestRunStatus string
+
+const (
+	TestRunStatusPending TestRunStatus = "pending"
+	TestRunStatusRunning TestRunStatus = "running"
+	TestRunStatusSuccess TestRunStatus = "success"
+	TestRunStatusFailed  TestRunStatus = "failed"
+)
+
 type Node struct {
 	ID               string                `json:"id" yaml:"id"`
 	Name             string                `json:"name" yaml:"name"`
@@ -224,16 +271,53 @@ type RuntimeTemplateValidationResult struct {
 }
 
 type Model struct {
-	ID            string            `json:"id" yaml:"id"`
-	Name          string            `json:"name" yaml:"name"`
-	Provider      string            `json:"provider" yaml:"provider"`
-	BackendType   RuntimeType       `json:"backend_type" yaml:"backend_type"`
-	HostNodeID    string            `json:"host_node_id" yaml:"host_node_id"`
-	RuntimeID     string            `json:"runtime_id" yaml:"runtime_id"`
-	Endpoint      string            `json:"endpoint" yaml:"endpoint"`
-	State         ModelState        `json:"state" yaml:"state"`
-	ContextLength int               `json:"context_length" yaml:"context_length"`
-	Metadata      map[string]string `json:"metadata,omitempty" yaml:"metadata,omitempty"`
+	ID               string            `json:"id" yaml:"id"`
+	Name             string            `json:"name" yaml:"name"`
+	Provider         string            `json:"provider" yaml:"provider"`
+	BackendType      RuntimeType       `json:"backend_type" yaml:"backend_type"`
+	HostNodeID       string            `json:"host_node_id" yaml:"host_node_id"`
+	RuntimeID        string            `json:"runtime_id" yaml:"runtime_id"`
+	Endpoint         string            `json:"endpoint" yaml:"endpoint"`
+	State            ModelState        `json:"state" yaml:"state"`
+	DesiredState     string            `json:"desired_state,omitempty" yaml:"desired_state,omitempty"`
+	ObservedState    string            `json:"observed_state,omitempty" yaml:"observed_state,omitempty"`
+	Readiness        ReadinessState    `json:"readiness,omitempty" yaml:"readiness,omitempty"`
+	HealthMessage    string            `json:"health_message,omitempty" yaml:"health_message,omitempty"`
+	LastReconciledAt time.Time         `json:"last_reconciled_at,omitempty" yaml:"last_reconciled_at,omitempty"`
+	ContextLength    int               `json:"context_length" yaml:"context_length"`
+	Metadata         map[string]string `json:"metadata,omitempty" yaml:"metadata,omitempty"`
+}
+
+type Task struct {
+	ID              string                 `json:"id"`
+	Type            TaskType               `json:"type"`
+	TargetType      TaskTargetType         `json:"target_type"`
+	TargetID        string                 `json:"target_id"`
+	AssignedAgentID string                 `json:"assigned_agent_id,omitempty"`
+	WorkerID        string                 `json:"worker_id,omitempty"`
+	Status          TaskStatus             `json:"status"`
+	Progress        int                    `json:"progress"`
+	Message         string                 `json:"message,omitempty"`
+	Detail          map[string]interface{} `json:"detail,omitempty"`
+	Payload         map[string]interface{} `json:"payload,omitempty"`
+	Error           string                 `json:"error,omitempty"`
+	CreatedAt       time.Time              `json:"created_at"`
+	AcceptedAt      time.Time              `json:"accepted_at,omitempty"`
+	StartedAt       time.Time              `json:"started_at,omitempty"`
+	FinishedAt      time.Time              `json:"finished_at,omitempty"`
+}
+
+type TestRun struct {
+	TestRunID   string        `json:"test_run_id"`
+	Scenario    string        `json:"scenario"`
+	Status      TestRunStatus `json:"status"`
+	StartedAt   time.Time     `json:"started_at,omitempty"`
+	FinishedAt  time.Time     `json:"finished_at,omitempty"`
+	LogPath     string        `json:"log_path,omitempty"`
+	Summary     string        `json:"summary,omitempty"`
+	TriggeredBy string        `json:"triggered_by,omitempty"`
+	Error       string        `json:"error,omitempty"`
+	CreatedAt   time.Time     `json:"created_at,omitempty"`
 }
 
 type ActionResult struct {

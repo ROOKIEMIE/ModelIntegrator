@@ -58,6 +58,11 @@ func main() {
 	} else {
 		log.Info("模型目录就绪", "path", cfg.Storage.ModelRootDir)
 	}
+	if err := storage.EnsureDirectory(cfg.Testing.LogRootDir); err != nil {
+		log.Warn("测试日志目录检查失败", "path", cfg.Testing.LogRootDir, "error", err)
+	} else {
+		log.Info("测试日志目录就绪", "path", cfg.Testing.LogRootDir)
+	}
 
 	nodeRegistry := registry.NewNodeRegistry(cfg.Nodes)
 	modelRegistry := registry.NewModelRegistry(cfg.Models)
@@ -113,8 +118,10 @@ func main() {
 		log.Error("模型持久化状态加载失败", "error", err)
 		os.Exit(1)
 	}
+	taskService := service.NewTaskService(sqliteStore, modelService, log)
+	testRunService := service.NewTestRunService(sqliteStore, taskService, modelService, log, cfg.Testing.LogRootDir)
 
-	handler := api.NewHandler(nodeService, modelService, runtimeTemplateService, agentService, log, version.Get())
+	handler := api.NewHandler(nodeService, modelService, runtimeTemplateService, agentService, taskService, testRunService, log, version.Get())
 	router := api.NewRouter(handler, cfg.Server.StaticDir, cfg.Auth.Token, log)
 
 	httpServer := server.New(cfg, router, log)

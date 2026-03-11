@@ -1,0 +1,63 @@
+{
+  "error": "Post \"http://127.0.0.1:58001/v1/embeddings\": dial tcp 127.0.0.1:58001: connect: connection refused",
+  "finished_at": "2026-03-11T15:22:30.830792635Z",
+  "scenario": "e5_embedding_smoke",
+  "started_at": "2026-03-11T15:22:29.607211954Z",
+  "status": "failed",
+  "steps": [
+    {
+      "detail": {
+        "expected_dim": 768,
+        "model_id": "local-multilingual-e5-base"
+      },
+      "message": "已找到 E5 模型",
+      "name": "discover_model",
+      "ok": true,
+      "time": "2026-03-11T15:22:29.613545438Z"
+    },
+    {
+      "detail": {
+        "task_id": "task-1773242549613571380"
+      },
+      "message": "已创建 runtime start 任务",
+      "name": "runtime_start",
+      "ok": true,
+      "time": "2026-03-11T15:22:29.619203633Z"
+    },
+    {
+      "detail": {
+        "task_id": "task-1773242549613571380"
+      },
+      "message": "runtime start 任务成功",
+      "name": "runtime_start_wait",
+      "ok": true,
+      "time": "2026-03-11T15:22:30.819936842Z"
+    },
+    {
+      "detail": {
+        "attempt": 1,
+        "desired_state": "running",
+        "endpoint": "http://127.0.0.1:58001",
+        "health_message": "runtime running",
+        "observed_state": "running",
+        "readiness": "ready"
+      },
+      "message": "模型已就绪",
+      "name": "readiness_poll",
+      "ok": true,
+      "time": "2026-03-11T15:22:30.830380866Z"
+    },
+    {
+      "detail": {
+        "endpoint": "http://127.0.0.1:58001",
+        "error": "Post \"http://127.0.0.1:58001/v1/embeddings\": dial tcp 127.0.0.1:58001: connect: connection refused"
+      },
+      "message": "embedding 请求失败",
+      "name": "embedding_request",
+      "ok": false,
+      "time": "2026-03-11T15:22:30.830769547Z"
+    }
+  ],
+  "summary": "embedding 请求失败",
+  "test_run_id": "testrun-1773242549599883713"
+}

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
@@ -22,6 +23,8 @@ type Handler struct {
 	modelService           *service.ModelService
 	runtimeTemplateService *service.RuntimeTemplateService
 	agentService           *service.AgentService
+	taskService            *service.TaskService
+	testRunService         *service.TestRunService
 	logger                 *slog.Logger
 	version                version.Info
 }
@@ -31,6 +34,8 @@ func NewHandler(
 	modelService *service.ModelService,
 	runtimeTemplateService *service.RuntimeTemplateService,
 	agentService *service.AgentService,
+	taskService *service.TaskService,
+	testRunService *service.TestRunService,
 	logger *slog.Logger,
 	v version.Info,
 ) *Handler {
@@ -39,6 +44,8 @@ func NewHandler(
 		modelService:           modelService,
 		runtimeTemplateService: runtimeTemplateService,
 		agentService:           agentService,
+		taskService:            taskService,
+		testRunService:         testRunService,
 		logger:                 logger,
 		version:                v,
 	}
@@ -231,6 +238,198 @@ func (h *Handler) ReportAgentCapabilities(w http.ResponseWriter, r *http.Request
 	OK(w, res)
 }
 
+func (h *Handler) CreateRuntimeTaskStart(w http.ResponseWriter, r *http.Request) {
+	h.createRuntimeTask(w, r, model.TaskTypeRuntimeStart)
+}
+
+func (h *Handler) CreateRuntimeTaskStop(w http.ResponseWriter, r *http.Request) {
+	h.createRuntimeTask(w, r, model.TaskTypeRuntimeStop)
+}
+
+func (h *Handler) CreateRuntimeTaskRefresh(w http.ResponseWriter, r *http.Request) {
+	h.createRuntimeTask(w, r, model.TaskTypeRuntimeRefresh)
+}
+
+func (h *Handler) CreateRuntimeTaskRestart(w http.ResponseWriter, r *http.Request) {
+	h.createRuntimeTask(w, r, model.TaskTypeRuntimeRestart)
+}
+
+func (h *Handler) createRuntimeTask(w http.ResponseWriter, r *http.Request, taskType model.TaskType) {
+	if h.taskService == nil {
+		Fail(w, http.StatusServiceUnavailable, "task 服务未就绪", nil)
+		return
+	}
+	req, err := parseRuntimeTaskPayload(r)
+	if err != nil {
+		Fail(w, http.StatusBadRequest, "runtime task 请求体错误", err.Error())
+		return
+	}
+	task, err := h.taskService.CreateRuntimeTask(r.Context(), taskType, req.ModelID, req.TriggeredBy)
+	if err != nil {
+		if errors.Is(err, service.ErrTaskStoreNotReady) {
+			Fail(w, http.StatusServiceUnavailable, "task store 未就绪", err.Error())
+			return
+		}
+		Fail(w, http.StatusBadRequest, "创建 runtime task 失败", err.Error())
+		return
+	}
+	OK(w, task)
+}
+
+func (h *Handler) ListTasks(w http.ResponseWriter, r *http.Request) {
+	if h.taskService == nil {
+		Fail(w, http.StatusServiceUnavailable, "task 服务未就绪", nil)
+		return
+	}
+	targetType := strings.TrimSpace(r.URL.Query().Get("target_type"))
+	targetID := strings.TrimSpace(r.URL.Query().Get("target_id"))
+	limit := 100
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		if n, convErr := strconv.Atoi(raw); convErr == nil && n > 0 {
+			limit = n
+		}
+	}
+	items, err := h.taskService.ListTasks(r.Context(), targetType, targetID, limit)
+	if err != nil {
+		Fail(w, http.StatusInternalServerError, "查询任务列表失败", err.Error())
+		return
+	}
+	OK(w, items)
+}
+
+func (h *Handler) GetTask(w http.ResponseWriter, r *http.Request) {
+	if h.taskService == nil {
+		Fail(w, http.StatusServiceUnavailable, "task 服务未就绪", nil)
+		return
+	}
+	id := strings.TrimSpace(chi.URLParam(r, "id"))
+	item, err := h.taskService.GetTask(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, service.ErrTaskNotFound) {
+			Fail(w, http.StatusNotFound, "任务不存在", map[string]string{"id": id})
+			return
+		}
+		Fail(w, http.StatusInternalServerError, "查询任务失败", err.Error())
+		return
+	}
+	OK(w, item)
+}
+
+func (h *Handler) CreateAgentRuntimeReadinessTask(w http.ResponseWriter, r *http.Request) {
+	if h.taskService == nil {
+		Fail(w, http.StatusServiceUnavailable, "task 服务未就绪", nil)
+		return
+	}
+	req, err := parseAgentRuntimeTaskPayload(r)
+	if err != nil {
+		Fail(w, http.StatusBadRequest, "agent task 请求体错误", err.Error())
+		return
+	}
+	item, err := h.taskService.CreateAgentRuntimeReadinessTask(r.Context(), req)
+	if err != nil {
+		Fail(w, http.StatusBadRequest, "创建 agent task 失败", err.Error())
+		return
+	}
+	OK(w, item)
+}
+
+func (h *Handler) PullAgentTask(w http.ResponseWriter, r *http.Request) {
+	if h.taskService == nil {
+		Fail(w, http.StatusServiceUnavailable, "task 服务未就绪", nil)
+		return
+	}
+	agentID := agentIDFromPath(r)
+	item, ok, err := h.taskService.PullNextAgentTask(r.Context(), agentID)
+	if err != nil {
+		Fail(w, http.StatusInternalServerError, "拉取 agent task 失败", err.Error())
+		return
+	}
+	if !ok {
+		OK(w, map[string]interface{}{"task": nil})
+		return
+	}
+	OK(w, map[string]interface{}{"task": item})
+}
+
+func (h *Handler) ReportAgentTask(w http.ResponseWriter, r *http.Request) {
+	if h.taskService == nil {
+		Fail(w, http.StatusServiceUnavailable, "task 服务未就绪", nil)
+		return
+	}
+	agentID := agentIDFromPath(r)
+	taskID := strings.TrimSpace(chi.URLParam(r, "taskID"))
+	report, err := parseAgentTaskReportPayload(r)
+	if err != nil {
+		Fail(w, http.StatusBadRequest, "agent task 上报请求体错误", err.Error())
+		return
+	}
+	item, err := h.taskService.ReportAgentTask(r.Context(), agentID, taskID, report)
+	if err != nil {
+		if errors.Is(err, service.ErrTaskNotFound) {
+			Fail(w, http.StatusNotFound, "任务不存在", map[string]string{"task_id": taskID})
+			return
+		}
+		Fail(w, http.StatusBadRequest, "agent task 上报失败", err.Error())
+		return
+	}
+	OK(w, item)
+}
+
+func (h *Handler) CreateTestRun(w http.ResponseWriter, r *http.Request) {
+	if h.testRunService == nil {
+		Fail(w, http.StatusServiceUnavailable, "test run 服务未就绪", nil)
+		return
+	}
+	req, err := parseCreateTestRunPayload(r)
+	if err != nil {
+		Fail(w, http.StatusBadRequest, "test run 请求体错误", err.Error())
+		return
+	}
+	item, err := h.testRunService.CreateAndStart(r.Context(), req)
+	if err != nil {
+		Fail(w, http.StatusBadRequest, "创建测试运行失败", err.Error())
+		return
+	}
+	OK(w, item)
+}
+
+func (h *Handler) ListTestRuns(w http.ResponseWriter, r *http.Request) {
+	if h.testRunService == nil {
+		Fail(w, http.StatusServiceUnavailable, "test run 服务未就绪", nil)
+		return
+	}
+	limit := 20
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		if n, convErr := strconv.Atoi(raw); convErr == nil && n > 0 {
+			limit = n
+		}
+	}
+	items, err := h.testRunService.ListTestRuns(r.Context(), limit)
+	if err != nil {
+		Fail(w, http.StatusInternalServerError, "查询测试运行列表失败", err.Error())
+		return
+	}
+	OK(w, items)
+}
+
+func (h *Handler) GetTestRun(w http.ResponseWriter, r *http.Request) {
+	if h.testRunService == nil {
+		Fail(w, http.StatusServiceUnavailable, "test run 服务未就绪", nil)
+		return
+	}
+	id := strings.TrimSpace(chi.URLParam(r, "id"))
+	item, err := h.testRunService.GetTestRun(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, service.ErrTestRunNotFound) {
+			Fail(w, http.StatusNotFound, "测试运行不存在", map[string]string{"id": id})
+			return
+		}
+		Fail(w, http.StatusInternalServerError, "查询测试运行失败", err.Error())
+		return
+	}
+	OK(w, item)
+}
+
 func (h *Handler) modelAction(w http.ResponseWriter, r *http.Request, action string) {
 	id := chi.URLParam(r, "id")
 
@@ -333,12 +532,119 @@ func parseAgentCapabilityPayload(r *http.Request) (model.AgentCapabilitiesReport
 	return payload, nil
 }
 
+type runtimeTaskPayload struct {
+	ModelID     string `json:"model_id"`
+	TargetID    string `json:"target_id"`
+	TriggeredBy string `json:"triggered_by"`
+}
+
+func parseRuntimeTaskPayload(r *http.Request) (runtimeTaskPayload, error) {
+	var payload runtimeTaskPayload
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		return payload, fmt.Errorf("读取请求体失败: %w", err)
+	}
+	if len(strings.TrimSpace(string(body))) == 0 {
+		return payload, fmt.Errorf("请求体不能为空")
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return payload, fmt.Errorf("解析 JSON 失败: %w", err)
+	}
+	payload.ModelID = strings.TrimSpace(firstNonEmpty(payload.ModelID, payload.TargetID))
+	if payload.ModelID == "" {
+		return payload, fmt.Errorf("model_id 不能为空")
+	}
+	return payload, nil
+}
+
+type agentRuntimeTaskPayload struct {
+	AgentID        string `json:"agent_id"`
+	ModelID        string `json:"model_id"`
+	TargetID       string `json:"target_id"`
+	Endpoint       string `json:"endpoint"`
+	HealthPath     string `json:"health_path"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
+	TriggeredBy    string `json:"triggered_by"`
+}
+
+func parseAgentRuntimeTaskPayload(r *http.Request) (service.AgentRuntimeReadinessTaskRequest, error) {
+	var payload agentRuntimeTaskPayload
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		return service.AgentRuntimeReadinessTaskRequest{}, fmt.Errorf("读取请求体失败: %w", err)
+	}
+	if len(strings.TrimSpace(string(body))) == 0 {
+		return service.AgentRuntimeReadinessTaskRequest{}, fmt.Errorf("请求体不能为空")
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return service.AgentRuntimeReadinessTaskRequest{}, fmt.Errorf("解析 JSON 失败: %w", err)
+	}
+	modelID := strings.TrimSpace(firstNonEmpty(payload.ModelID, payload.TargetID))
+	if strings.TrimSpace(payload.AgentID) == "" || modelID == "" {
+		return service.AgentRuntimeReadinessTaskRequest{}, fmt.Errorf("agent_id/model_id 不能为空")
+	}
+	return service.AgentRuntimeReadinessTaskRequest{
+		AgentID:        strings.TrimSpace(payload.AgentID),
+		ModelID:        modelID,
+		Endpoint:       strings.TrimSpace(payload.Endpoint),
+		HealthPath:     strings.TrimSpace(payload.HealthPath),
+		TimeoutSeconds: payload.TimeoutSeconds,
+		TriggeredBy:    strings.TrimSpace(payload.TriggeredBy),
+	}, nil
+}
+
+func parseAgentTaskReportPayload(r *http.Request) (service.AgentTaskReport, error) {
+	var payload service.AgentTaskReport
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		return payload, fmt.Errorf("读取请求体失败: %w", err)
+	}
+	if len(strings.TrimSpace(string(body))) == 0 {
+		return payload, fmt.Errorf("请求体不能为空")
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return payload, fmt.Errorf("解析 JSON 失败: %w", err)
+	}
+	if strings.TrimSpace(string(payload.Status)) == "" {
+		return payload, fmt.Errorf("status 不能为空")
+	}
+	return payload, nil
+}
+
+func parseCreateTestRunPayload(r *http.Request) (service.CreateTestRunRequest, error) {
+	var payload service.CreateTestRunRequest
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		return payload, fmt.Errorf("读取请求体失败: %w", err)
+	}
+	if len(strings.TrimSpace(string(body))) == 0 {
+		return payload, fmt.Errorf("请求体不能为空")
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return payload, fmt.Errorf("解析 JSON 失败: %w", err)
+	}
+	payload.Scenario = strings.TrimSpace(payload.Scenario)
+	if payload.Scenario == "" {
+		return payload, fmt.Errorf("scenario 不能为空")
+	}
+	return payload, nil
+}
+
 func agentIDFromPath(r *http.Request) string {
 	id := strings.TrimSpace(chi.URLParam(r, "id"))
 	if id != "" {
 		return id
 	}
 	return strings.TrimSpace(chi.URLParam(r, "agentID"))
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func runtimeTemplateIsZero(tpl model.RuntimeTemplate) bool {

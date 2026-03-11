@@ -18,6 +18,7 @@ type Config struct {
 	Server           ServerConfig            `yaml:"server"`
 	Log              LogConfig               `yaml:"log"`
 	Storage          StorageConfig           `yaml:"storage"`
+	Testing          TestingConfig           `yaml:"testing"`
 	Auth             AuthConfig              `yaml:"auth"`
 	Integrations     IntegrationsConfig      `yaml:"integrations"`
 	Nodes            []model.Node            `yaml:"nodes"`
@@ -41,6 +42,10 @@ type LogConfig struct {
 type StorageConfig struct {
 	SQLitePath   string `yaml:"sqlite_path"`
 	ModelRootDir string `yaml:"model_root_dir"`
+}
+
+type TestingConfig struct {
+	LogRootDir string `yaml:"log_root_dir"`
 }
 
 type AuthConfig struct {
@@ -81,6 +86,9 @@ func DefaultConfig() *Config {
 		Storage: StorageConfig{
 			SQLitePath:   "./resources/config/controller.db",
 			ModelRootDir: "./resources/models",
+		},
+		Testing: TestingConfig{
+			LogRootDir: "./testsystem/logs",
 		},
 		Integrations: IntegrationsConfig{
 			LMStudio: LMStudioConfig{
@@ -150,6 +158,9 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("MCP_MODEL_ROOT_DIR"); v != "" {
 		cfg.Storage.ModelRootDir = v
 	}
+	if v := os.Getenv("MCP_TEST_LOG_ROOT_DIR"); v != "" {
+		cfg.Testing.LogRootDir = v
+	}
 	if v := os.Getenv("MCP_AUTH_TOKEN"); v != "" {
 		cfg.Auth.Token = v
 	}
@@ -214,6 +225,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Storage.ModelRootDir == "" {
 		c.Storage.ModelRootDir = "./resources/models"
+	}
+	if c.Testing.LogRootDir == "" {
+		c.Testing.LogRootDir = "./testsystem/logs"
 	}
 	if c.Integrations.LMStudio.CacheRefreshSeconds <= 0 {
 		c.Integrations.LMStudio.CacheRefreshSeconds = 30

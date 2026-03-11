@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -65,6 +66,60 @@ func (s *Store) initSchema(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("init sqlite schema failed: %w", err)
 		}
+	}
+	// 对历史数据库做轻量增量迁移，确保新增字段存在。
+	for _, migration := range []struct {
+		table      string
+		column     string
+		definition string
+	}{
+		{table: "models", column: "desired_state", definition: "TEXT NOT NULL DEFAULT 'unknown'"},
+		{table: "models", column: "observed_state", definition: "TEXT NOT NULL DEFAULT 'unknown'"},
+		{table: "models", column: "readiness", definition: "TEXT NOT NULL DEFAULT 'unknown'"},
+		{table: "models", column: "health_message", definition: "TEXT NOT NULL DEFAULT ''"},
+		{table: "models", column: "last_reconciled_at", definition: "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := s.ensureColumn(ctx, migration.table, migration.column, migration.definition); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) ensureColumn(ctx context.Context, table, column, definition string) error {
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s);", table))
+	if err != nil {
+		return fmt.Errorf("read sqlite table info failed: table=%s err=%w", table, err)
+	}
+	defer rows.Close()
+
+	exists := false
+	for rows.Next() {
+		var (
+			cid       int
+			name      string
+			colType   string
+			notNull   int
+			defaultV  sql.NullString
+			primaryID int
+		)
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &defaultV, &primaryID); err != nil {
+			return fmt.Errorf("scan sqlite table info failed: table=%s err=%w", table, err)
+		}
+		if strings.EqualFold(strings.TrimSpace(name), strings.TrimSpace(column)) {
+			exists = true
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate sqlite table info failed: table=%s err=%w", table, err)
+	}
+	if exists {
+		return nil
+	}
+	stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s;", table, column, definition)
+	if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("add sqlite column failed: table=%s column=%s err=%w", table, column, err)
 	}
 	return nil
 }
@@ -363,8 +418,9 @@ func (s *Store) UpsertModel(ctx context.Context, item model.Model) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO models (
 			id, name, provider, backend_type, host_node_id, runtime_id,
-			endpoint, state, context_length, metadata_json, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			endpoint, state, desired_state, observed_state, readiness, health_message, last_reconciled_at,
+			context_length, metadata_json, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name = excluded.name,
 			provider = excluded.provider,
@@ -373,6 +429,11 @@ func (s *Store) UpsertModel(ctx context.Context, item model.Model) error {
 			runtime_id = excluded.runtime_id,
 			endpoint = excluded.endpoint,
 			state = excluded.state,
+			desired_state = excluded.desired_state,
+			observed_state = excluded.observed_state,
+			readiness = excluded.readiness,
+			health_message = excluded.health_message,
+			last_reconciled_at = excluded.last_reconciled_at,
 			context_length = excluded.context_length,
 			metadata_json = excluded.metadata_json,
 			updated_at = excluded.updated_at;
@@ -385,6 +446,11 @@ func (s *Store) UpsertModel(ctx context.Context, item model.Model) error {
 		strings.TrimSpace(item.RuntimeID),
 		strings.TrimSpace(item.Endpoint),
 		firstNonEmpty(string(item.State), string(model.ModelStateUnknown)),
+		firstNonEmpty(strings.TrimSpace(item.DesiredState), string(model.ModelStateUnknown)),
+		firstNonEmpty(strings.TrimSpace(item.ObservedState), string(model.ModelStateUnknown)),
+		firstNonEmpty(string(item.Readiness), string(model.ReadinessUnknown)),
+		strings.TrimSpace(item.HealthMessage),
+		timeToText(item.LastReconciledAt),
 		item.ContextLength,
 		mustJSON(item.Metadata, "{}"),
 		timeToText(now),
@@ -410,7 +476,8 @@ func (s *Store) UpsertModels(ctx context.Context, items []model.Model) error {
 func (s *Store) ListModels(ctx context.Context) ([]model.Model, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, name, provider, backend_type, host_node_id, runtime_id,
-		       endpoint, state, context_length, metadata_json
+		       endpoint, state, desired_state, observed_state, readiness, health_message, last_reconciled_at,
+		       context_length, metadata_json
 		FROM models
 		ORDER BY id;
 	`)
@@ -422,19 +489,28 @@ func (s *Store) ListModels(ctx context.Context) ([]model.Model, error) {
 	out := make([]model.Model, 0, 32)
 	for rows.Next() {
 		var (
-			item       model.Model
-			backendRaw string
-			stateRaw   string
-			metadata   string
+			item              model.Model
+			backendRaw        string
+			stateRaw          string
+			desiredStateRaw   string
+			observedStateRaw  string
+			readinessRaw      string
+			lastReconciledRaw string
+			metadata          string
 		)
 		if err := rows.Scan(
 			&item.ID, &item.Name, &item.Provider, &backendRaw, &item.HostNodeID, &item.RuntimeID,
-			&item.Endpoint, &stateRaw, &item.ContextLength, &metadata,
+			&item.Endpoint, &stateRaw, &desiredStateRaw, &observedStateRaw, &readinessRaw, &item.HealthMessage, &lastReconciledRaw,
+			&item.ContextLength, &metadata,
 		); err != nil {
 			return nil, fmt.Errorf("scan model failed: %w", err)
 		}
 		item.BackendType = model.RuntimeType(strings.TrimSpace(backendRaw))
 		item.State = model.ModelState(strings.TrimSpace(stateRaw))
+		item.DesiredState = strings.TrimSpace(desiredStateRaw)
+		item.ObservedState = strings.TrimSpace(observedStateRaw)
+		item.Readiness = model.ReadinessState(strings.TrimSpace(readinessRaw))
+		item.LastReconciledAt = textToTime(lastReconciledRaw)
 		item.Metadata = parseStringMap(metadata)
 		out = append(out, item)
 	}
@@ -447,20 +523,26 @@ func (s *Store) ListModels(ctx context.Context) ([]model.Model, error) {
 func (s *Store) GetModelByID(ctx context.Context, id string) (model.Model, bool, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, name, provider, backend_type, host_node_id, runtime_id,
-		       endpoint, state, context_length, metadata_json
+		       endpoint, state, desired_state, observed_state, readiness, health_message, last_reconciled_at,
+		       context_length, metadata_json
 		FROM models
 		WHERE id = ? LIMIT 1;
 	`, strings.TrimSpace(id))
 
 	var (
-		item       model.Model
-		backendRaw string
-		stateRaw   string
-		metadata   string
+		item              model.Model
+		backendRaw        string
+		stateRaw          string
+		desiredStateRaw   string
+		observedStateRaw  string
+		readinessRaw      string
+		lastReconciledRaw string
+		metadata          string
 	)
 	err := row.Scan(
 		&item.ID, &item.Name, &item.Provider, &backendRaw, &item.HostNodeID, &item.RuntimeID,
-		&item.Endpoint, &stateRaw, &item.ContextLength, &metadata,
+		&item.Endpoint, &stateRaw, &desiredStateRaw, &observedStateRaw, &readinessRaw, &item.HealthMessage, &lastReconciledRaw,
+		&item.ContextLength, &metadata,
 	)
 	if err == sql.ErrNoRows {
 		return model.Model{}, false, nil
@@ -470,7 +552,291 @@ func (s *Store) GetModelByID(ctx context.Context, id string) (model.Model, bool,
 	}
 	item.BackendType = model.RuntimeType(strings.TrimSpace(backendRaw))
 	item.State = model.ModelState(strings.TrimSpace(stateRaw))
+	item.DesiredState = strings.TrimSpace(desiredStateRaw)
+	item.ObservedState = strings.TrimSpace(observedStateRaw)
+	item.Readiness = model.ReadinessState(strings.TrimSpace(readinessRaw))
+	item.LastReconciledAt = textToTime(lastReconciledRaw)
 	item.Metadata = parseStringMap(metadata)
+	return item, true, nil
+}
+
+func (s *Store) UpsertTask(ctx context.Context, task model.Task) error {
+	if strings.TrimSpace(task.ID) == "" {
+		return fmt.Errorf("task id is empty")
+	}
+	now := time.Now().UTC()
+	createdAt := task.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = now
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO tasks (
+			id, type, target_type, target_id, assigned_agent_id, worker_id,
+			status, progress, message, detail_json, payload_json, error,
+			created_at, accepted_at, started_at, finished_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			type = excluded.type,
+			target_type = excluded.target_type,
+			target_id = excluded.target_id,
+			assigned_agent_id = excluded.assigned_agent_id,
+			worker_id = excluded.worker_id,
+			status = excluded.status,
+			progress = excluded.progress,
+			message = excluded.message,
+			detail_json = excluded.detail_json,
+			payload_json = excluded.payload_json,
+			error = excluded.error,
+			created_at = CASE WHEN tasks.created_at = '' THEN excluded.created_at ELSE tasks.created_at END,
+			accepted_at = excluded.accepted_at,
+			started_at = excluded.started_at,
+			finished_at = excluded.finished_at,
+			updated_at = excluded.updated_at;
+	`,
+		strings.TrimSpace(task.ID),
+		strings.TrimSpace(string(task.Type)),
+		strings.TrimSpace(string(task.TargetType)),
+		strings.TrimSpace(task.TargetID),
+		strings.TrimSpace(task.AssignedAgentID),
+		strings.TrimSpace(task.WorkerID),
+		firstNonEmpty(string(task.Status), string(model.TaskStatusPending)),
+		clampProgress(task.Progress),
+		strings.TrimSpace(task.Message),
+		mustJSON(task.Detail, "{}"),
+		mustJSON(task.Payload, "{}"),
+		strings.TrimSpace(task.Error),
+		timeToText(createdAt),
+		timeToText(task.AcceptedAt),
+		timeToText(task.StartedAt),
+		timeToText(task.FinishedAt),
+		timeToText(now),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert task failed: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ListTasks(ctx context.Context, targetType, targetID string, limit int) ([]model.Task, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	query := `
+		SELECT id, type, target_type, target_id, assigned_agent_id, worker_id,
+		       status, progress, message, detail_json, payload_json, error,
+		       created_at, accepted_at, started_at, finished_at
+		FROM tasks
+	`
+	args := make([]interface{}, 0, 3)
+	filters := make([]string, 0, 2)
+	if strings.TrimSpace(targetType) != "" {
+		filters = append(filters, "target_type = ?")
+		args = append(args, strings.TrimSpace(targetType))
+	}
+	if strings.TrimSpace(targetID) != "" {
+		filters = append(filters, "target_id = ?")
+		args = append(args, strings.TrimSpace(targetID))
+	}
+	if len(filters) > 0 {
+		query += " WHERE " + strings.Join(filters, " AND ")
+	}
+	query += " ORDER BY created_at DESC LIMIT ?"
+	args = append(args, limit)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list tasks failed: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]model.Task, 0, limit)
+	for rows.Next() {
+		item, scanErr := scanTask(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate tasks failed: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Store) GetTaskByID(ctx context.Context, id string) (model.Task, bool, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, type, target_type, target_id, assigned_agent_id, worker_id,
+		       status, progress, message, detail_json, payload_json, error,
+		       created_at, accepted_at, started_at, finished_at
+		FROM tasks
+		WHERE id = ? LIMIT 1;
+	`, strings.TrimSpace(id))
+
+	item, err := scanTask(row)
+	if err == sql.ErrNoRows {
+		return model.Task{}, false, nil
+	}
+	if err != nil {
+		return model.Task{}, false, err
+	}
+	return item, true, nil
+}
+
+func (s *Store) ClaimPendingTaskForAgent(ctx context.Context, agentID string, allowTypes []model.TaskType) (model.Task, bool, error) {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return model.Task{}, false, fmt.Errorf("agent id is empty")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return model.Task{}, false, fmt.Errorf("begin task claim tx failed: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	query := `
+		SELECT id, type, target_type, target_id, assigned_agent_id, worker_id,
+		       status, progress, message, detail_json, payload_json, error,
+		       created_at, accepted_at, started_at, finished_at
+		FROM tasks
+		WHERE status = ? AND assigned_agent_id = ?
+	`
+	args := []interface{}{string(model.TaskStatusPending), agentID}
+	if len(allowTypes) > 0 {
+		holders := make([]string, 0, len(allowTypes))
+		for _, tp := range allowTypes {
+			holders = append(holders, "?")
+			args = append(args, strings.TrimSpace(string(tp)))
+		}
+		query += " AND type IN (" + strings.Join(holders, ",") + ")"
+	}
+	query += " ORDER BY created_at ASC LIMIT 1;"
+
+	row := tx.QueryRowContext(ctx, query, args...)
+	item, scanErr := scanTask(row)
+	if scanErr == sql.ErrNoRows {
+		return model.Task{}, false, nil
+	}
+	if scanErr != nil {
+		return model.Task{}, false, scanErr
+	}
+
+	now := time.Now().UTC()
+	item.Status = model.TaskStatusDispatched
+	item.AcceptedAt = now
+	item.WorkerID = agentID
+	item.Message = "任务已分发到 agent"
+	item.Progress = max(item.Progress, 5)
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE tasks
+		SET status = ?, accepted_at = ?, worker_id = ?, message = ?, progress = ?, updated_at = ?
+		WHERE id = ?;
+	`,
+		string(item.Status),
+		timeToText(item.AcceptedAt),
+		item.WorkerID,
+		item.Message,
+		item.Progress,
+		timeToText(now),
+		item.ID,
+	); err != nil {
+		return model.Task{}, false, fmt.Errorf("update claimed task failed: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return model.Task{}, false, fmt.Errorf("commit task claim tx failed: %w", err)
+	}
+	return item, true, nil
+}
+
+func (s *Store) UpsertTestRun(ctx context.Context, run model.TestRun) error {
+	if strings.TrimSpace(run.TestRunID) == "" {
+		return fmt.Errorf("test run id is empty")
+	}
+	now := time.Now().UTC()
+	createdAt := run.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = now
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO test_runs (
+			id, scenario, status, started_at, finished_at, log_path, summary, triggered_by, error, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			scenario = excluded.scenario,
+			status = excluded.status,
+			started_at = excluded.started_at,
+			finished_at = excluded.finished_at,
+			log_path = excluded.log_path,
+			summary = excluded.summary,
+			triggered_by = excluded.triggered_by,
+			error = excluded.error,
+			created_at = CASE WHEN test_runs.created_at = '' THEN excluded.created_at ELSE test_runs.created_at END,
+			updated_at = excluded.updated_at;
+	`,
+		run.TestRunID,
+		strings.TrimSpace(run.Scenario),
+		firstNonEmpty(string(run.Status), string(model.TestRunStatusPending)),
+		timeToText(run.StartedAt),
+		timeToText(run.FinishedAt),
+		strings.TrimSpace(run.LogPath),
+		strings.TrimSpace(run.Summary),
+		strings.TrimSpace(run.TriggeredBy),
+		strings.TrimSpace(run.Error),
+		timeToText(createdAt),
+		timeToText(now),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert test run failed: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ListTestRuns(ctx context.Context, limit int) ([]model.TestRun, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, scenario, status, started_at, finished_at, log_path, summary, triggered_by, error, created_at
+		FROM test_runs
+		ORDER BY created_at DESC
+		LIMIT ?;
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list test runs failed: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]model.TestRun, 0, limit)
+	for rows.Next() {
+		item, scanErr := scanTestRun(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate test runs failed: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Store) GetTestRunByID(ctx context.Context, id string) (model.TestRun, bool, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, scenario, status, started_at, finished_at, log_path, summary, triggered_by, error, created_at
+		FROM test_runs
+		WHERE id = ? LIMIT 1;
+	`, strings.TrimSpace(id))
+
+	item, err := scanTestRun(row)
+	if err == sql.ErrNoRows {
+		return model.TestRun{}, false, nil
+	}
+	if err != nil {
+		return model.TestRun{}, false, err
+	}
 	return item, true, nil
 }
 
@@ -591,6 +957,65 @@ func scanAgent(scanner agentScanner) (model.Agent, error) {
 	return agent, nil
 }
 
+func scanTask(scanner agentScanner) (model.Task, error) {
+	var (
+		item          model.Task
+		typeRaw       string
+		targetTypeRaw string
+		statusRaw     string
+		detailJSON    string
+		payloadJSON   string
+		createdAtRaw  string
+		acceptedAtRaw string
+		startedAtRaw  string
+		finishedAtRaw string
+	)
+	if err := scanner.Scan(
+		&item.ID, &typeRaw, &targetTypeRaw, &item.TargetID, &item.AssignedAgentID, &item.WorkerID,
+		&statusRaw, &item.Progress, &item.Message, &detailJSON, &payloadJSON, &item.Error,
+		&createdAtRaw, &acceptedAtRaw, &startedAtRaw, &finishedAtRaw,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return model.Task{}, sql.ErrNoRows
+		}
+		return model.Task{}, fmt.Errorf("scan task failed: %w", err)
+	}
+	item.Type = model.TaskType(strings.TrimSpace(typeRaw))
+	item.TargetType = model.TaskTargetType(strings.TrimSpace(targetTypeRaw))
+	item.Status = model.TaskStatus(strings.TrimSpace(statusRaw))
+	item.Progress = clampProgress(item.Progress)
+	item.Detail = parseObjectMap(detailJSON)
+	item.Payload = parseObjectMap(payloadJSON)
+	item.CreatedAt = textToTime(createdAtRaw)
+	item.AcceptedAt = textToTime(acceptedAtRaw)
+	item.StartedAt = textToTime(startedAtRaw)
+	item.FinishedAt = textToTime(finishedAtRaw)
+	return item, nil
+}
+
+func scanTestRun(scanner agentScanner) (model.TestRun, error) {
+	var (
+		item         model.TestRun
+		statusRaw    string
+		startedAtRaw string
+		finishedRaw  string
+		createdAtRaw string
+	)
+	if err := scanner.Scan(
+		&item.TestRunID, &item.Scenario, &statusRaw, &startedAtRaw, &finishedRaw, &item.LogPath, &item.Summary, &item.TriggeredBy, &item.Error, &createdAtRaw,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return model.TestRun{}, sql.ErrNoRows
+		}
+		return model.TestRun{}, fmt.Errorf("scan test run failed: %w", err)
+	}
+	item.Status = model.TestRunStatus(strings.TrimSpace(statusRaw))
+	item.StartedAt = textToTime(startedAtRaw)
+	item.FinishedAt = textToTime(finishedRaw)
+	item.CreatedAt = textToTime(createdAtRaw)
+	return item, nil
+}
+
 func mustJSON(v interface{}, fallback string) string {
 	raw, err := json.Marshal(v)
 	if err != nil {
@@ -639,6 +1064,18 @@ func parseStringMap(raw string) map[string]string {
 	return out
 }
 
+func parseObjectMap(raw string) map[string]interface{} {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	out := map[string]interface{}{}
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil
+	}
+	return out
+}
+
 func parseNodeMetadata(raw string) interface{} {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -679,4 +1116,21 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func clampProgress(progress int) int {
+	if progress < 0 {
+		return 0
+	}
+	if progress > 100 {
+		return 100
+	}
+	return progress
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

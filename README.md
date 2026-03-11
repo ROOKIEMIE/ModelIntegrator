@@ -206,6 +206,75 @@ src/pkg/
 - 下载功能当前仅面向“主节点且具备 docker 能力”的部署场景
 - 提供一键启动脚本
 
+## P0 新增（本次落地）
+
+### 1. E5 embedding 样板（TEI）打通
+
+- 增加了 `local-multilingual-e5-base` 样板配置（`resources/config/config.example.yaml`）。
+- 默认绑定模板 `tei-embedding-e5-local`（TEI CPU 模板，映射端口 `58001:80`）。
+- controller 可通过任务 API 启动/停止/刷新样板 runtime。
+- 增加最小 embedding client：`scripts/e5_embedding_client.sh`。
+- 增加场景脚本：`testsystem/scenarios/e5_embedding_smoke.sh`，可校验返回结构与向量维度。
+
+### 2. runtime 动作任务化
+
+- 新增任务模型（`Task`）与 SQLite 持久化表 `tasks`。
+- 新增任务 API：
+  - `POST /api/v1/tasks/runtime/start`
+  - `POST /api/v1/tasks/runtime/stop`
+  - `POST /api/v1/tasks/runtime/refresh`
+  - `GET /api/v1/tasks`
+  - `GET /api/v1/tasks/{id}`
+- 任务状态支持：`pending/dispatched/running/success/failed/timeout/canceled`。
+- 前端 `start/stop/refresh` 已改为走任务 API，可在页面查看任务执行进度与错误。
+
+### 3. desired / observed / readiness
+
+- 模型状态新增字段：
+  - `desired_state`
+  - `observed_state`
+  - `readiness`
+  - `health_message`
+  - `last_reconciled_at`
+- controller 在 `start/stop` 触发时先写 `desired_state`。
+- 刷新或动作后执行 reconcile：读取容器状态并更新 observed/readiness。
+- 对 TEI E5 样板增加 `/health` 探测，可识别“容器已运行但服务未 ready”。
+- 当前端可直接看到 `desired/observed/readiness`。
+
+### 4. agent 最小任务执行面
+
+- controller <-> agent 新增最小任务协议字段（task id/type/payload/status/time/message/detail）。
+- controller 新增 agent 任务接口：
+  - `GET /api/v1/agents/{id}/tasks/next`
+  - `POST /api/v1/agents/{id}/tasks/{taskID}/report`
+  - `POST /api/v1/tasks/agent/runtime-readiness`
+- agent 新增任务轮询执行循环（默认 `AGENT_TASK_POLL_SECONDS=5`）。
+- 已实现真实任务类型：`agent.runtime_readiness_check`（端口连通 + HTTP health 检查）。
+- 任务结果会回写 SQLite，并更新对应模型 readiness 信息。
+
+### 5. 独立测试工具链（testsystem）
+
+- 新增独立目录 `testsystem/`：
+  - `Dockerfile`
+  - `docker-compose.test.yml`
+  - `scenarios/e5_embedding_smoke.sh`
+  - `scripts/run_test.sh`
+  - `scripts/collect_logs.sh`
+  - `logs/`
+  - `README.md`
+- 主系统与测试系统隔离：主系统继续使用根目录 `docker-compose.yml`，测试系统使用 `testsystem/docker-compose.test.yml`。
+- 测试日志按 run-id 落到挂载目录（默认 `./testsystem/logs/<run-id>/`）。
+
+### 6. controller 测试运行能力 + 前端一键测试
+
+- 新增 `test_runs` 持久化表与 `TestRunService`。
+- 新增测试运行 API：
+  - `POST /api/v1/test-runs`（仅允许预定义场景 `e5_embedding_smoke`）
+  - `GET /api/v1/test-runs`
+  - `GET /api/v1/test-runs/{id}`
+- 前端新增“一键测试 E5”按钮：调用 `POST /api/v1/test-runs`，并展示最近测试记录与日志路径。
+- 前端不会执行 shell，仅调用后端 API。
+
 ## 从 0 开始部署
 
 目标目录：`/tank/docker_data/model_control_plane`
@@ -220,7 +289,9 @@ cd /tank/docker_data/model_control_plane
 ```bash
 cp resources/docker/compose.example.env .env
 mkdir -p resources/config resources/models
+mkdir -p testsystem/logs
 touch resources/config/controller.db
+chmod 777 resources/config testsystem/logs
 chmod 666 resources/config/controller.db
 ```
 
@@ -275,10 +346,13 @@ curl -sS http://127.0.0.1:59081/api/v1/nodes
 - `MCP_SQLITE_PATH`：SQLite 文件路径
 - `MCP_MODEL_DIR_HOST`：宿主机模型目录（默认 `./resources/models`）
 - `MCP_MODEL_ROOT_DIR`：容器内模型目录（默认 `/opt/controller/models`）
+- `MCP_TEST_LOG_ROOT_HOST`：宿主机测试日志目录（默认 `./testsystem/logs`）
+- `MCP_TEST_LOG_ROOT_DIR`：controller 容器内测试日志目录（默认 `/opt/controller/test-logs`）
 - `MCP_LMSTUDIO_ENDPOINT`：LM Studio 地址
 - `MCP_LMSTUDIO_CACHE_ENABLED`：是否启用 LM Studio 模型缓存
 - `MCP_LMSTUDIO_CACHE_REFRESH_SECONDS`：缓存刷新间隔秒数
 - `MCP_DOCKER_ENDPOINT`：Docker endpoint（用于 docker runtime 与 GPU 探测回退）
+- `MCP_CONTAINER_HOST_ALIAS`：controller 容器访问宿主机端口的别名（默认 `host.docker.internal`）
 - `MCP_GPU_PROBE_IMAGE`：Docker GPU 探针镜像（可选，默认 `nvidia/cuda:12.4.1-base-ubuntu22.04`）
 - `MCP_HF_CACHE_DIR`：HF 下载缓存目录（download profile）
 - `MCP_ARIA2_RPC_SECRET`：aria2 RPC 密钥（download profile）
@@ -290,6 +364,60 @@ curl -sS http://127.0.0.1:59081/api/v1/nodes
 - `MCP_VLLM_GPU_MEMORY_UTILIZATION`：vLLM GPU 显存占用上限
 - `MCP_VLLM_MAX_MODEL_LEN`：vLLM 最大上下文长度
 - `HUGGING_FACE_HUB_TOKEN`：访问私有/gated 模型用 token（可选）
+
+## 主 compose 与测试 compose 的区别
+
+- 主系统：`docker-compose.yml`
+  - 负责 controller/nginx 及 addons/download/vllm 等运行组件。
+  - 生产运行态、控制台、API 都在这里。
+- 测试系统：`testsystem/docker-compose.test.yml`
+  - 只负责测试 runner，不承载主业务流量。
+  - 专用于预定义测试场景，输出测试报告和日志。
+
+## 外部日志目录挂载
+
+主 compose 中 controller 默认挂载：
+
+```text
+${MCP_TEST_LOG_ROOT_HOST:-./testsystem/logs}:${MCP_TEST_LOG_ROOT_DIR:-/opt/controller/test-logs}
+```
+
+测试 compose 中 testsystem-runner 默认挂载：
+
+```text
+${TEST_LOG_ROOT_HOST:-./testsystem/logs}:/workspace/test-logs
+```
+
+每次运行会写入独立目录：`<log-root>/<run-id>/`，包含 `run.log`、`summary.json`（和场景报告）。
+
+## 从前端一键触发测试
+
+1. 打开控制台 Runtime 页面。
+2. 点击“任务与测试”面板中的“`一键测试 E5`”。
+3. 前端调用 `POST /api/v1/test-runs`（场景固定 `e5_embedding_smoke`）。
+4. 在同面板查看最近测试运行状态、摘要和日志路径。
+
+## 2026-03-11 故障修复说明（已验证）
+
+- 已修复 `one-click-up` 后前端偶发 `502`：
+  - 根因：历史 `.env` 路径与数据库权限不兼容（旧 `modelintegrator` 路径、SQLite 目录只读）。
+  - 修复：`scripts/one-click-up.sh` 增加旧路径自动迁移，并确保 `resources/config` 与 `controller.db` 可写。
+- 已修复“一键运行 E5 测试”失败：
+  - 根因 1：`/opt/controller/test-logs` 挂载目录权限不足，导致 `permission denied`。
+  - 根因 2：容器内访问 `127.0.0.1:58001` 指向 controller 自身，而非宿主机 runtime。
+  - 修复：启动脚本新增测试日志目录可写性探测；compose 新增 `host-gateway` 映射与 `MCP_CONTAINER_HOST_ALIAS`；后端对容器内 loopback endpoint 做自动改写。
+- 复测结果：
+  - `e5_embedding_smoke` 已可成功执行，返回维度校验通过（`dim=768`）。
+  - 测试日志路径示例：`./testsystem/logs/<test-run-id>/run.log`。
+
+## 日志排障建议
+
+1. 先看 `summary.json` 的 `status/error`。
+2. 再看 `run.log` 中失败阶段（如 start task、readiness、embedding 请求）。
+3. 若 readiness 失败，优先检查模型 API 中 `desired_state/observed_state/readiness/health_message`。
+4. 若 embedding 失败，使用 `scripts/e5_embedding_client.sh` 直接重放请求。
+5. 若错误包含 `permission denied`（`/opt/controller/test-logs`），检查 `.env` 中 `MCP_TEST_LOG_ROOT_HOST` 指向目录是否可写。
+6. 若错误包含 `127.0.0.1:58001 connect refused` 且 controller 运行在容器内，检查 `MCP_CONTAINER_HOST_ALIAS` 与 compose `extra_hosts` 是否生效。
 
 ### SQLite 持久化说明（控制平面状态）
 

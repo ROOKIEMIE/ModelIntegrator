@@ -39,9 +39,23 @@ func NewRouter(h *Handler, staticDir, authToken string, logger *slog.Logger) htt
 		r.Post("/agents/register", h.RegisterAgent)
 		r.Post("/agents/{id}/heartbeat", h.AgentHeartbeat)
 		r.Post("/agents/{id}/capabilities", h.ReportAgentCapabilities)
+		r.Get("/agents/{id}/tasks/next", h.PullAgentTask)
+		r.Post("/agents/{id}/tasks/{taskID}/report", h.ReportAgentTask)
 		// 兼容旧路由参数名，后续可移除。
 		r.Post("/agents/{agentID}/heartbeat", h.AgentHeartbeat)
 		r.Post("/agents/{agentID}/capabilities", h.ReportAgentCapabilities)
+		r.Get("/agents/{agentID}/tasks/next", h.PullAgentTask)
+		r.Post("/agents/{agentID}/tasks/{taskID}/report", h.ReportAgentTask)
+		r.Post("/tasks/runtime/start", h.CreateRuntimeTaskStart)
+		r.Post("/tasks/runtime/stop", h.CreateRuntimeTaskStop)
+		r.Post("/tasks/runtime/restart", h.CreateRuntimeTaskRestart)
+		r.Post("/tasks/runtime/refresh", h.CreateRuntimeTaskRefresh)
+		r.Get("/tasks", h.ListTasks)
+		r.Get("/tasks/{id}", h.GetTask)
+		r.Post("/tasks/agent/runtime-readiness", h.CreateAgentRuntimeReadinessTask)
+		r.Post("/test-runs", h.CreateTestRun)
+		r.Get("/test-runs", h.ListTestRuns)
+		r.Get("/test-runs/{id}", h.GetTestRun)
 	})
 
 	if staticDir == "" {

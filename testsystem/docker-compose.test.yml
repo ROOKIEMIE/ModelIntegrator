@@ -1,0 +1,18 @@
+services:
+  testsystem-runner:
+    build:
+      context: .
+      dockerfile: testsystem/Dockerfile
+    image: model-control-plane/testsystem-runner:latest
+    container_name: mcp-testsystem-runner
+    environment:
+      CONTROLLER_BASE_URL: ${CONTROLLER_BASE_URL:-http://controller:8080}
+      CONTROLLER_AUTH_TOKEN: ${CONTROLLER_AUTH_TOKEN:-}
+      TEST_SCENARIO: ${TEST_SCENARIO:-e5_embedding_smoke}
+      TEST_LOG_ROOT: /workspace/test-logs
+      E5_MODEL_ID: ${E5_MODEL_ID:-local-multilingual-e5-base}
+      E5_EXPECTED_DIM: ${E5_EXPECTED_DIM:-768}
+    volumes:
+      - ./testsystem:/workspace/testsystem:ro
+      - ${TEST_LOG_ROOT_HOST:-./testsystem/logs}:/workspace/test-logs
+    command: ["/bin/bash", "/workspace/testsystem/scripts/run_test.sh"]

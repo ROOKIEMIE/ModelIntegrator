@@ -13,6 +13,9 @@ storage:
   sqlite_path: "./resources/config/controller.db"
   model_root_dir: "./resources/models"
 
+testing:
+  log_root_dir: "./testsystem/logs"
+
 auth:
   token: ""
 
@@ -56,7 +59,25 @@ nodes:
         endpoint: "http://192.168.50.241:1234"
         enabled: true
 
-models: []
+models:
+  - id: "local-multilingual-e5-base"
+    name: "multilingual-e5-base"
+    provider: "localfs"
+    backend_type: "docker"
+    host_node_id: "node-main"
+    runtime_id: "node-main-docker-1"
+    endpoint: "http://127.0.0.1:58001"
+    state: "stopped"
+    desired_state: "stopped"
+    observed_state: "unknown"
+    readiness: "unknown"
+    context_length: 512
+    metadata:
+      source: "config"
+      runtime_template_id: "tei-embedding-e5-local"
+      embedding_dimension: "768"
+      path: "./resources/models/multilingual-e5-base"
+      runtime_endpoint: "unix:///var/run/docker.sock"
 
 runtime_templates:
   - id: "docker-generic-local"
@@ -70,3 +91,20 @@ runtime_templates:
     volumes:
       - "./resources/models:/models:ro"
     needs_gpu: false
+  - id: "tei-embedding-e5-local"
+    name: "TEI Embedding E5 Local"
+    description: "E5 embedding 样板模板，优先用于 local-multilingual-e5-base"
+    runtime_type: "docker"
+    image: "ghcr.io/huggingface/text-embeddings-inference:cpu-latest"
+    command:
+      - "--model-id"
+      - "{{MODEL_PATH_CONTAINER}}"
+      - "--port"
+      - "80"
+    volumes:
+      - "./resources/models:/models:ro"
+    ports:
+      - "58001:80"
+    needs_gpu: false
+    metadata:
+      category: "embedding"

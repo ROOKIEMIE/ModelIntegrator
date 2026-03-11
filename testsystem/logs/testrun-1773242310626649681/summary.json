@@ -1,0 +1,41 @@
+{
+  "error": "task status=failed message=当前状态(stopped)不允许执行 start error=",
+  "finished_at": "2026-03-11T15:18:31.847251275Z",
+  "scenario": "e5_embedding_smoke",
+  "started_at": "2026-03-11T15:18:30.633862261Z",
+  "status": "failed",
+  "steps": [
+    {
+      "detail": {
+        "expected_dim": 768,
+        "model_id": "local-multilingual-e5-base"
+      },
+      "message": "已找到 E5 模型",
+      "name": "discover_model",
+      "ok": true,
+      "time": "2026-03-11T15:18:30.639650063Z"
+    },
+    {
+      "detail": {
+        "task_id": "task-1773242310639665644"
+      },
+      "message": "已创建 runtime start 任务",
+      "name": "runtime_start",
+      "ok": true,
+      "time": "2026-03-11T15:18:30.645284955Z"
+    },
+    {
+      "detail": {
+        "error": "",
+        "message": "当前状态(stopped)不允许执行 start",
+        "status": "failed"
+      },
+      "message": "runtime start 任务未成功",
+      "name": "runtime_start_wait",
+      "ok": false,
+      "time": "2026-03-11T15:18:31.847120036Z"
+    }
+  ],
+  "summary": "runtime start 任务未成功",
+  "test_run_id": "testrun-1773242310626649681"
+}

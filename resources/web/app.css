@@ -121,6 +121,10 @@ main {
   width: 100%;
 }
 
+.panel-observe {
+  width: 100%;
+}
+
 .panel-download {
   max-width: 1280px;
   margin: 20px auto;
@@ -181,6 +185,38 @@ main {
   border-radius: 10px;
   padding: 10px 12px;
   margin-bottom: 10px;
+}
+
+.status-pill {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  border: 1px solid #d1d5db;
+  background: #f8fafc;
+}
+
+.status-pill.status-success,
+.status-pill.status-ready {
+  color: #166534;
+  background: #ecfdf3;
+  border-color: #86efac;
+}
+
+.status-pill.status-failed,
+.status-pill.status-timeout,
+.status-pill.status-not_ready {
+  color: #991b1b;
+  background: #fef2f2;
+  border-color: #fecaca;
+}
+
+.status-pill.status-running,
+.status-pill.status-dispatched,
+.status-pill.status-pending {
+  color: #1d4ed8;
+  background: #eff6ff;
+  border-color: #bfdbfe;
 }
 
 .template-item .item-title {
@@ -297,15 +333,19 @@ button:disabled {
 
 @media (min-width: 768px) {
   main {
-    grid-template-columns: minmax(320px, 420px) minmax(560px, 1fr);
+    grid-template-columns: minmax(300px, 390px) minmax(480px, 1fr) minmax(300px, 390px);
   }
 
   .panel-nodes {
-    max-width: 420px;
+    max-width: 390px;
   }
 
   .panel-models {
-    max-width: 820px;
+    max-width: 780px;
+  }
+
+  .panel-observe {
+    max-width: 390px;
   }
 
   .download-grid {

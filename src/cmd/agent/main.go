@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -39,6 +41,7 @@ type agentConfig struct {
 	host               string
 	version            string
 	heartbeatInterval  time.Duration
+	taskPollInterval   time.Duration
 	capabilities       []string
 	runtimeCaps        map[string][]string
 	llmfit             llmfitConfig
@@ -73,8 +76,10 @@ func main() {
 	}
 	fmt.Printf("agent 已注册: agent_id=%s node_id=%s controller=%s\n", cfg.agentID, cfg.nodeID, cfg.controllerEndpoint)
 
-	ticker := time.NewTicker(cfg.heartbeatInterval)
-	defer ticker.Stop()
+	heartbeatTicker := time.NewTicker(cfg.heartbeatInterval)
+	defer heartbeatTicker.Stop()
+	taskTicker := time.NewTicker(cfg.taskPollInterval)
+	defer taskTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -83,9 +88,13 @@ func main() {
 			}
 			fmt.Println("agent 退出")
 			return
-		case <-ticker.C:
+		case <-heartbeatTicker.C:
 			if err := sendHeartbeat(ctx, client, cfg, fitManager); err != nil {
 				fmt.Printf("agent 心跳失败: %v\n", err)
+			}
+		case <-taskTicker.C:
+			if err := pollAndExecuteTask(ctx, client, cfg); err != nil {
+				fmt.Printf("agent 任务执行失败: %v\n", err)
 			}
 		}
 	}
@@ -101,6 +110,7 @@ func loadAgentConfig() (agentConfig, error) {
 		host:               strings.TrimSpace(firstNonEmpty(os.Getenv("AGENT_HOST"), hostname)),
 		version:            strings.TrimSpace(firstNonEmpty(os.Getenv("AGENT_VERSION"), "dev")),
 		heartbeatInterval:  durationFromEnv("AGENT_HEARTBEAT_SECONDS", 15*time.Second),
+		taskPollInterval:   durationFromEnv("AGENT_TASK_POLL_SECONDS", 5*time.Second),
 		capabilities:       splitList(firstNonEmpty(os.Getenv("AGENT_CAPABILITIES"), "resource-snapshot,docker-manage,download")),
 		llmfit: llmfitConfig{
 			enabled:             boolFromEnv("AGENT_LLMFIT_ENABLED", false),
@@ -193,6 +203,150 @@ func sendHeartbeat(ctx context.Context, client *http.Client, cfg agentConfig, fi
 		Metadata: buildAgentMetadata(cfg, fitManager),
 	}
 	return doJSON(ctx, client, cfg, http.MethodPost, cfg.controllerEndpoint+"/api/v1/agents/"+cfg.agentID+"/heartbeat", payload, nil)
+}
+
+type agentTaskEnvelope struct {
+	Task *model.Task `json:"task"`
+}
+
+type agentTaskReport struct {
+	Status     model.TaskStatus       `json:"status"`
+	Progress   int                    `json:"progress,omitempty"`
+	Message    string                 `json:"message,omitempty"`
+	Detail     map[string]interface{} `json:"detail,omitempty"`
+	Error      string                 `json:"error,omitempty"`
+	AcceptedAt time.Time              `json:"accepted_at,omitempty"`
+	StartedAt  time.Time              `json:"started_at,omitempty"`
+	FinishedAt time.Time              `json:"finished_at,omitempty"`
+}
+
+func pollAndExecuteTask(ctx context.Context, client *http.Client, cfg agentConfig) error {
+	var envelope agentTaskEnvelope
+	if err := doJSON(ctx, client, cfg, http.MethodGet, cfg.controllerEndpoint+"/api/v1/agents/"+cfg.agentID+"/tasks/next", nil, &envelope); err != nil {
+		return err
+	}
+	if envelope.Task == nil || strings.TrimSpace(envelope.Task.ID) == "" {
+		return nil
+	}
+	task := *envelope.Task
+	startedAt := time.Now().UTC()
+	if err := reportAgentTask(ctx, client, cfg, task.ID, agentTaskReport{
+		Status:    model.TaskStatusRunning,
+		Progress:  70,
+		Message:   "agent 开始执行任务",
+		StartedAt: startedAt,
+	}); err != nil {
+		return err
+	}
+
+	success, message, detail, errText := executeAgentTask(ctx, client, cfg, task)
+	report := agentTaskReport{
+		Progress:   100,
+		Message:    message,
+		Detail:     detail,
+		Error:      errText,
+		StartedAt:  startedAt,
+		FinishedAt: time.Now().UTC(),
+	}
+	if success {
+		report.Status = model.TaskStatusSuccess
+	} else {
+		report.Status = model.TaskStatusFailed
+	}
+	return reportAgentTask(ctx, client, cfg, task.ID, report)
+}
+
+func reportAgentTask(ctx context.Context, client *http.Client, cfg agentConfig, taskID string, report agentTaskReport) error {
+	url := cfg.controllerEndpoint + "/api/v1/agents/" + cfg.agentID + "/tasks/" + taskID + "/report"
+	return doJSON(ctx, client, cfg, http.MethodPost, url, report, nil)
+}
+
+func executeAgentTask(ctx context.Context, client *http.Client, cfg agentConfig, task model.Task) (bool, string, map[string]interface{}, string) {
+	switch task.Type {
+	case model.TaskTypeAgentRuntimeReadiness:
+		endpoint := strings.TrimSpace(stringValue(task.Payload, "endpoint"))
+		modelID := strings.TrimSpace(stringValue(task.Payload, "model_id"))
+		if endpoint == "" && modelID != "" {
+			if resolved, err := fetchModelEndpoint(ctx, client, cfg, modelID); err == nil {
+				endpoint = resolved
+			}
+		}
+		healthPath := strings.TrimSpace(stringValue(task.Payload, "health_path"))
+		if healthPath == "" {
+			healthPath = "/health"
+		}
+		timeout := time.Duration(intValue(task.Payload, "timeout_seconds", 3)) * time.Second
+		ready, detail, err := checkEndpointReadiness(endpoint, healthPath, timeout)
+		if err != nil {
+			return false, firstNonEmpty(err.Error(), "readiness 检查失败"), detail, err.Error()
+		}
+		if !ready {
+			return false, "runtime 未 ready", detail, "runtime not ready"
+		}
+		return true, "runtime readiness 检查通过", detail, ""
+	default:
+		return false, "不支持的任务类型", map[string]interface{}{"task_type": string(task.Type)}, "unsupported task type"
+	}
+}
+
+func fetchModelEndpoint(ctx context.Context, client *http.Client, cfg agentConfig, modelID string) (string, error) {
+	var item model.Model
+	url := cfg.controllerEndpoint + "/api/v1/models/" + modelID
+	if err := doJSON(ctx, client, cfg, http.MethodGet, url, nil, &item); err != nil {
+		return "", err
+	}
+	endpoint := strings.TrimSpace(item.Endpoint)
+	if endpoint == "" {
+		return "", fmt.Errorf("model endpoint is empty")
+	}
+	return endpoint, nil
+}
+
+func checkEndpointReadiness(endpoint, healthPath string, timeout time.Duration) (bool, map[string]interface{}, error) {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return false, nil, fmt.Errorf("endpoint is empty")
+	}
+	if !strings.HasPrefix(endpoint, "http://") && !strings.HasPrefix(endpoint, "https://") {
+		endpoint = "http://" + endpoint
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return false, nil, fmt.Errorf("parse endpoint failed: %w", err)
+	}
+	hostPort := u.Host
+	if !strings.Contains(hostPort, ":") {
+		if u.Scheme == "https" {
+			hostPort += ":443"
+		} else {
+			hostPort += ":80"
+		}
+	}
+	dialer := &net.Dialer{Timeout: timeout}
+	conn, err := dialer.Dial("tcp", hostPort)
+	if err != nil {
+		return false, map[string]interface{}{"endpoint": endpoint, "tcp_alive": false, "host_port": hostPort}, fmt.Errorf("tcp dial failed: %w", err)
+	}
+	_ = conn.Close()
+
+	client := &http.Client{Timeout: timeout}
+	healthURL := strings.TrimRight(endpoint, "/") + "/" + strings.TrimLeft(healthPath, "/")
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, healthURL, nil)
+	if err != nil {
+		return false, nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, map[string]interface{}{"endpoint": endpoint, "health_url": healthURL, "tcp_alive": true}, fmt.Errorf("health request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	detail := map[string]interface{}{
+		"endpoint":    endpoint,
+		"health_url":  healthURL,
+		"tcp_alive":   true,
+		"http_status": resp.StatusCode,
+	}
+	return resp.StatusCode >= 200 && resp.StatusCode < 300, detail, nil
 }
 
 func buildAgentMetadata(cfg agentConfig, fitManager *fit.ManagedServe) map[string]string {
@@ -378,6 +532,47 @@ func removeItem(base []string, target string) []string {
 		out = append(out, key)
 	}
 	return out
+}
+
+func stringValue(payload map[string]interface{}, key string) string {
+	if payload == nil {
+		return ""
+	}
+	raw, ok := payload[key]
+	if !ok || raw == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(raw))
+}
+
+func intValue(payload map[string]interface{}, key string, fallback int) int {
+	if payload == nil {
+		return fallback
+	}
+	raw, ok := payload[key]
+	if !ok || raw == nil {
+		return fallback
+	}
+	switch value := raw.(type) {
+	case float64:
+		if int(value) > 0 {
+			return int(value)
+		}
+	case int:
+		if value > 0 {
+			return value
+		}
+	case int64:
+		if value > 0 {
+			return int(value)
+		}
+	case string:
+		parsed, err := strconv.Atoi(strings.TrimSpace(value))
+		if err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	return fallback
 }
 
 func firstNonEmpty(values ...string) string {

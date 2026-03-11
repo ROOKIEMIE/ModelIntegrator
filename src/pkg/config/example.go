@@ -15,6 +15,9 @@ storage:
   sqlite_path: "./resources/config/controller.db"
   model_root_dir: "./resources/models"
 
+testing:
+  log_root_dir: "./testsystem/logs"
+
 auth:
   token: ""
 

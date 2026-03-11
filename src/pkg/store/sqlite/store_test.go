@@ -106,15 +106,19 @@ func TestModelRoundTrip(t *testing.T) {
 	ctx := context.Background()
 
 	item := model.Model{
-		ID:          "local-embed",
-		Name:        "local-embed",
-		Provider:    "localfs",
-		BackendType: model.RuntimeTypeDocker,
-		HostNodeID:  "node-main",
-		RuntimeID:   "rt-docker",
-		Endpoint:    "unix:///var/run/docker.sock",
-		State:       model.ModelStateLoaded,
-		Metadata:    map[string]string{"source": "test"},
+		ID:            "local-embed",
+		Name:          "local-embed",
+		Provider:      "localfs",
+		BackendType:   model.RuntimeTypeDocker,
+		HostNodeID:    "node-main",
+		RuntimeID:     "rt-docker",
+		Endpoint:      "unix:///var/run/docker.sock",
+		State:         model.ModelStateLoaded,
+		DesiredState:  string(model.ModelStateRunning),
+		ObservedState: string(model.ModelStateLoaded),
+		Readiness:     model.ReadinessNotReady,
+		HealthMessage: "runtime 已装载但未运行",
+		Metadata:      map[string]string{"source": "test"},
 	}
 	if err := store.UpsertModel(ctx, item); err != nil {
 		t.Fatalf("upsert model failed: %v", err)
@@ -129,5 +133,68 @@ func TestModelRoundTrip(t *testing.T) {
 	}
 	if got.State != model.ModelStateLoaded || got.HostNodeID != "node-main" {
 		t.Fatalf("unexpected model snapshot: %+v", got)
+	}
+	if got.DesiredState != string(model.ModelStateRunning) || got.ObservedState != string(model.ModelStateLoaded) {
+		t.Fatalf("unexpected model desired/observed: %+v", got)
+	}
+	if got.Readiness != model.ReadinessNotReady {
+		t.Fatalf("unexpected model readiness: %s", got.Readiness)
+	}
+}
+
+func TestTaskAndTestRunRoundTrip(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+
+	task := model.Task{
+		ID:              "task-1",
+		Type:            model.TaskTypeRuntimeStart,
+		TargetType:      model.TaskTargetRuntime,
+		TargetID:        "local-multilingual-e5-base",
+		AssignedAgentID: "agent-1",
+		Status:          model.TaskStatusPending,
+		Progress:        10,
+		Message:         "created",
+		Detail:          map[string]interface{}{"phase": "create"},
+		Payload:         map[string]interface{}{"model_id": "local-multilingual-e5-base"},
+		CreatedAt:       time.Now().UTC(),
+	}
+	if err := store.UpsertTask(ctx, task); err != nil {
+		t.Fatalf("upsert task failed: %v", err)
+	}
+
+	tasks, err := store.ListTasks(ctx, string(model.TaskTargetRuntime), "local-multilingual-e5-base", 10)
+	if err != nil {
+		t.Fatalf("list tasks failed: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("unexpected task count: %d", len(tasks))
+	}
+	if tasks[0].Type != model.TaskTypeRuntimeStart {
+		t.Fatalf("unexpected task type: %s", tasks[0].Type)
+	}
+
+	run := model.TestRun{
+		TestRunID:   "testrun-1",
+		Scenario:    "e5_embedding_smoke",
+		Status:      model.TestRunStatusRunning,
+		StartedAt:   time.Now().UTC(),
+		LogPath:     "/tmp/logs/testrun-1",
+		Summary:     "running",
+		TriggeredBy: "test",
+		CreatedAt:   time.Now().UTC(),
+	}
+	if err := store.UpsertTestRun(ctx, run); err != nil {
+		t.Fatalf("upsert test run failed: %v", err)
+	}
+	got, ok, err := store.GetTestRunByID(ctx, "testrun-1")
+	if err != nil {
+		t.Fatalf("get test run failed: %v", err)
+	}
+	if !ok {
+		t.Fatalf("test run not found")
+	}
+	if got.Scenario != "e5_embedding_smoke" || got.Status != model.TestRunStatusRunning {
+		t.Fatalf("unexpected test run snapshot: %+v", got)
 	}
 }

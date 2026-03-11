@@ -67,6 +67,63 @@ Local LLM Control Plane is a local multi-node LLM control plane for Linux server
 - Download capability currently targets deployments where the main node has docker runtime
 - One-click startup scripts included
 
+## P0 Additions (Current Delivery)
+
+### 1) E5 embedding sample (TEI) end-to-end
+
+- Added `local-multilingual-e5-base` sample in `resources/config/config.example.yaml`.
+- Default template binding: `tei-embedding-e5-local` (TEI CPU template, `58001:80`).
+- Controller can start/stop/refresh this runtime through task APIs.
+- Added minimal embedding client: `scripts/e5_embedding_client.sh`.
+- Added reusable smoke scenario: `testsystem/scenarios/e5_embedding_smoke.sh`.
+
+### 2) Runtime actions are task-based
+
+- Added task persistence in SQLite (`tasks` table).
+- Runtime task APIs:
+  - `POST /api/v1/tasks/runtime/start`
+  - `POST /api/v1/tasks/runtime/stop`
+  - `POST /api/v1/tasks/runtime/refresh`
+  - `GET /api/v1/tasks`
+  - `GET /api/v1/tasks/{id}`
+- Supported task status:
+  `pending/dispatched/running/success/failed/timeout/canceled`.
+
+### 3) desired / observed / readiness model
+
+- Model state now includes:
+  - `desired_state`
+  - `observed_state`
+  - `readiness`
+  - `health_message`
+  - `last_reconciled_at`
+- For the E5 template, readiness is health-probed and can expose
+  "container running but service not ready".
+
+### 4) Minimal agent execution plane
+
+- Added controller-agent task protocol and task report path.
+- Added agent-side polling execution loop.
+- Implemented a real task type: runtime readiness check.
+
+### 5) Isolated testing toolchain (`testsystem/`)
+
+- Added:
+  - `testsystem/Dockerfile`
+  - `testsystem/docker-compose.test.yml`
+  - `testsystem/scenarios/e5_embedding_smoke.sh`
+  - `testsystem/scripts/run_test.sh`
+  - `testsystem/scripts/collect_logs.sh`
+- Logs are persisted under host-mounted path by run-id.
+
+### 6) Controller test-run APIs + one-click frontend test
+
+- Added test-run APIs:
+  - `POST /api/v1/test-runs` (only predefined scenario `e5_embedding_smoke`)
+  - `GET /api/v1/test-runs`
+  - `GET /api/v1/test-runs/{id}`
+- Frontend button "One-click E5 Test" now calls backend API only (no shell from browser).
+
 ## Zero-to-Deployment
 
 Target directory: `/tank/docker_data/model_control_plane`
@@ -81,7 +138,9 @@ cd /tank/docker_data/model_control_plane
 ```bash
 cp resources/docker/compose.example.env .env
 mkdir -p resources/config resources/models
+mkdir -p testsystem/logs
 touch resources/config/controller.db
+chmod 777 resources/config testsystem/logs
 chmod 666 resources/config/controller.db
 ```
 
@@ -136,10 +195,13 @@ Stop:
 - `MCP_SQLITE_PATH`
 - `MCP_MODEL_DIR_HOST` (host model directory)
 - `MCP_MODEL_ROOT_DIR` (container model directory)
+- `MCP_TEST_LOG_ROOT_HOST` (host test-log directory, default `./testsystem/logs`)
+- `MCP_TEST_LOG_ROOT_DIR` (controller container test-log directory, default `/opt/controller/test-logs`)
 - `MCP_LMSTUDIO_ENDPOINT`
 - `MCP_LMSTUDIO_CACHE_ENABLED`
 - `MCP_LMSTUDIO_CACHE_REFRESH_SECONDS`
 - `MCP_DOCKER_ENDPOINT` (docker runtime / GPU fallback probe)
+- `MCP_CONTAINER_HOST_ALIAS` (controller-in-container host alias, default `host.docker.internal`)
 - `MCP_GPU_PROBE_IMAGE` (optional probe image, default `nvidia/cuda:12.4.1-base-ubuntu22.04`)
 - `MCP_HF_CACHE_DIR` (HF download cache directory, download profile)
 - `MCP_ARIA2_RPC_SECRET` (aria2 RPC secret, download profile)
@@ -151,6 +213,60 @@ Stop:
 - `MCP_VLLM_GPU_MEMORY_UTILIZATION` (vLLM GPU memory utilization cap)
 - `MCP_VLLM_MAX_MODEL_LEN` (vLLM max context length)
 - `HUGGING_FACE_HUB_TOKEN` (optional token for private/gated HF models)
+
+## Main Compose vs Test Compose
+
+- Main system: `docker-compose.yml`
+  - Runs controller/nginx and optional addons/download/vllm profiles.
+  - Serves production runtime, web console, and APIs.
+- Test system: `testsystem/docker-compose.test.yml`
+  - Runs only the test runner for predefined test scenarios.
+  - Does not serve production traffic.
+
+## External Log Directory Mounts
+
+Controller (main compose) default mount:
+
+```text
+${MCP_TEST_LOG_ROOT_HOST:-./testsystem/logs}:${MCP_TEST_LOG_ROOT_DIR:-/opt/controller/test-logs}
+```
+
+Test runner (test compose) default mount:
+
+```text
+${TEST_LOG_ROOT_HOST:-./testsystem/logs}:/workspace/test-logs
+```
+
+Each run writes into `<log-root>/<run-id>/` with `run.log` and `summary.json`.
+
+## One-click Test from Frontend
+
+1. Open Runtime page in web console.
+2. Click `One-click E5 Test` in the Task/Test panel.
+3. Frontend calls `POST /api/v1/test-runs` with fixed scenario `e5_embedding_smoke`.
+4. Check recent run status, summary, and log path in the same panel.
+
+## 2026-03-11 Incident Fixes (Verified)
+
+- Fixed occasional frontend `502` after `one-click-up`:
+  - Root cause: legacy `.env` paths + sqlite directory/file permission mismatch.
+  - Fix: path migration + sqlite directory/file writable setup in `scripts/one-click-up.sh`.
+- Fixed one-click E5 test failures:
+  - Root cause 1: test-log mount permission denied.
+  - Root cause 2: in-container `127.0.0.1:58001` pointed to controller container, not host runtime.
+  - Fix: test-log writable probe + host-gateway mapping + endpoint rewrite for controller-in-container.
+- Verified result:
+  - `e5_embedding_smoke` succeeds with embedding dimension check (`dim=768`).
+  - Logs are persisted under `./testsystem/logs/<test-run-id>/`.
+
+## Troubleshooting
+
+1. Check `summary.json` first (`status/error`).
+2. Check `run.log` for failed stage (`runtime_start`, `readiness_poll`, `embedding_request`).
+3. For readiness failures, inspect `desired_state/observed_state/readiness/health_message`.
+4. For embedding failures, replay with `scripts/e5_embedding_client.sh`.
+5. If `/opt/controller/test-logs` shows `permission denied`, verify host path in `MCP_TEST_LOG_ROOT_HOST`.
+6. If `127.0.0.1:58001 connect refused` occurs in container mode, verify `MCP_CONTAINER_HOST_ALIAS` and compose `extra_hosts`.
 
 ### SQLite Persistence Notes (Control Plane State)
 
@@ -239,3 +355,11 @@ Example payload:
 - `GET /api/v1/runtime-templates`
 - `POST /api/v1/runtime-templates/validate`
 - `POST /api/v1/runtime-templates`
+- `GET /api/v1/tasks`
+- `GET /api/v1/tasks/{id}`
+- `POST /api/v1/tasks/runtime/start`
+- `POST /api/v1/tasks/runtime/stop`
+- `POST /api/v1/tasks/runtime/refresh`
+- `GET /api/v1/test-runs`
+- `GET /api/v1/test-runs/{id}`
+- `POST /api/v1/test-runs`

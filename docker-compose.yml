@@ -24,18 +24,23 @@ services:
       MCP_LOG_FORMAT: ${MCP_LOG_FORMAT:-text}
       MCP_SQLITE_PATH: ${MCP_SQLITE_PATH:-/opt/controller/resources/config/controller.db}
       MCP_MODEL_ROOT_DIR: ${MCP_MODEL_ROOT_DIR:-/opt/controller/models}
+      MCP_TEST_LOG_ROOT_DIR: ${MCP_TEST_LOG_ROOT_DIR:-/opt/controller/test-logs}
       MCP_LMSTUDIO_ENDPOINT: ${MCP_LMSTUDIO_ENDPOINT:-http://192.168.50.241:1234}
       MCP_LMSTUDIO_CACHE_ENABLED: ${MCP_LMSTUDIO_CACHE_ENABLED:-true}
       MCP_LMSTUDIO_CACHE_REFRESH_SECONDS: ${MCP_LMSTUDIO_CACHE_REFRESH_SECONDS:-30}
       MCP_DOCKER_ENDPOINT: ${MCP_DOCKER_ENDPOINT:-unix:///var/run/docker.sock}
       MCP_PORTAINER_ENDPOINT: ${MCP_PORTAINER_ENDPOINT:-http://portainer:9000}
+      MCP_CONTAINER_HOST_ALIAS: ${MCP_CONTAINER_HOST_ALIAS:-host.docker.internal}
     volumes:
       - ${MCP_PROJECT_DIR:-.}/resources:/opt/controller/resources
       - ${MCP_MODEL_DIR_HOST:-./resources/models}:${MCP_MODEL_ROOT_DIR:-/opt/controller/models}:ro
+      - ${MCP_TEST_LOG_ROOT_HOST:-./testsystem/logs}:${MCP_TEST_LOG_ROOT_DIR:-/opt/controller/test-logs}
       - /var/run/docker.sock:/var/run/docker.sock
     # 让非 root 的 app 用户具备 docker.sock 的组访问权限。
     group_add:
       - "${MCP_DOCKER_GID:-998}"
+    extra_hosts:
+      - "${MCP_CONTAINER_HOST_ALIAS:-host.docker.internal}:host-gateway"
     networks:
       - mcp_net
     restart: unless-stopped
