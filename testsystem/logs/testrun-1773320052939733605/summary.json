@@ -1,0 +1,63 @@
+{
+  "error": "Post \"%3Cnil%3E/v1/embeddings\": unsupported protocol scheme \"\"",
+  "finished_at": "2026-03-12T12:54:19.379773808Z",
+  "scenario": "e5_embedding_smoke",
+  "started_at": "2026-03-12T12:54:12.947872959Z",
+  "status": "failed",
+  "steps": [
+    {
+      "detail": {
+        "expected_dim": 768,
+        "model_id": "local-multilingual-e5-base"
+      },
+      "message": "已找到 E5 模型",
+      "name": "discover_model",
+      "ok": true,
+      "time": "2026-03-12T12:54:12.953103386Z"
+    },
+    {
+      "detail": {
+        "task_id": "task-1773320052953112959"
+      },
+      "message": "已创建 runtime start 任务",
+      "name": "runtime_start",
+      "ok": true,
+      "time": "2026-03-12T12:54:12.958341854Z"
+    },
+    {
+      "detail": {
+        "task_id": "task-1773320052953112959"
+      },
+      "message": "runtime start 任务成功",
+      "name": "runtime_start_wait",
+      "ok": true,
+      "time": "2026-03-12T12:54:15.359149334Z"
+    },
+    {
+      "detail": {
+        "attempt": 1,
+        "desired_state": "running",
+        "endpoint": "\u003cnil\u003e",
+        "health_message": "runtime precheck passed",
+        "observed_state": "running",
+        "readiness": "ready"
+      },
+      "message": "模型已就绪",
+      "name": "readiness_poll",
+      "ok": true,
+      "time": "2026-03-12T12:54:19.379695804Z"
+    },
+    {
+      "detail": {
+        "endpoint": "\u003cnil\u003e",
+        "error": "Post \"%3Cnil%3E/v1/embeddings\": unsupported protocol scheme \"\""
+      },
+      "message": "embedding 请求失败",
+      "name": "embedding_request",
+      "ok": false,
+      "time": "2026-03-12T12:54:19.379766091Z"
+    }
+  ],
+  "summary": "embedding 请求失败",
+  "test_run_id": "testrun-1773320052939733605"
+}

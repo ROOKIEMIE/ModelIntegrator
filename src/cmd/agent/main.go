@@ -323,6 +323,8 @@ func checkEndpointReadiness(endpoint, healthPath string, timeout time.Duration) 
 	if !strings.HasPrefix(endpoint, "http://") && !strings.HasPrefix(endpoint, "https://") {
 		endpoint = "http://" + endpoint
 	}
+	originalEndpoint := endpoint
+	endpoint = normalizeAgentAccessibleEndpoint(endpoint)
 	u, err := url.Parse(endpoint)
 	if err != nil {
 		return false, nil, fmt.Errorf("parse endpoint failed: %w", err)
@@ -358,6 +360,10 @@ func checkEndpointReadiness(endpoint, healthPath string, timeout time.Duration) 
 		"health_url":  healthURL,
 		"tcp_alive":   true,
 		"http_status": resp.StatusCode,
+	}
+	if endpoint != originalEndpoint {
+		detail["endpoint_original"] = originalEndpoint
+		detail["endpoint_rewritten"] = true
 	}
 	return resp.StatusCode >= 200 && resp.StatusCode < 300, detail, nil
 }
@@ -531,6 +537,8 @@ func checkEndpointPort(endpoint string, timeout time.Duration) (bool, map[string
 	if !strings.HasPrefix(endpoint, "http://") && !strings.HasPrefix(endpoint, "https://") {
 		endpoint = "http://" + endpoint
 	}
+	originalEndpoint := endpoint
+	endpoint = normalizeAgentAccessibleEndpoint(endpoint)
 	u, err := url.Parse(endpoint)
 	if err != nil {
 		return false, nil, fmt.Errorf("parse endpoint failed: %w", err)
@@ -546,10 +554,20 @@ func checkEndpointPort(endpoint string, timeout time.Duration) (bool, map[string
 	dialer := &net.Dialer{Timeout: timeout}
 	conn, err := dialer.Dial("tcp", hostPort)
 	if err != nil {
-		return false, map[string]interface{}{"endpoint": endpoint, "host_port": hostPort, "tcp_alive": false}, err
+		detail := map[string]interface{}{"endpoint": endpoint, "host_port": hostPort, "tcp_alive": false}
+		if endpoint != originalEndpoint {
+			detail["endpoint_original"] = originalEndpoint
+			detail["endpoint_rewritten"] = true
+		}
+		return false, detail, err
 	}
 	_ = conn.Close()
-	return true, map[string]interface{}{"endpoint": endpoint, "host_port": hostPort, "tcp_alive": true}, nil
+	detail := map[string]interface{}{"endpoint": endpoint, "host_port": hostPort, "tcp_alive": true}
+	if endpoint != originalEndpoint {
+		detail["endpoint_original"] = originalEndpoint
+		detail["endpoint_rewritten"] = true
+	}
+	return true, detail, nil
 }
 
 func checkModelPathExists(path string) (bool, map[string]interface{}, error) {
@@ -624,6 +642,20 @@ func inspectDockerContainer(ctx context.Context, containerID string) (bool, bool
 	cmd := exec.CommandContext(ctx, "docker", "inspect", containerID)
 	raw, err := cmd.CombinedOutput()
 	if err != nil {
+		if errors.Is(err, exec.ErrNotFound) || strings.Contains(strings.ToLower(err.Error()), "executable file not found") {
+			exists, running, apiDetail, apiErr := inspectDockerContainerViaAPI(ctx, containerID)
+			for k, v := range apiDetail {
+				detail[k] = v
+			}
+			detail["inspect_transport"] = "docker_api_fallback"
+			if apiErr != nil {
+				detail["runtime_exists"] = false
+				detail["runtime_running"] = false
+				detail["error"] = apiErr.Error()
+				return false, false, detail, fmt.Errorf("docker inspect via api failed: %w", apiErr)
+			}
+			return exists, running, detail, nil
+		}
 		message := strings.ToLower(strings.TrimSpace(string(raw)))
 		if strings.Contains(message, "no such object") || strings.Contains(message, "not found") {
 			detail["runtime_exists"] = false
@@ -660,6 +692,7 @@ func inspectDockerContainer(ctx context.Context, containerID string) (bool, bool
 	detail["runtime_exists"] = true
 	detail["runtime_running"] = running
 	detail["runtime_status"] = status
+	detail["inspect_transport"] = "docker_cli"
 	if name != "" {
 		detail["runtime_container"] = name
 	}
@@ -667,6 +700,148 @@ func inspectDockerContainer(ctx context.Context, containerID string) (bool, bool
 		detail["runtime_image"] = image
 	}
 	return true, running, detail, nil
+}
+
+func inspectDockerContainerViaAPI(ctx context.Context, containerID string) (bool, bool, map[string]interface{}, error) {
+	endpoint := strings.TrimSpace(firstNonEmpty(
+		os.Getenv("AGENT_DOCKER_ENDPOINT"),
+		os.Getenv("MCP_DOCKER_ENDPOINT"),
+		"unix:///var/run/docker.sock",
+	))
+	detail := map[string]interface{}{
+		"runtime_container_id": containerID,
+		"docker_endpoint":      endpoint,
+	}
+	client, baseURL, err := newDockerInspectHTTPClient(endpoint, 5*time.Second)
+	if err != nil {
+		return false, false, detail, err
+	}
+
+	reqURL := strings.TrimRight(baseURL, "/") + "/containers/" + url.PathEscape(containerID) + "/json"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return false, false, detail, err
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, false, detail, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+
+	if resp.StatusCode == http.StatusNotFound {
+		detail["runtime_exists"] = false
+		detail["runtime_running"] = false
+		return false, false, detail, nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return false, false, detail, fmt.Errorf("docker api inspect failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var parsed struct {
+		Name   string `json:"Name"`
+		Config struct {
+			Image string `json:"Image"`
+		} `json:"Config"`
+		State struct {
+			Running bool   `json:"Running"`
+			Status  string `json:"Status"`
+		} `json:"State"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return false, false, detail, fmt.Errorf("parse docker api inspect output failed: %w", err)
+	}
+
+	detail["runtime_exists"] = true
+	detail["runtime_running"] = parsed.State.Running
+	detail["runtime_status"] = strings.TrimSpace(parsed.State.Status)
+	if name := strings.TrimPrefix(strings.TrimSpace(parsed.Name), "/"); name != "" {
+		detail["runtime_container"] = name
+	}
+	if image := strings.TrimSpace(parsed.Config.Image); image != "" {
+		detail["runtime_image"] = image
+	}
+	return true, parsed.State.Running, detail, nil
+}
+
+func newDockerInspectHTTPClient(endpoint string, timeout time.Duration) (*http.Client, string, error) {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return nil, "", fmt.Errorf("docker endpoint is empty")
+	}
+
+	if strings.HasPrefix(endpoint, "unix://") {
+		socketPath := strings.TrimSpace(strings.TrimPrefix(endpoint, "unix://"))
+		if socketPath == "" {
+			return nil, "", fmt.Errorf("docker unix endpoint missing socket path")
+		}
+		transport := &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				dialer := &net.Dialer{Timeout: timeout}
+				return dialer.DialContext(ctx, "unix", socketPath)
+			},
+		}
+		return &http.Client{Timeout: timeout, Transport: transport}, "http://docker", nil
+	}
+
+	if strings.HasPrefix(endpoint, "tcp://") {
+		endpoint = "http://" + strings.TrimPrefix(endpoint, "tcp://")
+	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return nil, "", fmt.Errorf("parse docker endpoint failed: %w", err)
+	}
+	if strings.TrimSpace(parsed.Scheme) == "" || strings.TrimSpace(parsed.Host) == "" {
+		return nil, "", fmt.Errorf("docker endpoint missing scheme or host")
+	}
+	return &http.Client{Timeout: timeout}, strings.TrimRight(endpoint, "/"), nil
+}
+
+func normalizeAgentAccessibleEndpoint(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return raw
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" {
+		return raw
+	}
+	if !isAgentRunningInContainer() {
+		return raw
+	}
+	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+		return raw
+	}
+	alias := strings.TrimSpace(firstNonEmpty(
+		os.Getenv("AGENT_CONTAINER_HOST_ALIAS"),
+		os.Getenv("MCP_CONTAINER_HOST_ALIAS"),
+		"host.docker.internal",
+	))
+	if alias == "" {
+		return raw
+	}
+	port := strings.TrimSpace(parsed.Port())
+	if port != "" {
+		parsed.Host = net.JoinHostPort(alias, port)
+	} else {
+		parsed.Host = alias
+	}
+	return parsed.String()
+}
+
+func isAgentRunningInContainer() bool {
+	if raw := strings.TrimSpace(os.Getenv("AGENT_RUNNING_IN_CONTAINER")); raw != "" {
+		switch strings.ToLower(raw) {
+		case "1", "true", "yes", "on":
+			return true
+		case "0", "false", "no", "off":
+			return false
+		}
+	}
+	_, err := os.Stat("/.dockerenv")
+	return err == nil
 }
 
 func buildAgentMetadata(cfg agentConfig, fitManager *fit.ManagedServe) map[string]string {

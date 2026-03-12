@@ -1,0 +1,8 @@
+[2026-03-12T12:58:49.275989312Z] test run started: id=testrun-1773320329263412994 scenario=e5_embedding_smoke triggered_by=script
+[2026-03-12T12:58:49.276010889Z] parameters: log_dir=/opt/controller/test-logs/testrun-1773320329263412994
+[2026-03-12T12:58:49.276412388Z] step=discover_model ok=true message=已找到 E5 模型 detail={"expected_dim":768,"model_id":"local-multilingual-e5-base"}
+[2026-03-12T12:58:49.283169657Z] step=runtime_start ok=true message=已创建 runtime start 任务 detail={"task_id":"task-1773320329276420317"}
+[2026-03-12T12:58:52.883665079Z] step=runtime_start_wait ok=true message=runtime start 任务成功 detail={"task_id":"task-1773320329276420317"}
+[2026-03-12T12:58:57.085863902Z] step=readiness_poll ok=true message=模型已就绪 detail={"attempt":1,"desired_state":"running","endpoint":"http://127.0.0.1:58001","health_message":"runtime precheck passed","observed_state":"running","readiness":"ready"}
+[2026-03-12T12:58:57.110254297Z] step=embedding_validate ok=true message=embedding 响应校验通过 detail={"dimension":768,"endpoint":"http://127.0.0.1:58001","expected_dimension":768}
+[2026-03-12T12:58:57.135282426Z] test run finished: status=success summary=e5_embedding_smoke 成功，endpoint=http://127.0.0.1:58001 dim=768 error=

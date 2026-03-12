@@ -61,6 +61,8 @@ services:
       AGENT_NODE_ID: ${MCP_CONTROLLER_NODE_ID:-node-controller}
       AGENT_ID: ${MCP_CONTROLLER_LOCAL_AGENT_ID:-agent-controller-local}
       AGENT_HOST: ${MCP_CONTROLLER_NODE_HOST:-127.0.0.1}
+      AGENT_CONTAINER_HOST_ALIAS: ${MCP_CONTAINER_HOST_ALIAS:-host.docker.internal}
+      AGENT_DOCKER_ENDPOINT: ${MCP_DOCKER_ENDPOINT:-unix:///var/run/docker.sock}
       AGENT_TASK_POLL_SECONDS: ${AGENT_TASK_POLL_SECONDS:-5}
       AGENT_HEARTBEAT_SECONDS: ${AGENT_HEARTBEAT_SECONDS:-15}
       AGENT_CAPABILITIES: ${AGENT_CAPABILITIES:-resource-snapshot,docker-manage,port-check,path-check}
@@ -70,6 +72,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     group_add:
       - "${MCP_DOCKER_GID:-998}"
+    extra_hosts:
+      - "${MCP_CONTAINER_HOST_ALIAS:-host.docker.internal}:host-gateway"
     networks:
       - mcp_net
     restart: unless-stopped

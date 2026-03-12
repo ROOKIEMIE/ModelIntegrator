@@ -332,20 +332,40 @@ function renderNodes() {
     const localAgentExpected = String(metadata.local_agent_expected || "").toLowerCase();
     const localAgentHint = localAgentExpected === "true" ? "应运行本机 agent" : localAgentExpected === "false" ? "本机 agent 非强制" : "-";
     const architectureRole = isControllerNode && isManagedNode ? "controller + managed node" : isControllerNode ? "controller" : isManagedNode ? "managed node" : "unknown";
+    const runtimeCount = Array.isArray(node.runtimes) ? node.runtimes.length : 0;
+    const summaryParts = [
+      `架构: ${architectureRole}`,
+      `状态: ${node.status || "unknown"}`,
+      `Agent: ${agentStatus}`,
+      `Runtime: ${runtimeCount}`,
+      `已装载模型: ${nodeLoadedCount}`,
+    ];
+    const summaryText = summaryParts.join(" | ");
     const item = document.createElement("div");
     item.className = "list-item";
     item.innerHTML = `
-      <div class="item-title">${escapeHTML(node.name)} (${escapeHTML(node.id)})</div>
-      <div class="meta">描述: ${escapeHTML(node.description || "-")}</div>
-      <div class="meta">架构角色: ${escapeHTML(architectureRole)} | 分类: ${escapeHTML(node.classification || "-")} | 状态: ${escapeHTML(node.status || "unknown")} | 类型: ${escapeHTML(node.type || "-")} | 主机: ${escapeHTML(node.host || "-")}</div>
-      <div class="meta">角色字段: ${escapeHTML(node.role || "-")} | Managed Node: ${isManagedNode ? "yes" : "no"} | 本机 Agent 期望: ${escapeHTML(localAgentHint)}</div>
-      <div class="meta">能力分级: ${escapeHTML(node.capability_tier || "unknown")} | 能力来源: ${escapeHTML(node.capability_source || "unknown")} | 操作级别: ${escapeHTML(node.operation_level || "-")}</div>
-      <div class="meta">Agent 状态: ${escapeHTML(agentStatus)} | 最近心跳: ${escapeHTML(formatTime(heartbeatAt))}</div>
-      <div class="meta">能力说明: ${escapeHTML(node.capability_note || "-")}</div>
-      <div class="meta">平台: ${(node.platform && node.platform.accelerator) || "unknown"} | GPU: ${(node.platform && node.platform.gpu) || "unknown"} | CUDA: ${(node.platform && node.platform.cuda_version) || "unknown"} | Driver: ${(node.platform && node.platform.driver) || "unknown"}</div>
-      <div class="meta">Runtime 数量: ${(node.runtimes || []).length} | 已装载模型: ${nodeLoadedCount}</div>
-      <div class="meta">Runtime 状态: ${runtimeSummary || "-"}</div>
-      ${buildRuntimeCapabilityBlock(node)}
+      <details class="node-card">
+        <summary class="node-summary">
+          <div class="node-summary-title">${escapeHTML(node.name)} (${escapeHTML(node.id)})</div>
+          <div class="node-summary-meta">${escapeHTML(summaryText)}</div>
+          <div class="node-summary-toggle">
+            <span class="node-summary-divider" aria-hidden="true"></span>
+            <span class="node-summary-hint">详情</span>
+          </div>
+        </summary>
+        <div class="node-detail">
+          <div class="meta">描述: ${escapeHTML(node.description || "-")}</div>
+          <div class="meta">架构角色: ${escapeHTML(architectureRole)} | 分类: ${escapeHTML(node.classification || "-")} | 状态: ${escapeHTML(node.status || "unknown")} | 类型: ${escapeHTML(node.type || "-")} | 主机: ${escapeHTML(node.host || "-")}</div>
+          <div class="meta">角色字段: ${escapeHTML(node.role || "-")} | Managed Node: ${isManagedNode ? "yes" : "no"} | 本机 Agent 期望: ${escapeHTML(localAgentHint)}</div>
+          <div class="meta">能力分级: ${escapeHTML(node.capability_tier || "unknown")} | 能力来源: ${escapeHTML(node.capability_source || "unknown")} | 操作级别: ${escapeHTML(node.operation_level || "-")}</div>
+          <div class="meta">Agent 状态: ${escapeHTML(agentStatus)} | 最近心跳: ${escapeHTML(formatTime(heartbeatAt))}</div>
+          <div class="meta">能力说明: ${escapeHTML(node.capability_note || "-")}</div>
+          <div class="meta">平台: ${(node.platform && node.platform.accelerator) || "unknown"} | GPU: ${(node.platform && node.platform.gpu) || "unknown"} | CUDA: ${(node.platform && node.platform.cuda_version) || "unknown"} | Driver: ${(node.platform && node.platform.driver) || "unknown"}</div>
+          <div class="meta">Runtime 数量: ${runtimeCount} | 已装载模型: ${nodeLoadedCount}</div>
+          <div class="meta">Runtime 状态: ${runtimeSummary || "-"}</div>
+          ${buildRuntimeCapabilityBlock(node)}
+        </div>
+      </details>
     `;
     nodesEl.appendChild(item);
   });

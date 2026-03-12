@@ -970,7 +970,7 @@ func (s *ModelService) checkRuntimeReadiness(ctx context.Context, item model.Mod
 			if err != nil {
 				s.logger.Warn("agent runtime precheck 失败，回退 controller 本地检查", "model_id", item.ID, "node_id", item.HostNodeID, "error", err)
 			} else {
-				if resolved := strings.TrimSpace(fmt.Sprint(detail["runtime_service_endpoint"])); resolved != "" {
+				if resolved := strings.TrimSpace(fmt.Sprint(detail["runtime_service_endpoint"])); resolved != "" && resolved != "<nil>" {
 					endpoint = resolved
 				}
 				return ready, firstNonEmpty(msg, "agent runtime precheck completed"), endpoint

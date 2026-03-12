@@ -241,10 +241,80 @@ main {
 }
 
 .list-item {
+  padding: 0;
+  margin-bottom: 10px;
+}
+
+.node-card {
   border: 1px solid #e5e7eb;
   border-radius: 10px;
+  background: #fff;
+  overflow: hidden;
+}
+
+.node-summary {
+  cursor: pointer;
+  list-style: none !important;
   padding: 12px;
-  margin-bottom: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: #f8fbff;
+}
+
+.node-summary::-webkit-details-marker {
+  display: none;
+}
+
+.node-summary::marker {
+  content: "";
+}
+
+.node-summary-title {
+  font-weight: 700;
+  color: #111827;
+}
+
+.node-summary-meta {
+  color: #4b5563;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.node-summary-hint {
+  color: #0f766e;
+  font-size: 12px;
+}
+
+.node-summary-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.node-summary-divider {
+  flex: 1;
+  min-width: 28px;
+  height: 1px;
+  background: #9fb5d4;
+}
+
+.node-summary-toggle::after {
+  content: "▸";
+  color: #0f766e;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.node-card[open] .node-summary-toggle::after {
+  content: "▾";
+}
+
+.node-detail {
+  border-top: 1px dashed #d1d5db;
+  padding: 10px 12px 2px 12px;
+  background: #f8fbff;
 }
 
 .runtime-capability-list {
