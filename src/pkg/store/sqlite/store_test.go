@@ -29,7 +29,7 @@ func TestAgentRoundTrip(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	agent := model.Agent{
 		ID:                  "agent-1",
-		NodeID:              "node-main",
+		NodeID:              "node-controller",
 		Name:                "agent-1",
 		Status:              model.AgentStatusOnline,
 		Capabilities:        []string{"fit", "docker-manage"},
@@ -49,7 +49,7 @@ func TestAgentRoundTrip(t *testing.T) {
 	if !ok {
 		t.Fatalf("agent not found")
 	}
-	if got.NodeID != "node-main" || got.Status != model.AgentStatusOnline {
+	if got.NodeID != "node-controller" || got.Status != model.AgentStatusOnline {
 		t.Fatalf("unexpected agent snapshot: %+v", got)
 	}
 }
@@ -60,8 +60,8 @@ func TestNodeAndRuntimeRoundTrip(t *testing.T) {
 
 	now := time.Now().UTC().Truncate(time.Second)
 	node := model.Node{
-		ID:               "node-main",
-		Name:             "Main",
+		ID:               "node-controller",
+		Name:             "Controller Node",
 		Type:             model.NodeTypeLinux,
 		Host:             "127.0.0.1",
 		Status:           model.NodeStatusOnline,
@@ -110,7 +110,7 @@ func TestModelRoundTrip(t *testing.T) {
 		Name:          "local-embed",
 		Provider:      "localfs",
 		BackendType:   model.RuntimeTypeDocker,
-		HostNodeID:    "node-main",
+		HostNodeID:    "node-controller",
 		RuntimeID:     "rt-docker",
 		Endpoint:      "unix:///var/run/docker.sock",
 		State:         model.ModelStateLoaded,
@@ -131,7 +131,7 @@ func TestModelRoundTrip(t *testing.T) {
 	if !ok {
 		t.Fatalf("model not found")
 	}
-	if got.State != model.ModelStateLoaded || got.HostNodeID != "node-main" {
+	if got.State != model.ModelStateLoaded || got.HostNodeID != "node-controller" {
 		t.Fatalf("unexpected model snapshot: %+v", got)
 	}
 	if got.DesiredState != string(model.ModelStateRunning) || got.ObservedState != string(model.ModelStateLoaded) {

@@ -111,6 +111,10 @@ for arg in "$@"; do
       PROFILE_ARGS+=(--profile vllm)
       echo "[INFO] 将一并启动 vLLM 运行模板容器"
       ;;
+    --local-agent)
+      PROFILE_ARGS+=(--profile local-agent)
+      echo "[INFO] 将一并启动 controller 节点本机 agent（local-agent profile）"
+      ;;
     *)
       echo "[WARN] 忽略未知参数: $arg"
       ;;

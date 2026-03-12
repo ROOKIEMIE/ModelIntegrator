@@ -38,10 +38,10 @@ func main() {
 	applyNodePlatformInfo(cfg, gpuReport)
 
 	if err := storage.EnsureSQLitePath(cfg.Storage.SQLitePath); err != nil {
-		log.Error("SQLite 路径准备失败", "path", cfg.Storage.SQLitePath, "error", err)
+		log.Error("controller self-check: SQLite 路径准备失败", "path", cfg.Storage.SQLitePath, "error", err)
 		os.Exit(1)
 	}
-	log.Info("SQLite 路径准备完成", "path", cfg.Storage.SQLitePath)
+	log.Info("controller self-check: SQLite 路径准备完成", "path", cfg.Storage.SQLitePath)
 
 	sqliteStore, err := sqlitestore.Open(cfg.Storage.SQLitePath, log)
 	if err != nil {
@@ -54,14 +54,14 @@ func main() {
 		}
 	}()
 	if err := storage.EnsureDirectory(cfg.Storage.ModelRootDir); err != nil {
-		log.Warn("模型目录检查失败", "path", cfg.Storage.ModelRootDir, "error", err)
+		log.Warn("controller self-check: 模型目录检查失败", "path", cfg.Storage.ModelRootDir, "error", err)
 	} else {
-		log.Info("模型目录就绪", "path", cfg.Storage.ModelRootDir)
+		log.Info("controller self-check: 模型目录就绪", "path", cfg.Storage.ModelRootDir)
 	}
 	if err := storage.EnsureDirectory(cfg.Testing.LogRootDir); err != nil {
-		log.Warn("测试日志目录检查失败", "path", cfg.Testing.LogRootDir, "error", err)
+		log.Warn("controller self-check: 测试日志目录检查失败", "path", cfg.Testing.LogRootDir, "error", err)
 	} else {
-		log.Info("测试日志目录就绪", "path", cfg.Testing.LogRootDir)
+		log.Info("controller self-check: 测试日志目录就绪", "path", cfg.Testing.LogRootDir)
 	}
 
 	nodeRegistry := registry.NewNodeRegistry(cfg.Nodes)
@@ -119,6 +119,9 @@ func main() {
 		os.Exit(1)
 	}
 	taskService := service.NewTaskService(sqliteStore, modelService, log)
+	taskService.SetAgentService(agentService)
+	taskService.SetNodeService(nodeService)
+	modelService.SetTaskService(taskService)
 	testRunService := service.NewTestRunService(sqliteStore, taskService, modelService, log, cfg.Testing.LogRootDir)
 
 	handler := api.NewHandler(nodeService, modelService, runtimeTemplateService, agentService, taskService, testRunService, log, version.Get())

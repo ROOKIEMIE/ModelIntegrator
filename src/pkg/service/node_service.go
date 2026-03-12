@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os/exec"
 	"runtime"
@@ -130,6 +131,60 @@ func (s *NodeService) GetNode(ctx context.Context, id string) (model.Node, bool)
 	return model.Node{}, false
 }
 
+func (s *NodeService) ApplyAgentTaskObservation(ctx context.Context, nodeID string, taskType model.TaskType, success bool, message string, detail map[string]interface{}) error {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return nil
+	}
+	node, ok := s.GetNode(ctx, nodeID)
+	if !ok {
+		return nil
+	}
+
+	now := time.Now().UTC()
+	node.LastSeenAt = now
+	if success {
+		node.Status = model.NodeStatusOnline
+	}
+	metadata := normalizeNodeMetadata(node.Metadata)
+	metadata["last_agent_task_type"] = string(taskType)
+	metadata["last_agent_task_success"] = fmt.Sprintf("%t", success)
+	metadata["last_agent_task_message"] = strings.TrimSpace(message)
+	metadata["last_agent_task_at"] = now.Format(time.RFC3339)
+	if detail != nil {
+		if raw, ok := detail["resource_snapshot_collected_at"]; ok {
+			metadata["resource_snapshot_collected_at"] = strings.TrimSpace(fmt.Sprint(raw))
+		}
+	}
+	node.Metadata = metadata
+
+	runtimeID := ""
+	if detail != nil {
+		runtimeID = strings.TrimSpace(fmt.Sprint(detail["runtime_id"]))
+	}
+	for i := range node.Runtimes {
+		if runtimeID != "" && strings.TrimSpace(node.Runtimes[i].ID) != runtimeID {
+			continue
+		}
+		if running, ok := boolFromTaskDetail(detail, "runtime_running"); ok {
+			if running {
+				node.Runtimes[i].Status = model.RuntimeStatusOnline
+			} else {
+				node.Runtimes[i].Status = model.RuntimeStatusOffline
+			}
+			node.Runtimes[i].LastSeenAt = now
+		}
+	}
+
+	if s.registry != nil {
+		s.registry.Upsert(node)
+	}
+	if s.store != nil {
+		return s.store.UpsertNodeWithRuntimes(ctx, node)
+	}
+	return nil
+}
+
 func (s *NodeService) detectNodeStatus(ctx context.Context, node model.Node) (model.NodeStatus, map[string]model.RuntimeStatus) {
 	runtimeStatuses := make(map[string]model.RuntimeStatus, len(node.Runtimes))
 	if online, checked := s.runtimeHealthCheckFirst(ctx, node, runtimeStatuses); checked {
@@ -159,7 +214,8 @@ func (s *NodeService) detectNodeStatus(ctx context.Context, node model.Node) (mo
 	return model.NodeStatusOffline, runtimeStatuses
 }
 
-// 优先使用 runtime 健康检查来判断节点可用性；只有没有可用 runtime 检查能力时才 fallback 到 ping。
+// 兼容路径：当前仍支持 controller 直接做 runtime 健康检查，
+// 后续应优先通过 agent 节点任务回传本机事实；无 agent 时才 fallback 到本地探测/ping。
 func (s *NodeService) runtimeHealthCheckFirst(ctx context.Context, node model.Node, runtimeStatuses map[string]model.RuntimeStatus) (online bool, checked bool) {
 	for _, rt := range node.Runtimes {
 		if runtimeStatuses != nil {
@@ -408,4 +464,60 @@ func mergeRuntime(base model.Runtime, persisted model.Runtime) model.Runtime {
 		base.LastSeenAt = persisted.LastSeenAt
 	}
 	return base
+}
+
+func normalizeNodeMetadata(raw interface{}) map[string]string {
+	out := map[string]string{}
+	switch v := raw.(type) {
+	case map[string]string:
+		for key, value := range v {
+			k := strings.TrimSpace(key)
+			if k == "" {
+				continue
+			}
+			out[k] = strings.TrimSpace(value)
+		}
+	case map[string]interface{}:
+		for key, value := range v {
+			k := strings.TrimSpace(key)
+			if k == "" {
+				continue
+			}
+			out[k] = strings.TrimSpace(fmt.Sprint(value))
+		}
+	}
+	return out
+}
+
+func boolFromTaskDetail(detail map[string]interface{}, key string) (bool, bool) {
+	if detail == nil {
+		return false, false
+	}
+	raw, ok := detail[key]
+	if !ok {
+		return false, false
+	}
+	switch typed := raw.(type) {
+	case bool:
+		return typed, true
+	case string:
+		switch strings.ToLower(strings.TrimSpace(typed)) {
+		case "1", "true", "yes", "on":
+			return true, true
+		case "0", "false", "no", "off":
+			return false, true
+		default:
+			return false, false
+		}
+	default:
+		value := strings.TrimSpace(fmt.Sprint(raw))
+		switch strings.ToLower(value) {
+		case "1", "true", "yes", "on":
+			return true, true
+		case "0", "false", "no", "off":
+			return false, true
+		default:
+			return false, false
+		}
+	}
 }

@@ -34,7 +34,7 @@ func TestListNodesRuntimeHealthCheckTakesPriority(t *testing.T) {
 
 	svc := newTestNodeService([]model.Node{
 		{
-			ID:   "node-main",
+			ID:   "node-controller",
 			Host: "203.0.113.1",
 			Runtimes: []model.Runtime{
 				{
@@ -67,7 +67,7 @@ func TestListNodesRuntimeFailureDoesNotFallbackToPing(t *testing.T) {
 
 	svc := newTestNodeService([]model.Node{
 		{
-			ID:   "node-main",
+			ID:   "node-controller",
 			Host: "127.0.0.1",
 			Runtimes: []model.Runtime{
 				{
@@ -95,7 +95,7 @@ func TestListNodesRuntimeFailureDoesNotFallbackToPing(t *testing.T) {
 func TestListNodesNoRuntimeAndNoHostReturnsUnknown(t *testing.T) {
 	svc := newTestNodeService([]model.Node{
 		{
-			ID:       "node-main",
+			ID:       "node-controller",
 			Host:     "",
 			Runtimes: nil,
 		},

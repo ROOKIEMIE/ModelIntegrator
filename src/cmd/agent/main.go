@@ -11,7 +11,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -284,6 +287,16 @@ func executeAgentTask(ctx context.Context, client *http.Client, cfg agentConfig,
 			return false, "runtime 未 ready", detail, "runtime not ready"
 		}
 		return true, "runtime readiness 检查通过", detail, ""
+	case model.TaskTypeAgentPortCheck:
+		return executePortCheckTask(task)
+	case model.TaskTypeAgentModelPathCheck:
+		return executeModelPathCheckTask(task)
+	case model.TaskTypeAgentResourceSnapshot:
+		return executeResourceSnapshotTask(task)
+	case model.TaskTypeAgentDockerInspect:
+		return executeDockerInspectTask(ctx, task)
+	case model.TaskTypeAgentRuntimePrecheck:
+		return executeRuntimePrecheckTask(ctx, client, cfg, task)
 	default:
 		return false, "不支持的任务类型", map[string]interface{}{"task_type": string(task.Type)}, "unsupported task type"
 	}
@@ -347,6 +360,313 @@ func checkEndpointReadiness(endpoint, healthPath string, timeout time.Duration) 
 		"http_status": resp.StatusCode,
 	}
 	return resp.StatusCode >= 200 && resp.StatusCode < 300, detail, nil
+}
+
+func executePortCheckTask(task model.Task) (bool, string, map[string]interface{}, string) {
+	endpoint := strings.TrimSpace(stringValue(task.Payload, "endpoint"))
+	if endpoint == "" {
+		host := strings.TrimSpace(stringValue(task.Payload, "host"))
+		port := strings.TrimSpace(stringValue(task.Payload, "port"))
+		if host != "" && port != "" {
+			endpoint = host + ":" + port
+		}
+	}
+	timeout := time.Duration(intValue(task.Payload, "timeout_seconds", 3)) * time.Second
+	open, detail, err := checkEndpointPort(endpoint, timeout)
+	if err != nil {
+		return false, firstNonEmpty(err.Error(), "端口检查失败"), detail, err.Error()
+	}
+	if !open {
+		return false, "端口不可达", detail, "port not reachable"
+	}
+	return true, "端口检查通过", detail, ""
+}
+
+func executeModelPathCheckTask(task model.Task) (bool, string, map[string]interface{}, string) {
+	modelPath := strings.TrimSpace(firstNonEmpty(
+		stringValue(task.Payload, "model_path"),
+		stringValue(task.Payload, "path"),
+	))
+	if modelPath == "" {
+		return false, "缺少 model_path", map[string]interface{}{"model_path": modelPath}, "model_path is empty"
+	}
+	exists, detail, err := checkModelPathExists(modelPath)
+	if err != nil {
+		return false, firstNonEmpty(err.Error(), "模型路径检查失败"), detail, err.Error()
+	}
+	if !exists {
+		return false, "模型路径不存在", detail, "model path not found"
+	}
+	return true, "模型路径检查通过", detail, ""
+}
+
+func executeResourceSnapshotTask(task model.Task) (bool, string, map[string]interface{}, string) {
+	detail := collectResourceSnapshot()
+	detail["task_type"] = string(task.Type)
+	detail["resource_snapshot_collected_at"] = time.Now().UTC().Format(time.RFC3339)
+	return true, "资源快照采集完成", detail, ""
+}
+
+func executeDockerInspectTask(ctx context.Context, task model.Task) (bool, string, map[string]interface{}, string) {
+	containerID := strings.TrimSpace(firstNonEmpty(
+		stringValue(task.Payload, "runtime_container_id"),
+		stringValue(task.Payload, "container_id"),
+		stringValue(task.Payload, "container"),
+	))
+	if containerID == "" {
+		return false, "缺少 runtime_container_id", map[string]interface{}{"task_type": string(task.Type)}, "runtime_container_id is empty"
+	}
+	exists, running, detail, err := inspectDockerContainer(ctx, containerID)
+	if err != nil {
+		return false, "docker inspect 失败", detail, err.Error()
+	}
+	if !exists {
+		detail["observed_state"] = "stopped"
+		return false, "容器不存在", detail, "runtime container not found"
+	}
+	if running {
+		detail["observed_state"] = "running"
+	} else {
+		detail["observed_state"] = "loaded"
+	}
+	return true, "docker inspect 完成", detail, ""
+}
+
+func executeRuntimePrecheckTask(ctx context.Context, client *http.Client, cfg agentConfig, task model.Task) (bool, string, map[string]interface{}, string) {
+	detail := map[string]interface{}{
+		"task_type":       string(task.Type),
+		"execution_path":  "agent",
+		"precheck_target": "runtime",
+	}
+	failures := make([]string, 0, 4)
+
+	endpoint := strings.TrimSpace(stringValue(task.Payload, "endpoint"))
+	modelID := strings.TrimSpace(stringValue(task.Payload, "model_id"))
+	if endpoint == "" && modelID != "" {
+		if resolved, err := fetchModelEndpoint(ctx, client, cfg, modelID); err == nil {
+			endpoint = resolved
+		}
+	}
+	timeout := time.Duration(intValue(task.Payload, "timeout_seconds", 3)) * time.Second
+	healthPath := strings.TrimSpace(stringValue(task.Payload, "health_path"))
+	if healthPath == "" {
+		healthPath = "/health"
+	}
+
+	if endpoint != "" {
+		portOpen, portDetail, err := checkEndpointPort(endpoint, timeout)
+		detail["port_check"] = portDetail
+		if err != nil || !portOpen {
+			failures = append(failures, "port_check_failed")
+		}
+		ready, readyDetail, err := checkEndpointReadiness(endpoint, healthPath, timeout)
+		detail["runtime_readiness"] = readyDetail
+		detail["runtime_ready"] = ready
+		if err != nil || !ready {
+			failures = append(failures, "runtime_readiness_failed")
+		}
+	} else {
+		detail["runtime_ready"] = false
+		failures = append(failures, "endpoint_missing")
+	}
+
+	modelPath := strings.TrimSpace(firstNonEmpty(
+		stringValue(task.Payload, "model_path"),
+		stringValue(task.Payload, "path"),
+	))
+	if modelPath != "" {
+		exists, pathDetail, err := checkModelPathExists(modelPath)
+		detail["model_path_check"] = pathDetail
+		if err != nil || !exists {
+			failures = append(failures, "model_path_check_failed")
+		}
+	}
+
+	containerID := strings.TrimSpace(firstNonEmpty(
+		stringValue(task.Payload, "runtime_container_id"),
+		stringValue(task.Payload, "container_id"),
+		stringValue(task.Payload, "container"),
+	))
+	if containerID != "" {
+		exists, running, inspectDetail, err := inspectDockerContainer(ctx, containerID)
+		detail["docker_inspect"] = inspectDetail
+		detail["runtime_exists"] = exists
+		detail["runtime_running"] = running
+		if err != nil {
+			failures = append(failures, "docker_inspect_failed")
+		} else if !exists {
+			failures = append(failures, "runtime_container_missing")
+		} else if !running {
+			failures = append(failures, "runtime_container_not_running")
+		}
+	}
+
+	resourceSnapshot := collectResourceSnapshot()
+	detail["resource_snapshot"] = resourceSnapshot
+	detail["resource_snapshot_collected_at"] = time.Now().UTC().Format(time.RFC3339)
+
+	if running, ok := detail["runtime_running"].(bool); ok {
+		if running {
+			detail["observed_state"] = "running"
+		} else {
+			detail["observed_state"] = "loaded"
+		}
+	} else if exists, ok := detail["runtime_exists"].(bool); ok && !exists {
+		detail["observed_state"] = "stopped"
+	}
+
+	if len(failures) > 0 {
+		message := "runtime precheck failed: " + strings.Join(failures, ",")
+		detail["precheck_failures"] = failures
+		return false, message, detail, message
+	}
+	return true, "runtime precheck passed", detail, ""
+}
+
+func checkEndpointPort(endpoint string, timeout time.Duration) (bool, map[string]interface{}, error) {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return false, nil, fmt.Errorf("endpoint is empty")
+	}
+	if !strings.HasPrefix(endpoint, "http://") && !strings.HasPrefix(endpoint, "https://") {
+		endpoint = "http://" + endpoint
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return false, nil, fmt.Errorf("parse endpoint failed: %w", err)
+	}
+	hostPort := u.Host
+	if !strings.Contains(hostPort, ":") {
+		if u.Scheme == "https" {
+			hostPort += ":443"
+		} else {
+			hostPort += ":80"
+		}
+	}
+	dialer := &net.Dialer{Timeout: timeout}
+	conn, err := dialer.Dial("tcp", hostPort)
+	if err != nil {
+		return false, map[string]interface{}{"endpoint": endpoint, "host_port": hostPort, "tcp_alive": false}, err
+	}
+	_ = conn.Close()
+	return true, map[string]interface{}{"endpoint": endpoint, "host_port": hostPort, "tcp_alive": true}, nil
+}
+
+func checkModelPathExists(path string) (bool, map[string]interface{}, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false, nil, fmt.Errorf("model_path is empty")
+	}
+	absPath, _ := filepath.Abs(path)
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, map[string]interface{}{
+				"model_path": path,
+				"abs_path":   absPath,
+				"exists":     false,
+			}, nil
+		}
+		return false, map[string]interface{}{"model_path": path, "abs_path": absPath, "exists": false}, err
+	}
+	return true, map[string]interface{}{
+		"model_path": path,
+		"abs_path":   absPath,
+		"exists":     true,
+		"is_dir":     info.IsDir(),
+		"size":       info.Size(),
+	}, nil
+}
+
+func collectResourceSnapshot() map[string]interface{} {
+	hostname, _ := os.Hostname()
+	now := time.Now().UTC()
+	snapshot := map[string]interface{}{
+		"hostname":      hostname,
+		"goos":          runtime.GOOS,
+		"goarch":        runtime.GOARCH,
+		"cpu_count":     runtime.NumCPU(),
+		"goroutine_num": runtime.NumGoroutine(),
+		"collected_at":  now.Format(time.RFC3339),
+	}
+	if memTotalKB, memAvailKB, ok := parseMemInfo(); ok {
+		snapshot["mem_total_kb"] = memTotalKB
+		snapshot["mem_available_kb"] = memAvailKB
+	}
+	return snapshot
+}
+
+func parseMemInfo() (int64, int64, bool) {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0, 0, false
+	}
+	var total, available int64
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "MemTotal:") {
+			_, _ = fmt.Sscanf(line, "MemTotal: %d kB", &total)
+		}
+		if strings.HasPrefix(line, "MemAvailable:") {
+			_, _ = fmt.Sscanf(line, "MemAvailable: %d kB", &available)
+		}
+	}
+	if total <= 0 {
+		return 0, 0, false
+	}
+	return total, available, true
+}
+
+func inspectDockerContainer(ctx context.Context, containerID string) (bool, bool, map[string]interface{}, error) {
+	detail := map[string]interface{}{
+		"runtime_container_id": containerID,
+	}
+	cmd := exec.CommandContext(ctx, "docker", "inspect", containerID)
+	raw, err := cmd.CombinedOutput()
+	if err != nil {
+		message := strings.ToLower(strings.TrimSpace(string(raw)))
+		if strings.Contains(message, "no such object") || strings.Contains(message, "not found") {
+			detail["runtime_exists"] = false
+			detail["runtime_running"] = false
+			return false, false, detail, nil
+		}
+		detail["runtime_exists"] = false
+		detail["runtime_running"] = false
+		detail["error"] = strings.TrimSpace(string(raw))
+		if detail["error"] == "" {
+			detail["error"] = err.Error()
+		}
+		return false, false, detail, fmt.Errorf("docker inspect failed: %w", err)
+	}
+	var parsed []map[string]interface{}
+	if unmarshalErr := json.Unmarshal(raw, &parsed); unmarshalErr != nil {
+		return false, false, detail, fmt.Errorf("parse docker inspect output failed: %w", unmarshalErr)
+	}
+	if len(parsed) == 0 {
+		detail["runtime_exists"] = false
+		detail["runtime_running"] = false
+		return false, false, detail, nil
+	}
+	entry := parsed[0]
+	stateRaw, _ := entry["State"].(map[string]interface{})
+	running, _ := stateRaw["Running"].(bool)
+	status := strings.TrimSpace(fmt.Sprint(stateRaw["Status"]))
+	image := ""
+	if configRaw, ok := entry["Config"].(map[string]interface{}); ok {
+		image = strings.TrimSpace(fmt.Sprint(configRaw["Image"]))
+	}
+	name := strings.TrimPrefix(strings.TrimSpace(fmt.Sprint(entry["Name"])), "/")
+
+	detail["runtime_exists"] = true
+	detail["runtime_running"] = running
+	detail["runtime_status"] = status
+	if name != "" {
+		detail["runtime_container"] = name
+	}
+	if image != "" {
+		detail["runtime_image"] = image
+	}
+	return true, running, detail, nil
 }
 
 func buildAgentMetadata(cfg agentConfig, fitManager *fit.ManagedServe) map[string]string {

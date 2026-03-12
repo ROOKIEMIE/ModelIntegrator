@@ -1,5 +1,72 @@
 # 变更日志
 
+## 2026-03-12
+
+### 架构术语与第一阶段计划修正（controller/agent/managed node）
+
+- 本轮澄清并落地了统一术语：
+  - `controller` = 控制平面
+  - `agent` = 节点执行面
+  - `managed node` = 受管节点
+  - `controller node` 同时是 `managed node`，应运行 local agent
+- 明确系统仅使用 `controller / agent / managed node` 术语，不再保留旧角色命名。
+
+### 为什么 controller 节点也要运行 agent
+
+- 若 controller node 不跑 agent，则本机节点动作会走“特例路径”，与远端节点不一致，导致：
+  - 执行路径分裂
+  - 测试路径分裂
+  - 回归复杂度上升
+- 因此本轮将 controller node 明确建模为 managed node，并优先走 agent 协议链路执行节点本地动作。
+
+### 节点局部动作优先 agent 的落地
+
+- 已补齐/统一 agent 任务类型（第一阶段修正版）：
+  - `agent.runtime_readiness_check`
+  - `agent.runtime_precheck`
+  - `agent.port_check`
+  - `agent.model_path_check`
+  - `agent.resource_snapshot`
+  - `agent.docker_inspect`
+- controller 新增通用 agent node-local 任务入口：
+  - `POST /api/v1/tasks/agent/node-local`
+- TaskService 现在可按 node 自动解析在线 agent 并分发节点本地任务。
+- ModelService 在容器运行时 reconcile 中优先尝试 `agent.runtime_precheck`，失败时才回退 controller 本地检查路径（fallback/compatibility path）。
+
+### controller 最小本机降级自检边界（已收敛）
+
+- controller 启动时仅保留自举所需自检：
+  - 配置读取
+  - SQLite 路径与初始化
+  - 模型目录与测试日志目录检查
+- 启动日志已明确标注为 `controller self-check`，避免与节点执行逻辑混淆。
+
+### 状态反哺与持续 reconcile 同步
+
+- agent 任务上报后，TaskService 会将结果反哺到：
+  - model（readiness/observed/health_message/last_reconciled/drift 语义）
+  - node（last_seen/status/最近 agent 任务元信息，运行时状态可见性）
+- 保持 `desired_state` / `observed_state` / `readiness` 的持续 reconcile 方向，不做大爆炸重构。
+
+### 配置、前端、脚本同步
+
+- 配置层：
+  - 新增 `controller` 配置段（`node_id/node_name/node_host/local_agent_expected/local_agent_id`）。
+  - `nodes` 归一化统一为 `controller/managed`，移除旧角色兼容分支。
+- 前端：
+  - 节点卡片新增架构角色提示（controller + managed node）、本机 agent 期望信息。
+  - 任务列表新增执行路径展示（`agent` / `controller-direct`）。
+- 脚本与编排：
+  - `docker-compose.yml` 新增 `local-agent` profile（controller 本机 agent）。
+  - `scripts/one-click-up.sh` 新增 `--local-agent`。
+  - `scripts/controller_api_smoke.sh` 新增 `agents` 检查，并支持触发 `agent.resource_snapshot` 任务。
+
+### 第一阶段修正版剩余项
+
+- 继续将更多 runtime 细分动作从 controller direct path 下沉为 agent 任务（尤其跨 runtime 的 precheck/conflict 细化）。
+- 完善 controller + remote agent 场景下的稳定性回归与故障注入测试。
+- 补充外围组件联调闭环（Nginx / LiteLLM / 外部 embedding client）并形成更完整的 agent/runtime 协调矩阵。
+
 ## 2026-03-11
 
 ### one-click-up 后前端 502 + 一键 E5 测试失败修复（已验证）
@@ -209,7 +276,7 @@
 
 - 1) 为什么从单控制面演进为 `controller + agent`
   - 单控制面已能覆盖基础管理，但对异构节点可控性不一致。
-  - 从节点的本机能力（资源快照、本地目录、本机下载、本机容器）不应长期依赖中心直接操作。
+  - managed 节点的本机能力（资源快照、本地目录、本机下载、本机容器）不应长期依赖中心直接操作。
   - 采用中心控制 + 节点执行拆分后，可在不破坏现有控制面的前提下渐进增强。
   - 结论：定稿为“controller + 可选 agent + 外部运行时分级接入”。
 
@@ -221,8 +288,8 @@
     - `service_observed`：以健康和指标观测为主
     - `agent_managed`：具备更强本机执行能力
 
-- 3) 为什么从节点 Docker 管理需要 agent
-  - 中央控制器不能假设天然可安全稳定地直管所有从节点 Docker。
+- 3) 为什么managed 节点 Docker 管理需要 agent
+  - 中央控制器不能假设天然可安全稳定地直管所有managed 节点 Docker。
   - 远程直连 Docker 会放大网络暴露、安全边界与运维一致性风险。
   - 结论：需要 Docker 级纳管时，由节点本机 agent 暴露能力并执行动作，controller 负责策略与编排。
 
@@ -423,7 +490,7 @@
   - 新增探针镜像环境变量：`MCP_GPU_PROBE_IMAGE`（默认 `nvidia/cuda:12.4.1-base-ubuntu22.04`）
 
 - 节点平台信息填充增强（`src/cmd/controller/main.go`）
-  - 对所有启用 `docker` runtime 的节点填充平台信息（不再仅限主节点）
+  - 对所有启用 `docker` runtime 的节点填充平台信息（不再仅限controller 节点）
   - Docker 探测 endpoint 优先取 `nodes[].runtimes[]` 中启用的 docker endpoint
 
 - 容器运行权限调整（`Dockerfile`）
@@ -434,7 +501,7 @@
 - 节点列表与模型状态联动（`resources/web/app.js`）
   - 节点卡片新增“已装载模型数”统计（按节点实时计算）
   - 节点卡片新增 Runtime 状态摘要（按 backend 聚合 loaded 数）
-  - 节点标签页新增已装载计数展示（`Main (N)` / `Sub1 (N)`）
+  - 节点标签页新增已装载计数展示（每节点已装载计数）
 
 - 模型动作按钮行为优化（`resources/web/app.js`）
   - `backend_type=lmstudio` 的模型仅展示 `load/unload`
@@ -443,7 +510,7 @@
   - 前端保留节点级动作锁；后端也已补充节点级并发动作锁，避免绕过前端并发提交
 
 - 节点展示信息微调
-  - 节点卡片移除角色显示（`main/sub`），保留名称与描述区分
+  - 节点卡片移除角色显示（`controller/managed`），保留名称与描述区分
 
 ### v0.2-prep 路线计划评估与阶段落地
 
@@ -475,7 +542,7 @@
       - `Runtime` 页签承载现有节点与模型控制台。
       - `Download` 页签当前为空白预留页，用于后续下载任务面板。
   - 使用约束（当前阶段）：
-    - 下载功能仅面向“主节点且具备 docker 能力”的部署场景。
+    - 下载功能仅面向“controller 节点且具备 docker 能力”的部署场景。
     - 若后续扩展到其他运行平台，再评估跨平台下载能力与 UI 适配策略。
 
 ### v0.2-prep vLLM 下载兼容与运行模板补充
@@ -489,7 +556,7 @@
   - 新增 `vllm-runtime` 服务（`profile=vllm`）。
   - 默认参数支持通过环境变量配置模型、服务名、端口、显存占用、最大上下文。
   - 复用 `resources/models` 与 HF 缓存目录，便于与下载容器协同。
-  - 当前定位：面向“主节点 + docker + NVIDIA”场景的运行模板，为后续按模型实例化编排做准备。
+  - 当前定位：面向“controller 节点 + docker + NVIDIA”场景的运行模板，为后续按模型实例化编排做准备。
 
 - 一键脚本与配置示例同步
   - `scripts/one-click-up.sh` 新增 `--vllm` 参数。

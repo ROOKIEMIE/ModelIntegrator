@@ -1,6 +1,6 @@
 # Local LLM Control Plane（Controller）
 
-- 中文（当前）
+- [中文（默认）](./README.md)
 - [English](./README.en.md)
 
 Local LLM Control Plane 是一个本地多节点 LLM 控制平面，用于统一管理 Linux 服务器与局域网 Mac mini 上的模型运行时。
@@ -9,12 +9,60 @@ Local LLM Control Plane 是一个本地多节点 LLM 控制平面，用于统一
 
 Local LLM Control Plane 的定位是“本地多节点 LLM 控制平面”，核心目标是统一管理：
 
-- 主节点上的 Docker 化模型服务
-- 从节点上的 LM Studio / Ollama / vLLM 等运行时
+- controller 节点上的控制平面与可选本地 runtime
+- managed 节点上的 LM Studio / Ollama / vLLM / Docker 等运行时
 - 需要深度纳管的节点（通过 agent）
 - 模型注册、节点注册、运行时注册、状态展示、调度与操作入口
 
 当前以 Linux Server + Docker Compose 作为主部署形态，后续向 `controller + agent + external runtimes` 稳定演进。
+
+## 架构基准（2026-03 第一阶段修正版）
+
+### 术语与角色（强约束）
+
+- `controller`：控制平面，负责全局状态、任务编排、调度决策、统一 API、前端控制台、持久化状态管理。
+- `agent`：节点执行面，运行在每个 managed node 上，负责节点本地执行与事实回传。
+- `managed node`：被纳管节点，每个节点都应运行 agent。
+- `controller node`：承载 controller 的节点；它同时也是一个 managed node，因此也应运行 agent。
+- 架构术语统一为 `controller / agent / managed node`，系统文档与配置仅使用这套术语。
+
+### 职责边界
+
+- controller 负责“决定做什么”：目标状态、全局协调、冲突检测、reconcile 驱动、统一审计。
+- agent 负责“在本机怎么做”：端口检查、路径检查、docker inspect、runtime precheck、资源快照、readiness 检查。
+- 节点局部动作优先下沉给 agent，controller 仅消费 agent 回传结果并做全局判断。
+
+### 同机 Agent 原则
+
+- controller node 也运行 agent（local agent）。
+- controller 与 local agent 尽量复用与远端 agent 相同的任务协议链路。
+- 这样可以统一执行路径，减少“本机特例逻辑”，并显著简化联调与回归测试。
+
+### Controller 最小降级自检边界
+
+- controller 保留极少量本机降级能力，仅用于自举与生存必需检查：
+  - 配置读取与基础参数检查
+  - SQLite 初始化与可写性检查
+  - 必要目录检查（模型目录/测试日志目录）
+  - 启动监听前的最小健康准备
+- 以上能力明确是 `controller self-check / bootstrap fallback`，不能扩展成“controller 代替 agent 执行节点动作”。
+
+### 测试策略（当前阶段）
+
+- 第一优先链路：`controller + local agent`（同机链路）。
+- 第二优先链路：`controller + remote agent`（跨机链路）。
+- 推荐顺序原因：先稳定协议与状态反哺，再扩展网络变量，可显著降低联调复杂度。
+
+### 第一阶段 / 第二阶段修正版计划
+
+- 第一阶段（当前）：
+  - agent 节点执行面增强（`runtime_readiness_check`、`runtime_precheck`、`port_check`、`model_path_check`、`resource_snapshot`、`docker_inspect`）。
+  - agent 结果反哺 model/node/runtime 关键状态（含 readiness/drift 信息）。
+  - controller 持续 reconcile 与 desired/observed 差异解释。
+  - precheck/conflict 以“节点局部事实走 agent、全局协调在 controller”为原则推进。
+- 第二阶段（后续）：
+  - 外围组件联调（Nginx / LiteLLM / 外部 embedding client）。
+  - 更完整的 agent/runtime 协调闭环（远端 agent 扩展、更多 runtime 类型、稳定性与回归体系）。
 
 ## 当前系统形态（2026-03）
 
@@ -28,12 +76,12 @@ Local LLM Control Plane 的定位是“本地多节点 LLM 控制平面”，核
 系统按三层结构演进：
 
 1. 中央控制器（controller）
-- 部署在主节点
+- 部署在 controller node（该节点同时是 managed node）
 - 负责 Web UI、REST API、注册表、调度、审计、统一认证
 - 继续以 Docker Compose 为核心部署方式
 
-2. 节点 agent（可选）
-- 只部署在需要深度纳管的节点
+2. 节点 agent（默认应部署）
+- 应部署在所有 managed node（包括 controller node）
 - 负责本机资源快照、本地目录扫描、本机 Docker 管理、本机下载、运行时桥接、可选 fit 分析
 - 不是第二个控制台，而是轻量本地执行单元
 
@@ -45,7 +93,7 @@ Local LLM Control Plane 的定位是“本地多节点 LLM 控制平面”，核
 
 系统统一采用四类节点：
 
-- `Central Node`：主控制节点，运行 controller，可同时承载本地 runtime
+- `Controller Node`：控制平面节点，运行 controller，且同时是 managed node
 - `Managed Node`：安装 agent，通过 agent 暴露增强能力
 - `Runtime-only Node`：未安装 agent，仅暴露运行时 API
 - `Offline / Catalog Node`：仅登记模型/模板/元信息，不直接承担运行
@@ -155,7 +203,7 @@ src/pkg/
   - `Download` 页签：当前空白预留页
 - 节点列表与模型状态已联动：
   - 节点卡片显示 Runtime 数量、已装载模型数、Runtime 状态摘要
-  - 模型标签页显示每个节点已装载模型数（`Main (N)` / `Sub1 (N)`）
+  - 模型标签页显示每个节点已装载模型数
 - 模型列表支持按节点标签切换，默认显示第一个节点
 - Docker Compose 编排（`nginx` 网关 + `controller`，其余组件作为 `addons` / `download` / `vllm` profile）
 
@@ -176,9 +224,9 @@ src/pkg/
   - 扫描 `storage.model_root_dir` 并自动注册为本地模型（`source=local-scan`）
 
 - 节点角色与连通性：
-  - 首个节点自动归类为 `Main`，其后依次为 `Sub1/Sub2...`
+  - 默认会生成 `controller` 与 `managed` 角色
   - `name` 为系统自动命名，建议将人类可读信息放在 `description`
-  - 从节点在返回 `online` 前会先进行 ICMP 探测
+  - 无 agent 可用时，controller 仍保留最小探测 fallback（runtime/ping）
 
 - 节点硬件信息（当前聚焦 NVIDIA）：
   - 对“启用 docker runtime 的节点”填充平台信息
@@ -203,7 +251,7 @@ src/pkg/
   - `aria2-downloader`
 - vLLM 运行模板容器（`vllm` profile）：
   - `vllm-runtime`（NVIDIA GPU，未来用于模型实例化）
-- 下载功能当前仅面向“主节点且具备 docker 能力”的部署场景
+- 下载功能当前优先面向“controller node 且具备 docker 能力”的部署场景
 - 提供一键启动脚本
 
 ## P0 新增（本次落地）
@@ -248,9 +296,16 @@ src/pkg/
   - `GET /api/v1/agents/{id}/tasks/next`
   - `POST /api/v1/agents/{id}/tasks/{taskID}/report`
   - `POST /api/v1/tasks/agent/runtime-readiness`
+  - `POST /api/v1/tasks/agent/node-local`
 - agent 新增任务轮询执行循环（默认 `AGENT_TASK_POLL_SECONDS=5`）。
-- 已实现真实任务类型：`agent.runtime_readiness_check`（端口连通 + HTTP health 检查）。
-- 任务结果会回写 SQLite，并更新对应模型 readiness 信息。
+- 第一阶段已补齐任务类型：
+  - `agent.runtime_readiness_check`
+  - `agent.runtime_precheck`
+  - `agent.port_check`
+  - `agent.model_path_check`
+  - `agent.resource_snapshot`
+  - `agent.docker_inspect`
+- 任务结果会回写 SQLite，并反哺 model/node 的 readiness/health/observed 信息。
 
 ### 5. 独立测试工具链（testsystem）
 
@@ -313,6 +368,9 @@ chmod 666 resources/config/controller.db
 
 # 启动核心 + addons + 下载容器 + vLLM 模板容器
 ./scripts/one-click-up.sh --addons --download --vllm
+
+# 启动核心 + controller 本机 agent（推荐用于同机联调）
+./scripts/one-click-up.sh --local-agent
 ```
 
 验证：
@@ -431,11 +489,10 @@ ${TEST_LOG_ROOT_HOST:-./testsystem/logs}:/workspace/test-logs
 
 ## nodes 配置说明（重要）
 
-- `nodes` 中的 `id` 不再要求手动维护，系统会按顺序自动生成。
-- 第 1 个节点自动为主节点：`Main`（`id=node-main`）。
-- 第 2..N 个节点自动为从节点：`Sub1/Sub2...`（`id=node-sub-1/node-sub-2...`）。
-- 建议在配置中使用 `description` 描述节点含义。
-- 说明：`Main/Sub` 是当前配置生成与 UI 展示别名；架构分层上的正式分类以 `Central/Managed/Runtime-only/Offline` 为准。
+- 推荐显式配置 `controller.node_id/node_name/node_host`，用于声明 controller node 与本机 agent 绑定关系。
+- `nodes` 中的 `id` 建议显式填写（例如：`node-controller`、`node-managed-*`），避免跨环境歧义。
+- 若省略 `role`，系统会默认第一个节点为 `controller`，其余为 `managed`。
+- 节点角色仅使用 `controller/managed`；推荐在配置中显式声明，避免环境歧义。
 
 ## LM Studio 兼容说明（重要）
 
@@ -450,13 +507,13 @@ ${TEST_LOG_ROOT_HOST:-./testsystem/logs}:/workspace/test-logs
 - 容器下载能力通过 compose `download` profile 启用。
 - `hf-downloader` 可直接下载 vLLM 所需的 Hugging Face 模型权重（如 safetensors）。
 - `aria2-downloader` 用于直链文件下载（如模型分片或镜像文件）。
-- 该能力当前仅在“主节点且存在 docker runtime”的部署场景下支持。
+- 该能力当前优先面向“controller node 存在 docker runtime”的部署场景。
 - 若后续扩展到非 docker 平台，将按平台能力单独设计下载路径与适配器。
 
 ## vLLM 容器说明（新增）
 
 - compose 提供 `vllm` profile 下的 `vllm-runtime` 模板容器。
-- 仅适用于“主节点 + Docker + NVIDIA Container Toolkit”场景。
+- 当前优先适用于“controller node + Docker + NVIDIA Container Toolkit”场景。
 - 默认会将模型下载/读取目录指向 `./resources/models`，并复用 HF cache。
 
 ## 运行时模板扩展（新增）
@@ -511,6 +568,16 @@ ${TEST_LOG_ROOT_HOST:-./testsystem/logs}:/workspace/test-logs
 - `POST /api/v1/agents/register`
 - `POST /api/v1/agents/{id}/heartbeat`
 - `POST /api/v1/agents/{id}/capabilities`
+- `GET /api/v1/agents/{id}/tasks/next`
+- `POST /api/v1/agents/{id}/tasks/{taskID}/report`
+- `GET /api/v1/tasks`
+- `GET /api/v1/tasks/{id}`
+- `POST /api/v1/tasks/runtime/start`
+- `POST /api/v1/tasks/runtime/stop`
+- `POST /api/v1/tasks/runtime/restart`
+- `POST /api/v1/tasks/runtime/refresh`
+- `POST /api/v1/tasks/agent/runtime-readiness`
+- `POST /api/v1/tasks/agent/node-local`
 
 节点接口新增字段（`GET /api/v1/nodes`）：
 

@@ -45,6 +45,35 @@ services:
       - mcp_net
     restart: unless-stopped
 
+  local-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: controller-local-agent
+    profiles:
+      - local-agent
+    depends_on:
+      - controller
+    command: ["/opt/controller/agent"]
+    environment:
+      AGENT_CONTROLLER_ENDPOINT: "http://controller:8080"
+      AGENT_AUTH_TOKEN: ${MCP_AUTH_TOKEN:-}
+      AGENT_NODE_ID: ${MCP_CONTROLLER_NODE_ID:-node-controller}
+      AGENT_ID: ${MCP_CONTROLLER_LOCAL_AGENT_ID:-agent-controller-local}
+      AGENT_HOST: ${MCP_CONTROLLER_NODE_HOST:-127.0.0.1}
+      AGENT_TASK_POLL_SECONDS: ${AGENT_TASK_POLL_SECONDS:-5}
+      AGENT_HEARTBEAT_SECONDS: ${AGENT_HEARTBEAT_SECONDS:-15}
+      AGENT_CAPABILITIES: ${AGENT_CAPABILITIES:-resource-snapshot,docker-manage,port-check,path-check}
+    volumes:
+      - ${MCP_PROJECT_DIR:-.}/resources:/opt/controller/resources
+      - ${MCP_MODEL_DIR_HOST:-./resources/models}:${MCP_MODEL_ROOT_DIR:-/opt/controller/models}:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - "${MCP_DOCKER_GID:-998}"
+    networks:
+      - mcp_net
+    restart: unless-stopped
+
   portainer:
     image: portainer/portainer-ce:2.21.5
     container_name: mcp-portainer
@@ -99,7 +128,7 @@ services:
       - mcp_net
     restart: unless-stopped
 
-  # Download 功能容器（仅在具备 docker 的主节点场景下启用）
+  # Download 功能容器（当前优先面向 controller node 的 docker 场景）
   hf-downloader:
     image: python:3.11-alpine
     container_name: mcp-hf-downloader

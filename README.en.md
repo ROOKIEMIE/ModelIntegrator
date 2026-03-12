@@ -5,6 +5,54 @@
 
 Local LLM Control Plane is a local multi-node LLM control plane for Linux server + LAN Mac mini runtime management.
 
+## Architecture Baseline (Phase-1 Revised, 2026-03)
+
+### Terms and Roles (authoritative)
+
+- `controller`: control plane; owns global state, orchestration, scheduling decisions, unified APIs, web console, and persistence.
+- `agent`: node execution plane; runs on every managed node and executes node-local actions.
+- `managed node`: any managed host in the fleet; each managed node should run an agent.
+- `controller node`: the host running controller; it is also a managed node and should run a local agent.
+- Primary architecture terms are `controller / agent / managed node` and the system uses these terms end-to-end.
+
+### Responsibility Boundaries
+
+- Controller decides what should happen: desired state, global coordination, conflict handling, reconcile loops.
+- Agent decides how to execute locally: runtime precheck/readiness, port checks, path checks, docker inspect, resource snapshots.
+- Node-local facts should be collected by agent first; controller consumes reports and performs global decisions.
+
+### Local-Agent Principle
+
+- The controller node also runs an agent.
+- The controller-to-local-agent flow should reuse the same protocol path as controller-to-remote-agent.
+- This keeps execution paths unified and reduces test/debug complexity.
+
+### Minimal Controller Fallback Self-Checks
+
+- Controller keeps only bootstrap-survival self-checks:
+  - config readability
+  - SQLite initialization and writeability
+  - required directories
+  - required listener/bootstrap checks
+- These are explicitly `controller self-check / bootstrap fallback` paths, not a replacement for agent execution.
+
+### Testing Strategy
+
+- First stabilize `controller + local agent` (same-host path).
+- Then expand to `controller + remote agent` (cross-host path).
+- This order reduces variables and speeds up regression/debug cycles.
+
+### Revised Phase Plan
+
+- Phase 1 (current):
+  - Strengthen agent node execution plane (`agent.runtime_readiness_check`, `agent.runtime_precheck`, `agent.port_check`, `agent.model_path_check`, `agent.resource_snapshot`, `agent.docker_inspect`).
+  - Feed agent results back into node/runtime/model state (including readiness and drift context).
+  - Continue desired-vs-observed reconcile loops in controller.
+  - Keep precheck/conflict split clear: node-local facts via agent, global decisions via controller.
+- Phase 2 (next):
+  - Peripheral integration hardening (Nginx / LiteLLM / external embedding client).
+  - Richer agent/runtime coordination for remote nodes and expanded runtime coverage.
+
 ## Implementation Snapshot
 
 - Go backend + unified REST API + static web console
@@ -15,7 +63,7 @@ Local LLM Control Plane is a local multi-node LLM control plane for Linux server
   - `Download`: currently an empty reserved page
 - Node list and model state are now synchronized:
   - Node cards show runtime count, loaded model count, and runtime status summary
-  - Model tabs show loaded model count per node (`Main (N)` / `Sub1 (N)`)
+  - Model tabs show loaded model count per node
 - Model list supports node tabs, with the first node selected by default
 - Docker Compose stack (`nginx` gateway + `controller`, other services via `addons` / `download` / `vllm` profiles)
 
@@ -37,9 +85,9 @@ Local LLM Control Plane is a local multi-node LLM control plane for Linux server
   - scans `storage.model_root_dir` and auto-registers local models (`source=local-scan`)
 
 - Node role and connectivity:
-  - first node is auto-assigned `Main`, following nodes become `Sub1/Sub2...`
+  - node roles are normalized to `controller` / `managed`
   - `name` is system-generated; use `description` for human-readable info
-  - sub-nodes are ICMP-checked before returning `online`
+  - when agent data is unavailable, controller keeps a minimal runtime/ping fallback probe
 
 - Node hardware info (currently NVIDIA-focused):
   - platform info is filled for nodes with enabled docker runtime
@@ -64,7 +112,7 @@ Local LLM Control Plane is a local multi-node LLM control plane for Linux server
   - `aria2-downloader`
 - vLLM runtime template container via `vllm` profile:
   - `vllm-runtime` (NVIDIA GPU, for future model instance orchestration)
-- Download capability currently targets deployments where the main node has docker runtime
+- Download capability currently targets deployments where the controller node has docker runtime
 - One-click startup scripts included
 
 ## P0 Additions (Current Delivery)
@@ -104,7 +152,17 @@ Local LLM Control Plane is a local multi-node LLM control plane for Linux server
 
 - Added controller-agent task protocol and task report path.
 - Added agent-side polling execution loop.
-- Implemented a real task type: runtime readiness check.
+- Added agent task APIs:
+  - `POST /api/v1/tasks/agent/runtime-readiness`
+  - `POST /api/v1/tasks/agent/node-local`
+- Phase-1 task types now include:
+  - `agent.runtime_readiness_check`
+  - `agent.runtime_precheck`
+  - `agent.port_check`
+  - `agent.model_path_check`
+  - `agent.resource_snapshot`
+  - `agent.docker_inspect`
+- Agent task reports are persisted and fed back into model/node readiness and health context.
 
 ### 5) Isolated testing toolchain (`testsystem/`)
 
@@ -162,6 +220,9 @@ chmod 666 resources/config/controller.db
 
 # Core + addons + download containers + vLLM template runtime
 ./scripts/one-click-up.sh --addons --download --vllm
+
+# Core + controller local agent (recommended for same-host link)
+./scripts/one-click-up.sh --local-agent
 ```
 
 Verify:
@@ -214,9 +275,9 @@ Stop:
 - `MCP_VLLM_MAX_MODEL_LEN` (vLLM max context length)
 - `HUGGING_FACE_HUB_TOKEN` (optional token for private/gated HF models)
 
-## Main Compose vs Test Compose
+## Primary Compose vs Test Compose
 
-- Main system: `docker-compose.yml`
+- Primary system: `docker-compose.yml`
   - Runs controller/nginx and optional addons/download/vllm profiles.
   - Serves production runtime, web console, and APIs.
 - Test system: `testsystem/docker-compose.test.yml`
@@ -280,9 +341,10 @@ Each run writes into `<log-root>/<run-id>/` with `run.log` and `summary.json`.
 
 ## nodes Config Notes (Important)
 
-- Manual `id` is no longer required in `nodes`.
-- The first node is automatically `Main` (`id=node-main`).
-- Nodes after that are `Sub1/Sub2...` (`id=node-sub-1/node-sub-2...`).
+- Configure `controller.node_id/node_name/node_host` to explicitly define the controller node (which is also a managed node).
+- Explicit node IDs are recommended (for example `node-controller`, `node-managed-*`) to avoid cross-env ambiguity.
+- If `role` is omitted, the first node is normalized as `controller` and the rest as `managed`.
+- Node roles should be declared as `controller/managed` only.
 - Use `description` for human-readable node description.
 
 ## LM Studio Compatibility Notes (Important)
@@ -298,13 +360,13 @@ Each run writes into `<log-root>/<run-id>/` with `run.log` and `summary.json`.
 - Download containers are enabled by compose `download` profile.
 - `hf-downloader` can fetch Hugging Face model artifacts used by vLLM (for example, safetensors checkpoints).
 - `aria2-downloader` is for direct-link artifact downloads.
-- This capability is currently intended for deployments where the main node has docker runtime.
+- This capability is currently intended for deployments where the controller node has docker runtime.
 - If non-docker platforms are supported in future, a separate downloader path will be designed.
 
 ## vLLM Runtime Notes (New)
 
 - Compose now includes `vllm-runtime` under the `vllm` profile.
-- It is intended for `main node + docker + NVIDIA Container Toolkit`.
+- It is currently intended for `controller node + docker + NVIDIA Container Toolkit`.
 - It uses `./resources/models` as model storage and reuses the HF cache path.
 
 ## Runtime Template Extensibility (New)
@@ -355,11 +417,20 @@ Example payload:
 - `GET /api/v1/runtime-templates`
 - `POST /api/v1/runtime-templates/validate`
 - `POST /api/v1/runtime-templates`
+- `GET /api/v1/agents`
+- `POST /api/v1/agents/register`
+- `POST /api/v1/agents/{id}/heartbeat`
+- `POST /api/v1/agents/{id}/capabilities`
+- `GET /api/v1/agents/{id}/tasks/next`
+- `POST /api/v1/agents/{id}/tasks/{taskID}/report`
 - `GET /api/v1/tasks`
 - `GET /api/v1/tasks/{id}`
 - `POST /api/v1/tasks/runtime/start`
 - `POST /api/v1/tasks/runtime/stop`
+- `POST /api/v1/tasks/runtime/restart`
 - `POST /api/v1/tasks/runtime/refresh`
+- `POST /api/v1/tasks/agent/runtime-readiness`
+- `POST /api/v1/tasks/agent/node-local`
 - `GET /api/v1/test-runs`
 - `GET /api/v1/test-runs/{id}`
 - `POST /api/v1/test-runs`

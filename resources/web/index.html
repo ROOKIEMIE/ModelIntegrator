@@ -9,7 +9,7 @@
   <body>
     <header>
       <h1>Controller（Local LLM Control Plane）</h1>
-      <p>本地多节点模型管理控制台</p>
+      <p>本地多节点模型管理控制台（controller 控制平面 + agent 节点执行面）</p>
     </header>
 
     <div class="page-tabs" id="page-tabs">
@@ -26,6 +26,7 @@
       <main id="runtime-list-view">
         <section class="panel panel-nodes">
           <h2>节点列表</h2>
+          <div class="meta">术语约定：所有 managed node（含 controller node）都应运行 agent，节点局部动作优先由 agent 执行。</div>
           <div id="nodes">加载中...</div>
         </section>
 

@@ -20,8 +20,8 @@ const (
 type NodeRole string
 
 const (
-	NodeRoleMain NodeRole = "main"
-	NodeRoleSub  NodeRole = "sub"
+	NodeRoleController NodeRole = "controller"
+	NodeRoleManaged    NodeRole = "managed"
 )
 
 type NodeClassification string
@@ -120,6 +120,11 @@ const (
 	TaskTypeRuntimeRestart        TaskType = "runtime.restart"
 	TaskTypeRuntimeRefresh        TaskType = "runtime.refresh"
 	TaskTypeAgentRuntimeReadiness TaskType = "agent.runtime_readiness_check"
+	TaskTypeAgentRuntimePrecheck  TaskType = "agent.runtime_precheck"
+	TaskTypeAgentPortCheck        TaskType = "agent.port_check"
+	TaskTypeAgentModelPathCheck   TaskType = "agent.model_path_check"
+	TaskTypeAgentResourceSnapshot TaskType = "agent.resource_snapshot"
+	TaskTypeAgentDockerInspect    TaskType = "agent.docker_inspect"
 )
 
 type TaskTargetType string

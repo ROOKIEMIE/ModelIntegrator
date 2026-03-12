@@ -28,7 +28,216 @@ const state = {
   activeRuntimeTab: "list",
   nodeActionLocks: {},
   apiToken: "",
+  nodeIdAliases: {},
 };
+
+function normalizeNodeRole(rawRole, metadata = {}) {
+  const role = String(rawRole || "").trim().toLowerCase();
+  if (role === "controller" || role === "managed") {
+    return role;
+  }
+  if (String(metadata.controller_node || "").toLowerCase() === "true") {
+    return "controller";
+  }
+  return "managed";
+}
+
+function normalizeNodeSuffix(rawID) {
+  const id = String(rawID || "").trim();
+  if (!id) {
+    return "local";
+  }
+  const plain = id.startsWith("node-") ? id.slice("node-".length) : id;
+  const suffix = plain
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  if (!suffix || suffix === "controller" || suffix === "managed") {
+    return "local";
+  }
+  if (suffix === "sub") {
+    return "local";
+  }
+  if (suffix.startsWith("sub-")) {
+    return suffix.slice("sub-".length) || "local";
+  }
+  if (suffix.startsWith("managed-")) {
+    return suffix.slice("managed-".length) || "local";
+  }
+  if (suffix.startsWith("controller-")) {
+    return suffix.slice("controller-".length) || "local";
+  }
+  return suffix;
+}
+
+function normalizeNodeID(rawID, normalizedRole) {
+  if (normalizedRole === "controller") {
+    return "node-controller";
+  }
+  const id = String(rawID || "").trim();
+  if (id.startsWith("node-managed-")) {
+    return id;
+  }
+  const suffix = normalizeNodeSuffix(id);
+  return `node-managed-${suffix}`;
+}
+
+function normalizeNodeReference(rawID) {
+  const id = String(rawID || "").trim();
+  if (!id) {
+    return "";
+  }
+  if (state.nodeIdAliases[id]) {
+    return state.nodeIdAliases[id];
+  }
+  if (id === "node-controller" || id.startsWith("node-managed-")) {
+    return id;
+  }
+  return id;
+}
+
+function normalizeNodeText(rawText) {
+  const text = String(rawText || "");
+  if (!text) {
+    return "";
+  }
+  let normalized = text;
+  Object.keys(state.nodeIdAliases).forEach((legacyID) => {
+    const canonicalID = state.nodeIdAliases[legacyID];
+    if (!legacyID || legacyID === canonicalID) {
+      return;
+    }
+    normalized = normalized.split(legacyID).join(canonicalID);
+  });
+  return normalized;
+}
+
+function normalizeNodeName(rawName, normalizedID, normalizedRole) {
+  const name = normalizeNodeText(rawName).trim();
+  if (normalizedRole === "controller" || normalizedID === "node-controller") {
+    return "Controller Node";
+  }
+  if (normalizedID.startsWith("node-managed-")) {
+    const suffix = normalizedID.slice("node-managed-".length);
+    return suffix ? `Managed Node ${suffix}` : "Managed Node";
+  }
+  return normalizeNodeText(name) || normalizedID || "-";
+}
+
+function normalizeNodeRecord(node) {
+  if (!node || typeof node !== "object") {
+    return node;
+  }
+  const metadata = node.metadata && typeof node.metadata === "object" ? node.metadata : {};
+  const rawID = String(node.id || "").trim();
+  const normalizedRole = normalizeNodeRole(node.role, metadata);
+  const normalizedID = normalizeNodeID(rawID, normalizedRole);
+  return {
+    ...node,
+    __raw_id: rawID,
+    id: normalizedID,
+    role: normalizedRole,
+    name: normalizeNodeName(node.name, normalizedID, normalizedRole),
+  };
+}
+
+function nodeRecordScore(node) {
+  if (!node || typeof node !== "object") {
+    return 0;
+  }
+  let score = 0;
+  if (String(node.__raw_id || "") === String(node.id || "")) {
+    score += 20;
+  }
+  if (String(node.status || "").trim() && String(node.status || "").toLowerCase() !== "unknown") {
+    score += 5;
+  }
+  if (String(node.agent_status || "").trim() && String(node.agent_status || "").toLowerCase() !== "none") {
+    score += 5;
+  }
+  if (String(node.host || "").trim()) {
+    score += 4;
+  }
+  if (String(node.name || "").trim()) {
+    score += 3;
+  }
+  if (Array.isArray(node.runtimes)) {
+    score += Math.min(node.runtimes.length, 5);
+  }
+  if (String(node.last_seen_at || "").trim()) {
+    score += 2;
+  }
+  return score;
+}
+
+function mergeNodeRecords(current, candidate) {
+  const currentScore = nodeRecordScore(current);
+  const candidateScore = nodeRecordScore(candidate);
+  const preferred = candidateScore >= currentScore ? candidate : current;
+  const secondary = preferred === candidate ? current : candidate;
+
+  const preferredMetadata = preferred.metadata && typeof preferred.metadata === "object" ? preferred.metadata : {};
+  const secondaryMetadata = secondary.metadata && typeof secondary.metadata === "object" ? secondary.metadata : {};
+
+  return {
+    ...secondary,
+    ...preferred,
+    metadata: {
+      ...secondaryMetadata,
+      ...preferredMetadata,
+    },
+    platform: preferred.platform || secondary.platform,
+    agent: preferred.agent || secondary.agent,
+    runtimes: Array.isArray(preferred.runtimes) && preferred.runtimes.length > 0 ? preferred.runtimes : secondary.runtimes,
+  };
+}
+
+function buildNodeIdentityKey(node) {
+  if (!node || typeof node !== "object") {
+    return "";
+  }
+  const metadata = node.metadata && typeof node.metadata === "object" ? node.metadata : {};
+  const host = String(node.host || metadata.hostname || metadata.host || "").trim().toLowerCase();
+  if (!host) {
+    return "";
+  }
+  return host;
+}
+
+function normalizeModelRecord(model) {
+  if (!model || typeof model !== "object") {
+    return model;
+  }
+  return {
+    ...model,
+    host_node_id: normalizeNodeReference(model.host_node_id),
+  };
+}
+
+function normalizeTaskRecord(task) {
+  if (!task || typeof task !== "object") {
+    return task;
+  }
+  const detail = task.detail && typeof task.detail === "object" ? { ...task.detail } : task.detail;
+  if (detail && typeof detail === "object") {
+    if (typeof detail.execution_worker === "string") {
+      detail.execution_worker = normalizeNodeText(detail.execution_worker);
+    }
+    if (typeof detail.node_id === "string") {
+      detail.node_id = normalizeNodeReference(detail.node_id);
+    }
+  }
+  return {
+    ...task,
+    worker_id: normalizeNodeText(task.worker_id),
+    assigned_agent_id: normalizeNodeText(task.assigned_agent_id),
+    target_id: normalizeNodeReference(task.target_id) || normalizeNodeText(task.target_id),
+    message: normalizeNodeText(task.message),
+    error: normalizeNodeText(task.error),
+    detail,
+  };
+}
 
 function showToast(text) {
   let toast = document.getElementById("toast");
@@ -115,12 +324,21 @@ function renderNodes() {
     const runtimeSummary = summarizeRuntimeLoad(node);
     const agentStatus = node.agent_status || (node.agent && node.agent.status) || "none";
     const heartbeatAt = (node.agent && node.agent.last_heartbeat_at) || node.last_seen_at;
+    const role = String(node.role || "").trim().toLowerCase();
+    const metadata = node.metadata && typeof node.metadata === "object" ? node.metadata : {};
+    const isControllerNode = role === "controller" || String(metadata.controller_node || "").toLowerCase() === "true";
+    const managedNodeRaw = String(metadata.managed_node || "").toLowerCase();
+    const isManagedNode = managedNodeRaw === "" || managedNodeRaw === "true";
+    const localAgentExpected = String(metadata.local_agent_expected || "").toLowerCase();
+    const localAgentHint = localAgentExpected === "true" ? "应运行本机 agent" : localAgentExpected === "false" ? "本机 agent 非强制" : "-";
+    const architectureRole = isControllerNode && isManagedNode ? "controller + managed node" : isControllerNode ? "controller" : isManagedNode ? "managed node" : "unknown";
     const item = document.createElement("div");
     item.className = "list-item";
     item.innerHTML = `
       <div class="item-title">${escapeHTML(node.name)} (${escapeHTML(node.id)})</div>
       <div class="meta">描述: ${escapeHTML(node.description || "-")}</div>
-      <div class="meta">分类: ${escapeHTML(node.classification || "-")} | 状态: ${escapeHTML(node.status || "unknown")} | 类型: ${escapeHTML(node.type || "-")} | 主机: ${escapeHTML(node.host || "-")}</div>
+      <div class="meta">架构角色: ${escapeHTML(architectureRole)} | 分类: ${escapeHTML(node.classification || "-")} | 状态: ${escapeHTML(node.status || "unknown")} | 类型: ${escapeHTML(node.type || "-")} | 主机: ${escapeHTML(node.host || "-")}</div>
+      <div class="meta">角色字段: ${escapeHTML(node.role || "-")} | Managed Node: ${isManagedNode ? "yes" : "no"} | 本机 Agent 期望: ${escapeHTML(localAgentHint)}</div>
       <div class="meta">能力分级: ${escapeHTML(node.capability_tier || "unknown")} | 能力来源: ${escapeHTML(node.capability_source || "unknown")} | 操作级别: ${escapeHTML(node.operation_level || "-")}</div>
       <div class="meta">Agent 状态: ${escapeHTML(agentStatus)} | 最近心跳: ${escapeHTML(formatTime(heartbeatAt))}</div>
       <div class="meta">能力说明: ${escapeHTML(node.capability_note || "-")}</div>
@@ -256,12 +474,14 @@ function renderTasks() {
   state.tasks.slice(0, 10).forEach((task) => {
     const item = document.createElement("div");
     item.className = "list-item";
-    const detail = task.detail && typeof task.detail === "object" ? JSON.stringify(task.detail) : "";
+    const detailRaw = task.detail && typeof task.detail === "object" ? JSON.stringify(task.detail) : "";
+    const detail = normalizeNodeText(detailRaw);
+    const executionPath = task.detail && typeof task.detail === "object" ? String(task.detail.execution_path || "").trim() : "";
     item.innerHTML = `
       <div class="item-title">${escapeHTML(task.type)} (${escapeHTML(task.id)})</div>
       <div class="meta">状态: ${statusPill(task.status)} | 进度: ${escapeHTML(String(task.progress || 0))}%</div>
       <div class="meta">目标: ${escapeHTML(task.target_type || "-")} / ${escapeHTML(task.target_id || "-")}</div>
-      <div class="meta">执行者: ${escapeHTML(task.worker_id || task.assigned_agent_id || "-")} | 开始: ${escapeHTML(formatTime(task.started_at))} | 结束: ${escapeHTML(formatTime(task.finished_at))}</div>
+      <div class="meta">执行者: ${escapeHTML(task.worker_id || task.assigned_agent_id || "-")} | 执行路径: ${escapeHTML(executionPath || "controller-direct")} | 开始: ${escapeHTML(formatTime(task.started_at))} | 结束: ${escapeHTML(formatTime(task.finished_at))}</div>
       <div class="meta">消息: ${escapeHTML(task.message || "-")}</div>
       <div class="meta">错误: ${escapeHTML(task.error || "-")}</div>
       <div class="meta">明细: ${escapeHTML(detail || "-")}</div>
@@ -663,8 +883,61 @@ function renderModels() {
 
 async function loadNodes() {
   const nodes = await requestJSON("/api/v1/nodes");
-  state.nodes = Array.isArray(nodes) ? nodes : [];
-  if (!state.activeNodeId && state.nodes.length > 0) {
+  const normalizedNodes = Array.isArray(nodes) ? nodes.map((node) => normalizeNodeRecord(node)) : [];
+  const aliases = {};
+  const groupedByIdentity = new Map();
+  const mergedByCanonicalID = new Map();
+
+  normalizedNodes.forEach((node) => {
+    const identityKey = buildNodeIdentityKey(node);
+    const groupKey = identityKey || `id:${node.id}`;
+    if (!groupedByIdentity.has(groupKey)) {
+      groupedByIdentity.set(groupKey, []);
+    }
+    groupedByIdentity.get(groupKey).push(node);
+  });
+
+  groupedByIdentity.forEach((group) => {
+    if (!Array.isArray(group) || group.length === 0) {
+      return;
+    }
+    let merged = group[0];
+    for (let i = 1; i < group.length; i += 1) {
+      merged = mergeNodeRecords(merged, group[i]);
+    }
+    const canonicalID = merged.id;
+    const existing = mergedByCanonicalID.get(canonicalID);
+    mergedByCanonicalID.set(canonicalID, existing ? mergeNodeRecords(existing, merged) : merged);
+
+    group.forEach((node) => {
+      aliases[node.id] = canonicalID;
+      if (node.__raw_id) {
+        aliases[node.__raw_id] = canonicalID;
+      }
+    });
+  });
+
+  const dedupedNodes = Array.from(mergedByCanonicalID.values()).sort((a, b) => {
+    if (a.id === "node-controller" && b.id !== "node-controller") {
+      return -1;
+    }
+    if (b.id === "node-controller" && a.id !== "node-controller") {
+      return 1;
+    }
+    return String(a.name || a.id).localeCompare(String(b.name || b.id));
+  });
+  dedupedNodes.forEach((node) => {
+    aliases[node.id] = node.id;
+  });
+  state.nodeIdAliases = aliases;
+  state.nodes = dedupedNodes.map((node) => {
+    const out = { ...node };
+    delete out.__raw_id;
+    return out;
+  });
+  state.activeNodeId = normalizeNodeReference(state.activeNodeId);
+  const activeNodeExists = state.nodes.some((node) => node.id === state.activeNodeId);
+  if ((!state.activeNodeId || !activeNodeExists) && state.nodes.length > 0) {
     state.activeNodeId = state.nodes[0].id;
   }
 }
@@ -673,7 +946,7 @@ async function loadModels(options = {}) {
   const refresh = Boolean(options.refresh);
   const path = refresh ? "/api/v1/models?refresh=true" : "/api/v1/models";
   const models = await requestJSON(path);
-  state.models = Array.isArray(models) ? models : [];
+  state.models = Array.isArray(models) ? models.map((model) => normalizeModelRecord(model)) : [];
 }
 
 async function loadRuntimeTemplates() {
@@ -683,12 +956,18 @@ async function loadRuntimeTemplates() {
 
 async function loadTasks() {
   const tasks = await requestJSON("/api/v1/tasks?limit=20");
-  state.tasks = Array.isArray(tasks) ? tasks : [];
+  state.tasks = Array.isArray(tasks) ? tasks.map((task) => normalizeTaskRecord(task)) : [];
 }
 
 async function loadTestRuns() {
   const runs = await requestJSON("/api/v1/test-runs?limit=20");
-  state.testRuns = Array.isArray(runs) ? runs : [];
+  state.testRuns = Array.isArray(runs)
+    ? runs.map((run) => ({
+        ...run,
+        summary: normalizeNodeText(run.summary),
+        error: normalizeNodeText(run.error),
+      }))
+    : [];
 }
 
 function bindTestActions() {
@@ -741,7 +1020,8 @@ function bindTestActions() {
     state.apiToken = resolveAPIToken();
 
     let runtimeTemplatesLoadFailed = false;
-    await Promise.all([loadNodes(), loadModels(), loadTasks(), loadTestRuns()]);
+    await loadNodes();
+    await Promise.all([loadModels(), loadTasks(), loadTestRuns()]);
     try {
       await loadRuntimeTemplates();
     } catch (err) {

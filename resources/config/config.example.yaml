@@ -19,6 +19,13 @@ testing:
 auth:
   token: ""
 
+controller:
+  node_id: "node-controller"
+  node_name: "Controller Node"
+  node_host: "192.168.50.102"
+  local_agent_expected: true
+  local_agent_id: "agent-controller-local"
+
 integrations:
   lmstudio:
     enabled: true
@@ -36,26 +43,42 @@ integrations:
     token: ""
 
 nodes:
-  - description: "Linux Server"
+  - id: "node-controller"
+    name: "Controller Node"
+    role: "controller"
+    description: "Controller Node（同时是 managed node，建议运行本机 agent）"
     type: "linux"
     host: "192.168.50.102"
     status: "online"
     last_seen_at: "2026-03-09T00:00:00Z"
+    metadata:
+      managed_node: "true"
+      controller_node: "true"
+      local_agent_expected: "true"
+      preferred_local_agent_id: "agent-controller-local"
     runtimes:
-      - type: "docker"
+      - id: "rt-controller-docker"
+        type: "docker"
         endpoint: "unix:///var/run/docker.sock"
         enabled: true
-      - type: "portainer"
+      - id: "rt-controller-portainer"
+        type: "portainer"
         endpoint: "http://portainer:9000"
         enabled: true
 
-  - description: "Mac mini M4 Pro"
+  - id: "node-managed-mac-mini"
+    name: "Managed Node 1"
+    role: "managed"
+    description: "Mac mini M4 Pro（远端 managed node）"
     type: "mac"
     host: "192.168.50.241"
     status: "online"
     last_seen_at: "2026-03-09T00:00:00Z"
+    metadata:
+      managed_node: "true"
     runtimes:
-      - type: "lmstudio"
+      - id: "rt-mac-lmstudio"
+        type: "lmstudio"
         endpoint: "http://192.168.50.241:1234"
         enabled: true
 
@@ -64,8 +87,8 @@ models:
     name: "multilingual-e5-base"
     provider: "localfs"
     backend_type: "docker"
-    host_node_id: "node-main"
-    runtime_id: "node-main-docker-1"
+    host_node_id: "node-controller"
+    runtime_id: "rt-controller-docker"
     endpoint: "http://127.0.0.1:58001"
     state: "stopped"
     desired_state: "stopped"

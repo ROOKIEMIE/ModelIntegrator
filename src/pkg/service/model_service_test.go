@@ -126,7 +126,7 @@ func TestResolveContainerRuntimeBindingFallbackToPortainer(t *testing.T) {
 	svc := newTestModelService(
 		[]model.Node{
 			{
-				ID: "node-main",
+				ID: "node-controller",
 				Runtimes: []model.Runtime{
 					{
 						ID:       "rt-portainer-1",
@@ -145,7 +145,7 @@ func TestResolveContainerRuntimeBindingFallbackToPortainer(t *testing.T) {
 	if backend != model.RuntimeTypePortainer {
 		t.Fatalf("unexpected backend: %s", backend)
 	}
-	if nodeID != "node-main" || runtimeID != "rt-portainer-1" {
+	if nodeID != "node-controller" || runtimeID != "rt-portainer-1" {
 		t.Fatalf("unexpected runtime binding: node=%s runtime=%s", nodeID, runtimeID)
 	}
 	if endpoint != "http://portainer:9000" {
@@ -157,7 +157,7 @@ func TestResolveRuntimeConnectionModelMetadataPriority(t *testing.T) {
 	svc := newTestModelService(
 		[]model.Node{
 			{
-				ID: "node-main",
+				ID: "node-controller",
 				Runtimes: []model.Runtime{
 					{
 						ID:       "rt-docker-1",
@@ -177,7 +177,7 @@ func TestResolveRuntimeConnectionModelMetadataPriority(t *testing.T) {
 
 	endpoint, token := svc.resolveRuntimeConnection(model.Model{
 		BackendType: model.RuntimeTypeDocker,
-		HostNodeID:  "node-main",
+		HostNodeID:  "node-controller",
 		RuntimeID:   "rt-docker-1",
 		Endpoint:    "tcp://model-endpoint:2375",
 		Metadata: map[string]string{
@@ -200,7 +200,7 @@ func TestStartModelUsesRuntimeBindingWithoutPersistingToken(t *testing.T) {
 
 	nodes := []model.Node{
 		{
-			ID: "node-main",
+			ID: "node-controller",
 			Runtimes: []model.Runtime{
 				{
 					ID:       "rt-docker-1",
@@ -220,7 +220,7 @@ func TestStartModelUsesRuntimeBindingWithoutPersistingToken(t *testing.T) {
 			Name:        "Qwen",
 			Provider:    "localfs",
 			BackendType: model.RuntimeTypeDocker,
-			HostNodeID:  "node-main",
+			HostNodeID:  "node-controller",
 			RuntimeID:   "rt-docker-1",
 			State:       model.ModelStateLoaded,
 			Metadata: map[string]string{
@@ -281,7 +281,7 @@ func TestRefreshLocalModelsPreserveLoadedStateAndContainerMetadata(t *testing.T)
 				Name:        "multilingual-e5-base",
 				Provider:    "localfs",
 				BackendType: model.RuntimeTypeDocker,
-				HostNodeID:  "node-main",
+				HostNodeID:  "node-controller",
 				RuntimeID:   "rt-docker-1",
 				Endpoint:    "unix:///var/run/docker.sock",
 				State:       model.ModelStateLoaded,
@@ -295,7 +295,7 @@ func TestRefreshLocalModelsPreserveLoadedStateAndContainerMetadata(t *testing.T)
 		}),
 		registry.NewNodeRegistry([]model.Node{
 			{
-				ID: "node-main",
+				ID: "node-controller",
 				Runtimes: []model.Runtime{
 					{
 						ID:       "rt-docker-1",
@@ -348,7 +348,7 @@ func TestStopModelContainerKeepsLoadedState(t *testing.T) {
 	svc := newTestModelService(
 		[]model.Node{
 			{
-				ID: "node-main",
+				ID: "node-controller",
 				Runtimes: []model.Runtime{
 					{
 						ID:       "rt-docker-1",
@@ -364,7 +364,7 @@ func TestStopModelContainerKeepsLoadedState(t *testing.T) {
 				ID:          "local-embed",
 				Name:        "embed",
 				BackendType: model.RuntimeTypeDocker,
-				HostNodeID:  "node-main",
+				HostNodeID:  "node-controller",
 				RuntimeID:   "rt-docker-1",
 				State:       model.ModelStateRunning,
 			},
@@ -411,7 +411,7 @@ func TestLoadModelContainerAlwaysEntersLoadedState(t *testing.T) {
 			svc := newTestModelService(
 				[]model.Node{
 					{
-						ID: "node-main",
+						ID: "node-controller",
 						Runtimes: []model.Runtime{
 							{
 								ID:       "rt-docker-1",
@@ -427,7 +427,7 @@ func TestLoadModelContainerAlwaysEntersLoadedState(t *testing.T) {
 						ID:          "local-embed",
 						Name:        "embed",
 						BackendType: model.RuntimeTypeDocker,
-						HostNodeID:  "node-main",
+						HostNodeID:  "node-controller",
 						RuntimeID:   "rt-docker-1",
 						State:       model.ModelStateStopped,
 					},
@@ -551,7 +551,7 @@ func TestStartModelAllowedWhenContainerModelStopped(t *testing.T) {
 	svc := newTestModelService(
 		[]model.Node{
 			{
-				ID: "node-main",
+				ID: "node-controller",
 				Runtimes: []model.Runtime{
 					{
 						ID:       "rt-docker-1",
@@ -567,7 +567,7 @@ func TestStartModelAllowedWhenContainerModelStopped(t *testing.T) {
 				ID:          "local-embed",
 				Name:        "embed",
 				BackendType: model.RuntimeTypeDocker,
-				HostNodeID:  "node-main",
+				HostNodeID:  "node-controller",
 				RuntimeID:   "rt-docker-1",
 				State:       model.ModelStateStopped,
 			},
@@ -613,7 +613,7 @@ func TestUnloadModelFromRunningStopsFirstThenUnloads(t *testing.T) {
 	svc := newTestModelService(
 		[]model.Node{
 			{
-				ID: "node-main",
+				ID: "node-controller",
 				Runtimes: []model.Runtime{
 					{
 						ID:       "rt-docker-1",
@@ -629,7 +629,7 @@ func TestUnloadModelFromRunningStopsFirstThenUnloads(t *testing.T) {
 				ID:          "local-embed",
 				Name:        "embed",
 				BackendType: model.RuntimeTypeDocker,
-				HostNodeID:  "node-main",
+				HostNodeID:  "node-controller",
 				RuntimeID:   "rt-docker-1",
 				State:       model.ModelStateRunning,
 			},
@@ -674,7 +674,7 @@ func TestRefreshContainerRuntimeStatesSyncToLoaded(t *testing.T) {
 	svc := newTestModelService(
 		[]model.Node{
 			{
-				ID: "node-main",
+				ID: "node-controller",
 				Runtimes: []model.Runtime{
 					{
 						ID:       "rt-docker-1",
@@ -690,7 +690,7 @@ func TestRefreshContainerRuntimeStatesSyncToLoaded(t *testing.T) {
 				ID:          "local-embed",
 				Name:        "embed",
 				BackendType: model.RuntimeTypeDocker,
-				HostNodeID:  "node-main",
+				HostNodeID:  "node-controller",
 				RuntimeID:   "rt-docker-1",
 				State:       model.ModelStateRunning,
 				Metadata: map[string]string{
@@ -727,7 +727,7 @@ func TestRefreshContainerRuntimeStatesSyncToStoppedAndClearMetadata(t *testing.T
 	svc := newTestModelService(
 		[]model.Node{
 			{
-				ID: "node-main",
+				ID: "node-controller",
 				Runtimes: []model.Runtime{
 					{
 						ID:       "rt-docker-1",
@@ -743,7 +743,7 @@ func TestRefreshContainerRuntimeStatesSyncToStoppedAndClearMetadata(t *testing.T
 				ID:          "local-embed",
 				Name:        "embed",
 				BackendType: model.RuntimeTypeDocker,
-				HostNodeID:  "node-main",
+				HostNodeID:  "node-controller",
 				RuntimeID:   "rt-docker-1",
 				State:       model.ModelStateLoaded,
 				Metadata: map[string]string{
@@ -810,7 +810,7 @@ func TestRefreshModelsUpdatesLMStudioData(t *testing.T) {
 	svc := newTestModelService(
 		[]model.Node{
 			{
-				ID: "node-main",
+				ID: "node-controller",
 				Runtimes: []model.Runtime{
 					{
 						ID:       "rt-lm-1",

@@ -22,7 +22,7 @@ func TestAgentRegisterHeartbeatAndCapabilities(t *testing.T) {
 
 	registerResp, err := svc.Register(ctx, model.AgentRegisterRequest{
 		AgentID: "agent-1",
-		NodeID:  "node-sub-1",
+		NodeID:  "node-managed-1",
 		Host:    "10.0.0.2",
 		Version: "0.1.0",
 	})
@@ -34,7 +34,7 @@ func TestAgentRegisterHeartbeatAndCapabilities(t *testing.T) {
 	}
 
 	_, err = svc.ReportCapabilities(ctx, "agent-1", model.AgentCapabilityReportRequest{
-		NodeID:              "node-sub-1",
+		NodeID:              "node-managed-1",
 		Capabilities:        []string{"fit", "docker-manage"},
 		RuntimeCapabilities: map[string][]string{"docker": []string{"load", "unload"}},
 	})
@@ -50,7 +50,7 @@ func TestAgentRegisterHeartbeatAndCapabilities(t *testing.T) {
 		t.Fatalf("unexpected heartbeat status: %s", hbResp.Status)
 	}
 
-	agent, ok := svc.GetByNodeID("node-sub-1")
+	agent, ok := svc.GetByNodeID("node-managed-1")
 	if !ok {
 		t.Fatalf("agent should be mapped by node id")
 	}
@@ -76,14 +76,14 @@ func TestAgentStatusTurnsOfflineWhenHeartbeatExpired(t *testing.T) {
 
 	_, err := svc.Register(ctx, model.AgentRegisterRequest{
 		AgentID: "agent-expire",
-		NodeID:  "node-sub-2",
+		NodeID:  "node-managed-2",
 	})
 	if err != nil {
 		t.Fatalf("register failed: %v", err)
 	}
 
 	time.Sleep(30 * time.Millisecond)
-	agent, ok := svc.GetByNodeID("node-sub-2")
+	agent, ok := svc.GetByNodeID("node-managed-2")
 	if !ok {
 		t.Fatalf("agent should be found by node")
 	}
@@ -108,13 +108,13 @@ func TestAgentServiceSQLitePersistenceAndRecover(t *testing.T) {
 	ctx := context.Background()
 	if _, err := svc1.Register(ctx, model.AgentRegisterRequest{
 		AgentID:      "agent-persist",
-		NodeID:       "node-main",
+		NodeID:       "node-controller",
 		Capabilities: []string{"fit"},
 	}); err != nil {
 		t.Fatalf("register failed: %v", err)
 	}
 	if _, err := svc1.ReportCapabilities(ctx, "agent-persist", model.AgentCapabilitiesReportRequest{
-		NodeID:              "node-main",
+		NodeID:              "node-controller",
 		RuntimeCapabilities: map[string][]string{"docker": {"load", "start"}},
 	}); err != nil {
 		t.Fatalf("report capabilities failed: %v", err)
@@ -140,7 +140,7 @@ func TestAgentServiceSQLitePersistenceAndRecover(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected restored agent")
 	}
-	if restored.NodeID != "node-main" {
+	if restored.NodeID != "node-controller" {
 		t.Fatalf("unexpected restored node id: %s", restored.NodeID)
 	}
 	if len(restored.Capabilities) == 0 {

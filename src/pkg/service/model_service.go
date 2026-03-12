@@ -30,6 +30,7 @@ type ModelService struct {
 	templates     *RuntimeTemplateService
 	scheduler     *scheduler.Scheduler
 	adapters      *adapter.Manager
+	taskSvc       *TaskService
 	store         *sqlitestore.Store
 	logger        *slog.Logger
 	refreshMu     sync.Mutex
@@ -135,6 +136,10 @@ func (s *ModelService) SyncRegistryToStore(ctx context.Context) error {
 	return s.store.UpsertModels(ctx, s.modelRegistry.List())
 }
 
+func (s *ModelService) SetTaskService(taskSvc *TaskService) {
+	s.taskSvc = taskSvc
+}
+
 func (s *ModelService) LoadModel(ctx context.Context, id string) (model.ActionResult, error) {
 	return s.executeAction(ctx, id, "load")
 }
@@ -201,6 +206,104 @@ func (s *ModelService) ApplyAgentReadiness(ctx context.Context, id string, ready
 				}
 			}
 		}
+	}
+	m.LastReconciledAt = now
+	applyDrift(&m)
+	s.modelRegistry.Upsert(m)
+	return s.persistModel(ctx, m)
+}
+
+func (s *ModelService) ApplyAgentTaskObservation(ctx context.Context, task model.Task) error {
+	if !isSupportedAgentTaskType(task.Type) {
+		return nil
+	}
+	if task.TargetType != model.TaskTargetRuntime {
+		return nil
+	}
+	modelID := strings.TrimSpace(task.TargetID)
+	if modelID == "" {
+		return nil
+	}
+	m, ok := s.modelRegistry.Get(modelID)
+	if !ok {
+		return ErrModelNotFound
+	}
+	now := time.Now().UTC()
+	success := task.Status == model.TaskStatusSuccess
+	message := firstNonEmpty(strings.TrimSpace(task.Message), strings.TrimSpace(task.Error))
+	if task.Detail == nil {
+		task.Detail = map[string]interface{}{}
+	}
+	task.Detail["task_type"] = string(task.Type)
+	task.Detail["execution_path"] = "agent"
+
+	switch task.Type {
+	case model.TaskTypeAgentRuntimeReadiness, model.TaskTypeAgentRuntimePrecheck:
+		if success {
+			m.Readiness = model.ReadinessReady
+			if strings.TrimSpace(m.ObservedState) == "" {
+				m.ObservedState = string(model.ModelStateRunning)
+			}
+			m.HealthMessage = firstNonEmpty(message, "agent precheck passed")
+		} else {
+			m.Readiness = model.ReadinessNotReady
+			m.HealthMessage = firstNonEmpty(message, "agent precheck failed")
+		}
+	case model.TaskTypeAgentPortCheck, model.TaskTypeAgentModelPathCheck:
+		if success {
+			m.HealthMessage = firstNonEmpty(message, m.HealthMessage, "agent node-local check passed")
+		} else {
+			m.Readiness = model.ReadinessNotReady
+			m.HealthMessage = firstNonEmpty(message, "agent node-local check failed")
+		}
+	case model.TaskTypeAgentDockerInspect:
+		applyContainerRuntimeDetail(task.Detail, &m)
+		exists, hasExists := boolFromDetail(task.Detail, "runtime_exists")
+		running, hasRunning := boolFromDetail(task.Detail, "runtime_running")
+		switch {
+		case hasExists && !exists:
+			m.State = model.ModelStateStopped
+			m.ObservedState = string(model.ModelStateStopped)
+			m.Readiness = model.ReadinessNotReady
+			m.HealthMessage = firstNonEmpty(message, "agent docker inspect: container not exists")
+			clearContainerMetadata(&m)
+			s.scheduler.MarkStopped(m.ID)
+		case hasRunning && running:
+			m.State = model.ModelStateRunning
+			m.ObservedState = string(model.ModelStateRunning)
+			if ready, ok := boolFromDetail(task.Detail, "runtime_ready"); ok && !ready {
+				m.Readiness = model.ReadinessNotReady
+				m.HealthMessage = firstNonEmpty(message, "agent docker inspect: running but not ready")
+			} else {
+				m.Readiness = model.ReadinessReady
+				m.HealthMessage = firstNonEmpty(message, "agent docker inspect: running")
+			}
+			s.scheduler.MarkRunning(m)
+		case hasExists && exists:
+			m.State = model.ModelStateLoaded
+			m.ObservedState = string(model.ModelStateLoaded)
+			m.Readiness = model.ReadinessNotReady
+			m.HealthMessage = firstNonEmpty(message, "agent docker inspect: loaded")
+			s.scheduler.MarkStopped(m.ID)
+		default:
+			m.HealthMessage = firstNonEmpty(message, m.HealthMessage)
+		}
+	case model.TaskTypeAgentResourceSnapshot:
+		if m.Metadata == nil {
+			m.Metadata = map[string]string{}
+		}
+		m.Metadata["last_resource_snapshot_task_id"] = task.ID
+		m.Metadata["last_resource_snapshot_at"] = now.Format(time.RFC3339)
+		m.HealthMessage = firstNonEmpty(message, m.HealthMessage)
+	}
+
+	if observed, ok := task.Detail["observed_state"]; ok {
+		if value := strings.TrimSpace(fmt.Sprint(observed)); value != "" {
+			m.ObservedState = value
+		}
+	}
+	if strings.TrimSpace(m.DesiredState) == "" {
+		m.DesiredState = string(m.State)
 	}
 	m.LastReconciledAt = now
 	applyDrift(&m)
@@ -859,6 +962,19 @@ func (s *ModelService) checkRuntimeReadiness(ctx context.Context, item model.Mod
 	if endpoint == "" {
 		if inferred := s.inferServiceEndpointFromTemplateID(templateID); inferred != "" {
 			endpoint = inferred
+		}
+	}
+	if s.taskSvc != nil {
+		ready, msg, detail, used, err := s.taskSvc.TryRunRuntimePrecheckViaAgent(ctx, item)
+		if used {
+			if err != nil {
+				s.logger.Warn("agent runtime precheck 失败，回退 controller 本地检查", "model_id", item.ID, "node_id", item.HostNodeID, "error", err)
+			} else {
+				if resolved := strings.TrimSpace(fmt.Sprint(detail["runtime_service_endpoint"])); resolved != "" {
+					endpoint = resolved
+				}
+				return ready, firstNonEmpty(msg, "agent runtime precheck completed"), endpoint
+			}
 		}
 	}
 	if endpoint == "" {

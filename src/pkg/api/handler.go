@@ -333,6 +333,24 @@ func (h *Handler) CreateAgentRuntimeReadinessTask(w http.ResponseWriter, r *http
 	OK(w, item)
 }
 
+func (h *Handler) CreateAgentNodeLocalTask(w http.ResponseWriter, r *http.Request) {
+	if h.taskService == nil {
+		Fail(w, http.StatusServiceUnavailable, "task 服务未就绪", nil)
+		return
+	}
+	req, err := parseAgentNodeLocalTaskPayload(r)
+	if err != nil {
+		Fail(w, http.StatusBadRequest, "agent node-local task 请求体错误", err.Error())
+		return
+	}
+	item, err := h.taskService.CreateAgentNodeTask(r.Context(), req)
+	if err != nil {
+		Fail(w, http.StatusBadRequest, "创建 agent node-local task 失败", err.Error())
+		return
+	}
+	OK(w, item)
+}
+
 func (h *Handler) PullAgentTask(w http.ResponseWriter, r *http.Request) {
 	if h.taskService == nil {
 		Fail(w, http.StatusServiceUnavailable, "task 服务未就绪", nil)
@@ -567,6 +585,15 @@ type agentRuntimeTaskPayload struct {
 	TriggeredBy    string `json:"triggered_by"`
 }
 
+type agentNodeLocalTaskPayload struct {
+	AgentID     string                 `json:"agent_id"`
+	NodeID      string                 `json:"node_id"`
+	ModelID     string                 `json:"model_id"`
+	TaskType    string                 `json:"task_type"`
+	Payload     map[string]interface{} `json:"payload"`
+	TriggeredBy string                 `json:"triggered_by"`
+}
+
 func parseAgentRuntimeTaskPayload(r *http.Request) (service.AgentRuntimeReadinessTaskRequest, error) {
 	var payload agentRuntimeTaskPayload
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
@@ -590,6 +617,42 @@ func parseAgentRuntimeTaskPayload(r *http.Request) (service.AgentRuntimeReadines
 		HealthPath:     strings.TrimSpace(payload.HealthPath),
 		TimeoutSeconds: payload.TimeoutSeconds,
 		TriggeredBy:    strings.TrimSpace(payload.TriggeredBy),
+	}, nil
+}
+
+func parseAgentNodeLocalTaskPayload(r *http.Request) (service.AgentNodeLocalTaskRequest, error) {
+	var payload agentNodeLocalTaskPayload
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		return service.AgentNodeLocalTaskRequest{}, fmt.Errorf("读取请求体失败: %w", err)
+	}
+	if len(strings.TrimSpace(string(body))) == 0 {
+		return service.AgentNodeLocalTaskRequest{}, fmt.Errorf("请求体不能为空")
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return service.AgentNodeLocalTaskRequest{}, fmt.Errorf("解析 JSON 失败: %w", err)
+	}
+	taskType := model.TaskType(strings.TrimSpace(payload.TaskType))
+	switch taskType {
+	case model.TaskTypeAgentRuntimeReadiness,
+		model.TaskTypeAgentRuntimePrecheck,
+		model.TaskTypeAgentPortCheck,
+		model.TaskTypeAgentModelPathCheck,
+		model.TaskTypeAgentResourceSnapshot,
+		model.TaskTypeAgentDockerInspect:
+	default:
+		return service.AgentNodeLocalTaskRequest{}, fmt.Errorf("不支持的 agent task_type: %s", payload.TaskType)
+	}
+	if strings.TrimSpace(payload.AgentID) == "" && strings.TrimSpace(payload.NodeID) == "" {
+		return service.AgentNodeLocalTaskRequest{}, fmt.Errorf("agent_id 或 node_id 不能为空")
+	}
+	return service.AgentNodeLocalTaskRequest{
+		AgentID:     strings.TrimSpace(payload.AgentID),
+		NodeID:      strings.TrimSpace(payload.NodeID),
+		ModelID:     strings.TrimSpace(payload.ModelID),
+		TaskType:    taskType,
+		Payload:     payload.Payload,
+		TriggeredBy: strings.TrimSpace(payload.TriggeredBy),
 	}, nil
 }
 

@@ -53,6 +53,7 @@ func NewRouter(h *Handler, staticDir, authToken string, logger *slog.Logger) htt
 		r.Get("/tasks", h.ListTasks)
 		r.Get("/tasks/{id}", h.GetTask)
 		r.Post("/tasks/agent/runtime-readiness", h.CreateAgentRuntimeReadinessTask)
+		r.Post("/tasks/agent/node-local", h.CreateAgentNodeLocalTask)
 		r.Post("/test-runs", h.CreateTestRun)
 		r.Get("/test-runs", h.ListTestRuns)
 		r.Get("/test-runs/{id}", h.GetTestRun)

@@ -34,7 +34,7 @@ func EnrichNode(node *model.Node, agent *model.AgentState) {
 }
 
 func classifyNode(node model.Node, agent *model.AgentState) model.NodeClassification {
-	hasControllerRole := node.Role == model.NodeRoleMain
+	hasControllerRole := node.Role == model.NodeRoleController
 	hasRuntime := countEnabledRuntimes(node.Runtimes) > 0
 	hasAgent := agentExists(agent)
 

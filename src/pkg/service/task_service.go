@@ -26,6 +26,15 @@ type AgentRuntimeReadinessTaskRequest struct {
 	TriggeredBy    string
 }
 
+type AgentNodeLocalTaskRequest struct {
+	AgentID     string
+	NodeID      string
+	ModelID     string
+	TaskType    model.TaskType
+	Payload     map[string]interface{}
+	TriggeredBy string
+}
+
 type AgentTaskReport struct {
 	Status     model.TaskStatus       `json:"status"`
 	Progress   int                    `json:"progress,omitempty"`
@@ -40,6 +49,8 @@ type AgentTaskReport struct {
 type TaskService struct {
 	store       *sqlitestore.Store
 	modelSvc    *ModelService
+	agentSvc    *AgentService
+	nodeSvc     *NodeService
 	logger      *slog.Logger
 	taskTimeout time.Duration
 }
@@ -54,6 +65,14 @@ func NewTaskService(store *sqlitestore.Store, modelSvc *ModelService, logger *sl
 		logger:      logger,
 		taskTimeout: 2 * time.Minute,
 	}
+}
+
+func (s *TaskService) SetAgentService(agentSvc *AgentService) {
+	s.agentSvc = agentSvc
+}
+
+func (s *TaskService) SetNodeService(nodeSvc *NodeService) {
+	s.nodeSvc = nodeSvc
 }
 
 func (s *TaskService) CreateRuntimeTask(ctx context.Context, taskType model.TaskType, modelID, triggeredBy string) (model.Task, error) {
@@ -172,14 +191,6 @@ func (s *TaskService) executeRuntimeTask(taskID string, taskType model.TaskType,
 }
 
 func (s *TaskService) CreateAgentRuntimeReadinessTask(ctx context.Context, req AgentRuntimeReadinessTaskRequest) (model.Task, error) {
-	if s.store == nil {
-		return model.Task{}, ErrTaskStoreNotReady
-	}
-	agentID := strings.TrimSpace(req.AgentID)
-	modelID := strings.TrimSpace(req.ModelID)
-	if agentID == "" || modelID == "" {
-		return model.Task{}, fmt.Errorf("agent_id/model_id is required")
-	}
 	timeoutSeconds := req.TimeoutSeconds
 	if timeoutSeconds <= 0 {
 		timeoutSeconds = 3
@@ -188,22 +199,85 @@ func (s *TaskService) CreateAgentRuntimeReadinessTask(ctx context.Context, req A
 	if healthPath == "" {
 		healthPath = "/health"
 	}
-	task := model.Task{
-		ID:              newTaskID("task"),
-		Type:            model.TaskTypeAgentRuntimeReadiness,
-		TargetType:      model.TaskTargetRuntime,
-		TargetID:        modelID,
-		AssignedAgentID: agentID,
-		Status:          model.TaskStatusPending,
-		Message:         "等待 agent 拉取任务",
+	return s.CreateAgentNodeTask(ctx, AgentNodeLocalTaskRequest{
+		AgentID:  req.AgentID,
+		ModelID:  req.ModelID,
+		TaskType: model.TaskTypeAgentRuntimeReadiness,
 		Payload: map[string]interface{}{
-			"model_id":        modelID,
 			"endpoint":        strings.TrimSpace(req.Endpoint),
 			"health_path":     healthPath,
 			"timeout_seconds": timeoutSeconds,
-			"triggered_by":    strings.TrimSpace(req.TriggeredBy),
 		},
-		CreatedAt: time.Now().UTC(),
+		TriggeredBy: req.TriggeredBy,
+	})
+}
+
+func (s *TaskService) CreateAgentNodeTask(ctx context.Context, req AgentNodeLocalTaskRequest) (model.Task, error) {
+	if s.store == nil {
+		return model.Task{}, ErrTaskStoreNotReady
+	}
+	taskType := req.TaskType
+	if !isSupportedAgentTaskType(taskType) {
+		return model.Task{}, fmt.Errorf("unsupported agent task type: %s", taskType)
+	}
+	modelID := strings.TrimSpace(req.ModelID)
+	nodeID := strings.TrimSpace(req.NodeID)
+	agentID := strings.TrimSpace(req.AgentID)
+	if nodeID == "" && modelID != "" && s.modelSvc != nil {
+		if item, err := s.modelSvc.GetModel(ctx, modelID); err == nil {
+			nodeID = strings.TrimSpace(item.HostNodeID)
+		}
+	}
+	if nodeID == "" && agentID != "" && s.agentSvc != nil {
+		if agent, ok := s.agentSvc.GetByID(agentID); ok {
+			nodeID = strings.TrimSpace(agent.NodeID)
+		}
+	}
+	if agentID == "" && nodeID != "" && s.agentSvc != nil {
+		if agent, ok := s.agentSvc.GetByNodeID(nodeID); ok {
+			agentID = strings.TrimSpace(agent.ID)
+		}
+	}
+	if agentID == "" {
+		return model.Task{}, fmt.Errorf("agent_id is required")
+	}
+	if modelID == "" && nodeID == "" {
+		return model.Task{}, fmt.Errorf("model_id/node_id is required")
+	}
+
+	payload := map[string]interface{}{}
+	for k, v := range req.Payload {
+		payload[k] = v
+	}
+	if modelID != "" {
+		payload["model_id"] = modelID
+	}
+	if nodeID != "" {
+		payload["node_id"] = nodeID
+	}
+	payload["task_type"] = string(taskType)
+	payload["triggered_by"] = strings.TrimSpace(req.TriggeredBy)
+
+	targetType := model.TaskTargetNode
+	targetID := nodeID
+	if modelID != "" {
+		targetType = model.TaskTargetRuntime
+		targetID = modelID
+	}
+
+	task := model.Task{
+		ID:              newTaskID("task"),
+		Type:            taskType,
+		TargetType:      targetType,
+		TargetID:        targetID,
+		AssignedAgentID: agentID,
+		Status:          model.TaskStatusPending,
+		Message:         "等待 agent 拉取任务",
+		Payload:         payload,
+		CreatedAt:       time.Now().UTC(),
+		Detail: map[string]interface{}{
+			"execution_path": "agent-dispatched",
+		},
 	}
 	if err := s.store.UpsertTask(ctx, task); err != nil {
 		return model.Task{}, err
@@ -215,7 +289,7 @@ func (s *TaskService) PullNextAgentTask(ctx context.Context, agentID string) (mo
 	if s.store == nil {
 		return model.Task{}, false, ErrTaskStoreNotReady
 	}
-	return s.store.ClaimPendingTaskForAgent(ctx, agentID, []model.TaskType{model.TaskTypeAgentRuntimeReadiness})
+	return s.store.ClaimPendingTaskForAgent(ctx, agentID, supportedAgentTaskTypes())
 }
 
 func (s *TaskService) ReportAgentTask(ctx context.Context, agentID, taskID string, report AgentTaskReport) (model.Task, error) {
@@ -255,6 +329,10 @@ func (s *TaskService) ReportAgentTask(ctx context.Context, agentID, taskID strin
 	if report.Detail != nil {
 		task.Detail = report.Detail
 	}
+	if task.Detail == nil {
+		task.Detail = map[string]interface{}{}
+	}
+	task.Detail["execution_path"] = "agent"
 	if errText := strings.TrimSpace(report.Error); errText != "" {
 		task.Error = errText
 	}
@@ -291,15 +369,86 @@ func (s *TaskService) ReportAgentTask(ctx context.Context, agentID, taskID strin
 		return model.Task{}, err
 	}
 
-	if task.Type == model.TaskTypeAgentRuntimeReadiness && s.modelSvc != nil {
-		ready := task.Status == model.TaskStatusSuccess
-		applyErr := s.modelSvc.ApplyAgentReadiness(ctx, task.TargetID, ready, firstNonEmpty(task.Message, "agent runtime readiness report"), task.Detail)
-		if applyErr != nil {
-			s.logger.Warn("apply agent readiness failed", "task_id", task.ID, "model_id", task.TargetID, "error", applyErr)
+	if isSupportedAgentTaskType(task.Type) && s.modelSvc != nil {
+		if applyErr := s.modelSvc.ApplyAgentTaskObservation(ctx, task); applyErr != nil {
+			s.logger.Warn("apply agent task observation failed", "task_id", task.ID, "task_type", task.Type, "target_id", task.TargetID, "error", applyErr)
+		}
+	}
+
+	if isSupportedAgentTaskType(task.Type) && s.nodeSvc != nil {
+		nodeID := strings.TrimSpace(fmt.Sprint(task.Payload["node_id"]))
+		if nodeID == "" && s.modelSvc != nil && task.TargetType == model.TaskTargetRuntime {
+			if item, err := s.modelSvc.GetModel(ctx, task.TargetID); err == nil {
+				nodeID = strings.TrimSpace(item.HostNodeID)
+			}
+		}
+		if nodeID == "" && s.agentSvc != nil {
+			if agent, ok := s.agentSvc.GetByID(agentID); ok {
+				nodeID = strings.TrimSpace(agent.NodeID)
+			}
+		}
+		if nodeID != "" {
+			if applyErr := s.nodeSvc.ApplyAgentTaskObservation(ctx, nodeID, task.Type, task.Status == model.TaskStatusSuccess, firstNonEmpty(task.Message, "agent task reported"), task.Detail); applyErr != nil {
+				s.logger.Warn("apply node observation failed", "task_id", task.ID, "node_id", nodeID, "error", applyErr)
+			}
 		}
 	}
 
 	return task, nil
+}
+
+func (s *TaskService) TryRunRuntimePrecheckViaAgent(ctx context.Context, item model.Model) (bool, string, map[string]interface{}, bool, error) {
+	if s.store == nil || s.agentSvc == nil {
+		return false, "", nil, false, nil
+	}
+	nodeID := strings.TrimSpace(item.HostNodeID)
+	if nodeID == "" {
+		return false, "", nil, false, nil
+	}
+	agentState, ok := s.agentSvc.GetByNodeID(nodeID)
+	if !ok || agentState == nil || strings.TrimSpace(agentState.ID) == "" || agentState.Status != model.AgentStatusOnline {
+		return false, "", nil, false, nil
+	}
+
+	timeoutSeconds := 3
+	payload := map[string]interface{}{
+		"runtime_id":      strings.TrimSpace(item.RuntimeID),
+		"endpoint":        strings.TrimSpace(item.Endpoint),
+		"health_path":     "/health",
+		"timeout_seconds": timeoutSeconds,
+	}
+	if path := readMetadataValue(item.Metadata, "path"); path != "" {
+		payload["model_path"] = path
+	}
+	if runtimeEndpoint := readMetadataValue(item.Metadata, "runtime_service_endpoint"); runtimeEndpoint != "" && strings.TrimSpace(item.Endpoint) == "" {
+		payload["endpoint"] = runtimeEndpoint
+	}
+	if containerID := readMetadataValue(item.Metadata, "runtime_container_id"); containerID != "" {
+		payload["runtime_container_id"] = containerID
+	}
+
+	created, err := s.CreateAgentNodeTask(ctx, AgentNodeLocalTaskRequest{
+		AgentID:     agentState.ID,
+		NodeID:      nodeID,
+		ModelID:     item.ID,
+		TaskType:    model.TaskTypeAgentRuntimePrecheck,
+		Payload:     payload,
+		TriggeredBy: "controller.reconcile",
+	})
+	if err != nil {
+		return false, "", nil, true, err
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSeconds+5)*time.Second)
+	defer cancel()
+	finalTask, err := s.AwaitTask(waitCtx, created.ID, 500*time.Millisecond)
+	if err != nil {
+		return false, "agent precheck await failed", map[string]interface{}{"task_id": created.ID, "error": err.Error()}, true, err
+	}
+	if finalTask.Status == model.TaskStatusSuccess {
+		return true, firstNonEmpty(finalTask.Message, "agent runtime precheck success"), finalTask.Detail, true, nil
+	}
+	return false, firstNonEmpty(finalTask.Message, "agent runtime precheck failed"), finalTask.Detail, true, nil
 }
 
 func (s *TaskService) ListTasks(ctx context.Context, targetType, targetID string, limit int) ([]model.Task, error) {
@@ -380,6 +529,31 @@ func (s *TaskService) failTask(taskID string, status model.TaskStatus, message, 
 func isRuntimeTaskType(taskType model.TaskType) bool {
 	switch taskType {
 	case model.TaskTypeRuntimeStart, model.TaskTypeRuntimeStop, model.TaskTypeRuntimeRestart, model.TaskTypeRuntimeRefresh:
+		return true
+	default:
+		return false
+	}
+}
+
+func supportedAgentTaskTypes() []model.TaskType {
+	return []model.TaskType{
+		model.TaskTypeAgentRuntimeReadiness,
+		model.TaskTypeAgentRuntimePrecheck,
+		model.TaskTypeAgentPortCheck,
+		model.TaskTypeAgentModelPathCheck,
+		model.TaskTypeAgentResourceSnapshot,
+		model.TaskTypeAgentDockerInspect,
+	}
+}
+
+func isSupportedAgentTaskType(taskType model.TaskType) bool {
+	switch taskType {
+	case model.TaskTypeAgentRuntimeReadiness,
+		model.TaskTypeAgentRuntimePrecheck,
+		model.TaskTypeAgentPortCheck,
+		model.TaskTypeAgentModelPathCheck,
+		model.TaskTypeAgentResourceSnapshot,
+		model.TaskTypeAgentDockerInspect:
 		return true
 	default:
 		return false
