@@ -50,6 +50,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: controller-local-agent
+    # 阶段 A 第 3 步：controller 节点标准执行路径，默认由 one-click-up 启用 local-agent profile。
     profiles:
       - local-agent
     depends_on:
@@ -65,7 +66,7 @@ services:
       AGENT_DOCKER_ENDPOINT: ${MCP_DOCKER_ENDPOINT:-unix:///var/run/docker.sock}
       AGENT_TASK_POLL_SECONDS: ${AGENT_TASK_POLL_SECONDS:-5}
       AGENT_HEARTBEAT_SECONDS: ${AGENT_HEARTBEAT_SECONDS:-15}
-      AGENT_CAPABILITIES: ${AGENT_CAPABILITIES:-resource-snapshot,docker-manage,port-check,path-check}
+      AGENT_CAPABILITIES: ${AGENT_CAPABILITIES:-resource-snapshot,docker-manage,docker-start,docker-stop,docker-inspect,port-check,path-check}
     volumes:
       - ${MCP_PROJECT_DIR:-.}/resources:/opt/controller/resources
       - ${MCP_MODEL_DIR_HOST:-./resources/models}:${MCP_MODEL_ROOT_DIR:-/opt/controller/models}:ro

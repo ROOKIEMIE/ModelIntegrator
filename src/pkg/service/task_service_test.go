@@ -2,8 +2,10 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -178,5 +180,130 @@ func TestCreateAgentNodeLocalTaskWithNodeAgentResolution(t *testing.T) {
 	}
 	if created.Type != model.TaskTypeAgentResourceSnapshot {
 		t.Fatalf("unexpected task type: %s", created.Type)
+	}
+}
+
+func TestCreateAgentNodeTaskWithRuntimeInstanceContext(t *testing.T) {
+	capture := &captureAdapter{}
+	models := []model.Model{{
+		ID:          "local-multilingual-e5-base",
+		Name:        "multilingual-e5-base",
+		BackendType: model.RuntimeTypeDocker,
+		HostNodeID:  "node-controller",
+		RuntimeID:   "rt-docker",
+		State:       model.ModelStateRunning,
+		PathOrRef:   "./resources/models/multilingual-e5-base",
+		ScriptRef:   "./resources/scripts/start-e5.sh",
+		Metadata: map[string]string{
+			"runtime_template_id":  "tei-embedding",
+			"runtime_container_id": "mcp-model-local-multilingual-e5-base",
+		},
+	}}
+	nodes := []model.Node{{
+		ID:       "node-controller",
+		Runtimes: []model.Runtime{{ID: "rt-docker", Type: model.RuntimeTypeDocker, Enabled: true}},
+	}}
+	taskSvc, _ := newTaskServiceForTest(t, models, nodes, capture)
+	runtimeObjectSvc := newRuntimeObjectTestService(models, nodes)
+	if err := runtimeObjectSvc.Bootstrap(context.Background()); err != nil {
+		t.Fatalf("runtime bootstrap failed: %v", err)
+	}
+	taskSvc.SetRuntimeObjectService(runtimeObjectSvc)
+
+	agentSvc := NewAgentService(30*time.Second, 5*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if _, err := agentSvc.Register(context.Background(), model.AgentRegisterRequest{
+		ID:     "agent-controller-local",
+		NodeID: "node-controller",
+	}); err != nil {
+		t.Fatalf("register agent failed: %v", err)
+	}
+	taskSvc.SetAgentService(agentSvc)
+
+	instance, err := runtimeObjectSvc.GetRuntimeInstanceByModelID(context.Background(), "local-multilingual-e5-base")
+	if err != nil {
+		t.Fatalf("get runtime instance by model failed: %v", err)
+	}
+
+	created, err := taskSvc.CreateAgentNodeTask(context.Background(), AgentNodeLocalTaskRequest{
+		RuntimeInstanceID: instance.ID,
+		TaskType:          model.TaskTypeAgentRuntimePrecheck,
+		Payload:           map[string]interface{}{"timeout_seconds": 3},
+		TriggeredBy:       "test.instance-first",
+	})
+	if err != nil {
+		t.Fatalf("create instance-first agent task failed: %v", err)
+	}
+	if created.AssignedAgentID != "agent-controller-local" {
+		t.Fatalf("unexpected assigned agent: %s", created.AssignedAgentID)
+	}
+	if got := strings.TrimSpace(fmt.Sprint(created.Payload["runtime_instance_id"])); got != instance.ID {
+		t.Fatalf("unexpected runtime_instance_id payload: %s", got)
+	}
+	if got := strings.TrimSpace(fmt.Sprint(created.Payload["runtime_binding_id"])); got == "" {
+		t.Fatalf("runtime_binding_id should be populated")
+	}
+	if got := strings.TrimSpace(fmt.Sprint(created.Payload["manifest_id"])); got == "" {
+		t.Fatalf("manifest_id should be populated")
+	}
+	resolved, ok := created.Payload["resolved_context"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("resolved_context should exist")
+	}
+	if got := strings.TrimSpace(fmt.Sprint(resolved["runtime_kind"])); got == "" {
+		t.Fatalf("runtime_kind should be present in resolved_context")
+	}
+	if got := strings.TrimSpace(fmt.Sprint(created.Detail["task_scope"])); got != "runtime_instance" {
+		t.Fatalf("unexpected task_scope detail: %s", got)
+	}
+}
+
+func TestCreateAgentDockerStartStopTasks(t *testing.T) {
+	capture := &captureAdapter{}
+	taskSvc, _ := newTaskServiceForTest(t,
+		[]model.Model{{
+			ID:          "local-multilingual-e5-base",
+			Name:        "multilingual-e5-base",
+			BackendType: model.RuntimeTypeDocker,
+			HostNodeID:  "node-controller",
+			RuntimeID:   "rt-docker",
+			State:       model.ModelStateLoaded,
+			Metadata: map[string]string{
+				"runtime_container_id": "mcp-model-local-multilingual-e5-base",
+			},
+		}},
+		[]model.Node{{
+			ID:       "node-controller",
+			Role:     model.NodeRoleController,
+			Metadata: map[string]string{"local_agent_expected": "true", "preferred_local_agent_id": "agent-controller-local"},
+			Runtimes: []model.Runtime{{ID: "rt-docker", Type: model.RuntimeTypeDocker, Enabled: true}},
+		}},
+		capture,
+	)
+
+	agentSvc := NewAgentService(30*time.Second, 5*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if _, err := agentSvc.Register(context.Background(), model.AgentRegisterRequest{
+		ID:     "agent-controller-local",
+		NodeID: "node-controller",
+	}); err != nil {
+		t.Fatalf("register agent failed: %v", err)
+	}
+	taskSvc.SetAgentService(agentSvc)
+
+	for _, taskType := range []model.TaskType{model.TaskTypeAgentDockerStart, model.TaskTypeAgentDockerStop} {
+		created, err := taskSvc.CreateAgentNodeTask(context.Background(), AgentNodeLocalTaskRequest{
+			NodeID:   "node-controller",
+			ModelID:  "local-multilingual-e5-base",
+			TaskType: taskType,
+			Payload:  map[string]interface{}{"runtime_container_id": "mcp-model-local-multilingual-e5-base"},
+		})
+		if err != nil {
+			t.Fatalf("create agent task failed: %v", err)
+		}
+		if created.Type != taskType {
+			t.Fatalf("unexpected task type: %s", created.Type)
+		}
+		if created.AssignedAgentID != "agent-controller-local" {
+			t.Fatalf("unexpected assigned agent: %s", created.AssignedAgentID)
+		}
 	}
 }

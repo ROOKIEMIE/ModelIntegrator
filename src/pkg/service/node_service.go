@@ -155,6 +155,33 @@ func (s *NodeService) ApplyAgentTaskObservation(ctx context.Context, nodeID stri
 		if raw, ok := detail["resource_snapshot_collected_at"]; ok {
 			metadata["resource_snapshot_collected_at"] = strings.TrimSpace(fmt.Sprint(raw))
 		}
+		if snapshotRaw, ok := detail["resource_snapshot"].(map[string]interface{}); ok {
+			if cpu := strings.TrimSpace(fmt.Sprint(snapshotRaw["cpu_count"])); cpu != "" && cpu != "<nil>" {
+				metadata["resource_snapshot_cpu_count"] = cpu
+			}
+			if memTotal := strings.TrimSpace(fmt.Sprint(snapshotRaw["mem_total_kb"])); memTotal != "" && memTotal != "<nil>" {
+				metadata["resource_snapshot_mem_total_kb"] = memTotal
+			}
+			if memAvail := strings.TrimSpace(fmt.Sprint(snapshotRaw["mem_available_kb"])); memAvail != "" && memAvail != "<nil>" {
+				metadata["resource_snapshot_mem_available_kb"] = memAvail
+			}
+			if diskRaw, ok := snapshotRaw["disk"].(map[string]interface{}); ok {
+				if diskAvail := strings.TrimSpace(fmt.Sprint(diskRaw["available_bytes"])); diskAvail != "" && diskAvail != "<nil>" {
+					metadata["resource_snapshot_disk_available_bytes"] = diskAvail
+				}
+				if diskPath := strings.TrimSpace(fmt.Sprint(diskRaw["path"])); diskPath != "" && diskPath != "<nil>" {
+					metadata["resource_snapshot_disk_path"] = diskPath
+				}
+			}
+			if dockerRaw, ok := snapshotRaw["docker_access"].(map[string]interface{}); ok {
+				if reachable := strings.TrimSpace(fmt.Sprint(dockerRaw["api_reachable"])); reachable != "" && reachable != "<nil>" {
+					metadata["resource_snapshot_docker_api_reachable"] = reachable
+				}
+				if endpoint := strings.TrimSpace(fmt.Sprint(dockerRaw["endpoint"])); endpoint != "" && endpoint != "<nil>" {
+					metadata["resource_snapshot_docker_endpoint"] = endpoint
+				}
+			}
+		}
 	}
 	node.Metadata = metadata
 
@@ -168,6 +195,15 @@ func (s *NodeService) ApplyAgentTaskObservation(ctx context.Context, nodeID stri
 		}
 		if running, ok := boolFromTaskDetail(detail, "runtime_running"); ok {
 			if running {
+				node.Runtimes[i].Status = model.RuntimeStatusOnline
+			} else {
+				node.Runtimes[i].Status = model.RuntimeStatusOffline
+			}
+			node.Runtimes[i].LastSeenAt = now
+			continue
+		}
+		if exists, ok := boolFromTaskDetail(detail, "runtime_exists"); ok {
+			if exists {
 				node.Runtimes[i].Status = model.RuntimeStatusOnline
 			} else {
 				node.Runtimes[i].Status = model.RuntimeStatusOffline

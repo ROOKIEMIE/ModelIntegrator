@@ -130,6 +130,7 @@ func main() {
 	taskService := service.NewTaskService(sqliteStore, modelService, log)
 	taskService.SetAgentService(agentService)
 	taskService.SetNodeService(nodeService)
+	taskService.SetRuntimeObjectService(runtimeObjectService)
 	modelService.SetTaskService(taskService)
 	testRunService := service.NewTestRunService(sqliteStore, taskService, modelService, log, cfg.Testing.LogRootDir)
 

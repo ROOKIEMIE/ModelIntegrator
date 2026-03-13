@@ -180,9 +180,123 @@ func (s *TestRunService) runScenario(ctx context.Context, scenario string, step 
 	switch scenario {
 	case "e5_embedding_smoke":
 		return s.runE5EmbeddingSmoke(ctx, step)
+	case "local_agent_execution_smoke":
+		return s.runLocalAgentExecutionSmoke(ctx, step)
 	default:
 		return "", fmt.Errorf("unsupported scenario: %s", scenario)
 	}
+}
+
+func (s *TestRunService) runLocalAgentExecutionSmoke(ctx context.Context, step func(name string, ok bool, message string, detail map[string]interface{})) (string, error) {
+	if s.taskSvc == nil || s.modelSvc == nil {
+		return "", fmt.Errorf("task/model service is not ready")
+	}
+	models, err := s.modelSvc.ListModels(ctx)
+	if err != nil {
+		step("discover_model", false, "读取模型列表失败", map[string]interface{}{"error": err.Error()})
+		return "读取模型列表失败", err
+	}
+	if len(models) == 0 {
+		err := fmt.Errorf("没有可用模型")
+		step("discover_model", false, err.Error(), nil)
+		return err.Error(), err
+	}
+	target := models[0]
+	for _, item := range models {
+		if strings.TrimSpace(item.HostNodeID) == "node-controller" {
+			target = item
+			break
+		}
+	}
+	modelID := strings.TrimSpace(target.ID)
+	if modelID == "" {
+		err := fmt.Errorf("模型 ID 为空")
+		step("discover_model", false, err.Error(), nil)
+		return err.Error(), err
+	}
+	step("discover_model", true, "已选择模型", map[string]interface{}{"model_id": modelID, "node_id": target.HostNodeID})
+
+	runAgentTask := func(name string, taskType model.TaskType, timeout time.Duration, requireSuccess bool) (model.Task, error) {
+		payload := map[string]interface{}{}
+		if taskType == model.TaskTypeAgentDockerInspect {
+			if containerID := strings.TrimSpace(readMetadataValue(target.Metadata, "runtime_container_id")); containerID != "" {
+				payload["runtime_container_id"] = containerID
+			}
+		}
+		created, createErr := s.taskSvc.CreateAgentNodeTask(ctx, AgentNodeLocalTaskRequest{
+			NodeID:      strings.TrimSpace(target.HostNodeID),
+			ModelID:     modelID,
+			TaskType:    taskType,
+			Payload:     payload,
+			TriggeredBy: "test-run.local-agent-smoke",
+		})
+		if createErr != nil {
+			step(name, false, "创建 agent 任务失败", map[string]interface{}{"task_type": string(taskType), "error": createErr.Error()})
+			return model.Task{}, createErr
+		}
+		waitCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		finalTask, waitErr := s.taskSvc.AwaitTask(waitCtx, created.ID, 600*time.Millisecond)
+		if waitErr != nil {
+			step(name, false, "等待 agent 任务失败", map[string]interface{}{"task_id": created.ID, "error": waitErr.Error()})
+			return model.Task{}, waitErr
+		}
+		ok := finalTask.Status == model.TaskStatusSuccess || !requireSuccess
+		step(name, ok, "agent 任务已结束", map[string]interface{}{
+			"task_id":    finalTask.ID,
+			"task_type":  string(taskType),
+			"status":     string(finalTask.Status),
+			"worker_id":  finalTask.WorkerID,
+			"agent_id":   finalTask.AssignedAgentID,
+			"message":    finalTask.Message,
+			"require_ok": requireSuccess,
+		})
+		if requireSuccess && finalTask.Status != model.TaskStatusSuccess {
+			return finalTask, fmt.Errorf("task=%s status=%s message=%s error=%s", finalTask.ID, finalTask.Status, finalTask.Message, finalTask.Error)
+		}
+		return finalTask, nil
+	}
+
+	snapshotTask, err := runAgentTask("resource_snapshot", model.TaskTypeAgentResourceSnapshot, 30*time.Second, true)
+	if err != nil {
+		return "agent resource snapshot 失败", err
+	}
+	inspectTask, err := runAgentTask("docker_inspect", model.TaskTypeAgentDockerInspect, 30*time.Second, false)
+	if err != nil {
+		return "agent docker inspect 失败", err
+	}
+	precheckTask, err := runAgentTask("runtime_precheck", model.TaskTypeAgentRuntimePrecheck, 45*time.Second, false)
+	if err != nil {
+		return "agent runtime precheck 失败", err
+	}
+
+	if s.taskSvc.runtimeObjectSvc != nil {
+		runtimeInstanceID := firstNonEmpty(
+			readTaskRuntimeInstanceID(precheckTask),
+			readTaskRuntimeInstanceID(inspectTask),
+			readTaskRuntimeInstanceID(snapshotTask),
+		)
+		if runtimeInstanceID != "" {
+			instance, getErr := s.taskSvc.runtimeObjectSvc.GetRuntimeInstance(ctx, runtimeInstanceID)
+			if getErr != nil {
+				step("runtime_instance_projection", false, "读取 runtime instance 失败", map[string]interface{}{"runtime_instance_id": runtimeInstanceID, "error": getErr.Error()})
+				return "读取 runtime instance 失败", getErr
+			}
+			ok := strings.TrimSpace(string(instance.PrecheckStatus)) != "" && instance.PrecheckStatus != model.PrecheckStatusUnknown
+			step("runtime_instance_projection", ok, "已读取 runtime instance 状态投影", map[string]interface{}{
+				"runtime_instance_id": runtimeInstanceID,
+				"precheck_status":     string(instance.PrecheckStatus),
+				"precheck_gating":     instance.PrecheckGating,
+				"readiness":           string(instance.Readiness),
+				"health_message":      instance.HealthMessage,
+				"last_agent_task":     instance.LastAgentTask,
+			})
+			if !ok {
+				return "runtime instance 状态未完成收口", fmt.Errorf("runtime instance precheck status unknown: %s", runtimeInstanceID)
+			}
+		}
+	}
+	return "local_agent_execution_smoke 完成", nil
 }
 
 func (s *TestRunService) runE5EmbeddingSmoke(ctx context.Context, step func(name string, ok bool, message string, detail map[string]interface{})) (string, error) {
@@ -296,7 +410,7 @@ func (s *TestRunService) failRun(run model.TestRun, summary string, err error) {
 
 func isAllowedScenario(scenario string) bool {
 	switch strings.TrimSpace(scenario) {
-	case "e5_embedding_smoke":
+	case "e5_embedding_smoke", "local_agent_execution_smoke":
 		return true
 	default:
 		return false

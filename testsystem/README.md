@@ -7,6 +7,7 @@
 - `Dockerfile`：测试 runner 镜像（bash/curl/jq）
 - `docker-compose.test.yml`：测试专用 compose
 - `scenarios/e5_embedding_smoke.sh`：E5 embedding 端到端 smoke 场景
+- `scenarios/local_agent_execution_smoke.sh`：local-agent 路径执行/检查 smoke 场景（含 runtime instance 状态收口校验）
 - `scripts/run_test.sh`：统一入口，创建 run id 与日志目录
 - `scripts/collect_logs.sh`：收集日志清单
 - `logs/`：默认日志目录（可挂载为宿主机目录）
@@ -15,7 +16,9 @@
 
 - `CONTROLLER_BASE_URL`：controller API 地址，默认 `http://controller:8080`
 - `CONTROLLER_AUTH_TOKEN`：controller Bearer token（可空）
-- `TEST_SCENARIO`：场景名，当前只允许 `e5_embedding_smoke`
+- `TEST_SCENARIO`：场景名，当前允许：
+  - `e5_embedding_smoke`
+  - `local_agent_execution_smoke`
 - `TEST_LOG_ROOT_HOST`：宿主机日志目录，默认 `./testsystem/logs`
 - `E5_MODEL_ID`：E5 模型 id，默认 `local-multilingual-e5-base`
 - `E5_EXPECTED_DIM`：embedding 维度，默认 `768`

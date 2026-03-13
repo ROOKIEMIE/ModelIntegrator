@@ -2,8 +2,10 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -286,5 +288,82 @@ func TestRuntimeBindingInstanceManifestRoundTrip(t *testing.T) {
 	}
 	if !ok || gotManifest.RuntimeKind != model.RuntimeKindTEI {
 		t.Fatalf("unexpected runtime manifest snapshot: %+v", gotManifest)
+	}
+}
+
+func TestOpenMigratesLegacyTasksTable(t *testing.T) {
+	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "legacy.db")
+	rawDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw sqlite failed: %v", err)
+	}
+	legacyDDL := `
+		CREATE TABLE tasks (
+			id TEXT PRIMARY KEY,
+			type TEXT NOT NULL DEFAULT '',
+			target_type TEXT NOT NULL DEFAULT '',
+			target_id TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT 'pending',
+			progress TEXT NOT NULL DEFAULT '',
+			message TEXT,
+			error TEXT,
+			created_at TEXT NOT NULL DEFAULT ''
+		);
+		INSERT INTO tasks (id, type, target_type, target_id, status, progress, message, error, created_at)
+		VALUES ('legacy-task-1', 'agent.runtime_precheck', 'runtime', 'ri-1', 'pending', '', NULL, NULL, '2026-03-14T00:00:00Z');
+	`
+	if _, err := rawDB.Exec(legacyDDL); err != nil {
+		_ = rawDB.Close()
+		t.Fatalf("seed legacy tasks schema failed: %v", err)
+	}
+	if err := rawDB.Close(); err != nil {
+		t.Fatalf("close raw sqlite failed: %v", err)
+	}
+
+	store, err := Open(dbPath, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("open store with legacy db failed: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	tasks, err := store.ListTasks(ctx, "", "", 10)
+	if err != nil {
+		t.Fatalf("list tasks on migrated legacy db failed: %v", err)
+	}
+	if len(tasks) == 0 {
+		t.Fatalf("expected legacy task to be queryable after migration")
+	}
+	if tasks[0].ID == "legacy-task-1" && tasks[0].Progress != 0 {
+		t.Fatalf("expected legacy progress to be normalized to 0, got %d", tasks[0].Progress)
+	}
+
+	newTask := model.Task{
+		ID:              "task-migrated-1",
+		Type:            model.TaskTypeAgentRuntimePrecheck,
+		TargetType:      model.TaskTargetRuntime,
+		TargetID:        "ri-1",
+		AssignedAgentID: "agent-controller-local",
+		Status:          model.TaskStatusPending,
+		Progress:        5,
+		Message:         "created",
+		Detail:          map[string]interface{}{"phase": "bootstrap"},
+		Payload:         map[string]interface{}{"runtime_instance_id": "ri-1"},
+		CreatedAt:       time.Now().UTC(),
+	}
+	if err := store.UpsertTask(ctx, newTask); err != nil {
+		t.Fatalf("upsert task after legacy migration failed: %v", err)
+	}
+
+	claimed, ok, err := store.ClaimPendingTaskForAgent(ctx, "agent-controller-local", []model.TaskType{model.TaskTypeAgentRuntimePrecheck})
+	if err != nil {
+		t.Fatalf("claim pending task after migration failed: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected claimable task after migration")
+	}
+	if claimed.ID != newTask.ID {
+		t.Fatalf("unexpected claimed task id: %s", claimed.ID)
 	}
 }

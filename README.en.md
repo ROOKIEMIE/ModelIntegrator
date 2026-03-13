@@ -54,11 +54,14 @@ chmod 666 resources/config/controller.db
 Start:
 
 ```bash
-# Core (recommended)
+# Core (recommended, local-agent on controller node is enabled by default)
 ./scripts/one-click-up.sh
 
-# Core + local agent (recommended for same-host validation)
+# Explicitly enable local-agent (same as default behavior)
 ./scripts/one-click-up.sh --local-agent
+
+# Disable local-agent (compatibility/troubleshooting only; falls back to controller direct/self-check)
+./scripts/one-click-up.sh --no-local-agent
 
 # Core + addons
 ./scripts/one-click-up.sh --addons
@@ -134,6 +137,14 @@ Runtime templates:
 - `POST /api/v1/runtime-templates/validate`
 - `POST /api/v1/runtime-templates`
 
+Runtime objects (instance-first):
+
+- `GET /api/v1/runtime-bindings`
+- `GET /api/v1/runtime-instances`
+- `GET /api/v1/runtime-instances/{id}`
+- `GET /api/v1/runtime-instances/{id}/tasks`
+- `GET /api/v1/runtime-instances/{id}/summary`
+
 Agents and tasks:
 
 - `GET /api/v1/agents`
@@ -151,8 +162,27 @@ Agents and tasks:
 - `POST /api/v1/tasks/agent/runtime-readiness`
 - `POST /api/v1/tasks/agent/node-local`
 
+Node execution task types (submitted via `POST /api/v1/tasks/agent/node-local`):
+
+- `agent.runtime_precheck`
+- `agent.resource_snapshot`
+- `agent.docker_inspect`
+- `agent.docker_start_container`
+- `agent.docker_stop_container`
+
 Test runs:
 
 - `GET /api/v1/test-runs`
 - `GET /api/v1/test-runs/{id}`
 - `POST /api/v1/test-runs`
+
+Scripted smoke checks (local-agent path):
+
+- `scripts/controller_api_smoke.sh <base_url> [token] [agent_id] [model_id]`
+- `testsystem/scenarios/local_agent_execution_smoke.sh`
+
+Stage A closure (current):
+
+- Agent outcomes now land on `RuntimeInstance` first (precheck/readiness/drift/resolved state + latest task summary).
+- `Node` keeps node-level resource/agent liveness facts; `Model` primarily consumes instance projection.
+- Stage B focus: instance-first reconcile, deeper precheck/conflict/drift, and less direct fallback.

@@ -1,5 +1,201 @@
 # 变更日志
 
+## 2026-03-14
+
+### 阶段 A 第 4 步：agent 结果状态归属收口（instance-first）
+
+本轮把 agent 结果反哺规则明确为：`RuntimeInstance` 为第一落点，`Node/Model/Task` 为投影或过程承载。
+
+### 收口原则
+
+- `RuntimeInstance` 优先承载：
+  - `precheck_status/precheck_gating/precheck_reasons/precheck_result`
+  - `observed_state/readiness/health_message/drift_reason`
+  - `resolved_mounts/resolved_ports/resolved_script`
+  - `last_agent_task` 摘要
+- `Node` 继续承载：
+  - agent 在线状态、last_seen
+  - 节点资源快照摘要（CPU/内存/磁盘/docker 可达性）
+- `Model` 调整为：
+  - 以 instance 投影更新对外状态（readiness/health/observed）
+  - 不再优先沉淀实例级节点检查细节
+- `Task` 保留：
+  - 一次动作原始 detail/result（审计与排障）
+
+### 代码收敛点
+
+- `TaskService.ReportAgentTask` 调整为 instance-first 顺序：
+  - 先 `RuntimeObjectService.ApplyAgentTaskObservation`
+  - 再 `NodeService.ApplyAgentTaskObservation`
+  - 最后 `ModelService.ApplyAgentTaskObservation`
+- `RuntimeObjectService.ApplyAgentTaskObservation` 扩展为统一映射：
+  - `agent.runtime_precheck`
+  - `agent.runtime_readiness_check`
+  - `agent.port_check`
+  - `agent.model_path_check`
+  - `agent.resource_snapshot`
+  - `agent.docker_inspect`
+  - `agent.docker_start_container`
+  - `agent.docker_stop_container`
+- `RuntimeInstance` API 视图增强：
+  - 新增 `binding_mode/manifest_id/resolved_*`
+  - 新增 `last_agent_task` 摘要
+  - 新增 `GET /api/v1/runtime-instances/{id}/summary`
+
+### testsystem 收口验证
+
+- `local_agent_execution_smoke` 新增 instance 收口检查：
+  - 基于 instance 触发 `agent.runtime_precheck`
+  - 查询 `runtime-instances/{id}/summary`
+  - 验证 `precheck_status` 与 `last_agent_task` 已回写 instance
+
+### 阶段 B 进入条件（明确）
+
+阶段 A 到达以下状态即可进入阶段 B：
+
+1. agent 结果稳定先写 RuntimeInstance，再做 Node/Model 投影。  
+2. API/前端可直接观察 instance 的 precheck/readiness/drift/last task 摘要。  
+3. local-agent-first 是主路径，controller direct 仅兼容 fallback。  
+4. testsystem 能重复验证“任务完成 + instance 状态变化”。
+
+阶段 B 重点：
+
+- instance-first reconcile 主循环
+- precheck/conflict/drift 深化
+- 更少 direct fallback（继续收缩兼容路径）
+
+不再属于阶段 A 的问题：
+
+- 更复杂的冲突仲裁策略（多实例/多节点）
+- 全量调度阻塞策略与回退编排
+- 深度 bundle 执行器与跨 runtime 复杂编排
+
+### 阶段 A 第 3 步：local-agent-first + 节点执行面扩展
+
+本轮把 agent 从“检查器”为主推进到“最小真实执行面”，并让 controller node 的 local-agent 成为默认标准路径。
+
+### local-agent-first（controller node）
+
+- `scripts/one-click-up.sh` 现在默认启用 `local-agent` profile，`--no-local-agent` 仅保留兼容排障用途。
+- `docker-compose.yml` 明确 local-agent 是阶段 A 的标准执行路径，并补充执行能力声明（`docker-start/docker-stop/docker-inspect/resource-snapshot`）。
+- `TaskService` 在 `runtime.start/runtime.stop/runtime.refresh` 上增加 local-agent-first 尝试逻辑：
+  - 优先派发 agent 子任务（controller node + local-agent 期望场景）
+  - 失败时回退 `controller direct`（compatibility fallback）
+  - 回退原因写入父任务 detail（可审计）
+
+### agent 执行动作扩展
+
+新增并接入任务类型：
+
+- `agent.docker_start_container`
+- `agent.docker_stop_container`
+
+现有任务增强：
+
+- `agent.docker_inspect`：继续作为标准容器事实探针
+- `agent.resource_snapshot`：增加磁盘、模型目录、docker 可达性、关键依赖可用性摘要
+
+执行器特性：
+
+- `docker` CLI 优先，缺失时自动走 Docker API fallback（`unix:///var/run/docker.sock` / tcp endpoint）
+- 返回结构化 detail，包含 `runtime_exists/runtime_running/observed_state/action_transport` 等字段
+- 明确禁止任意 shell 通道，仍保持受约束动作集合
+
+### controller 侧消费增强
+
+- `TaskService.ReportAgentTask` 现在会把 agent 结果同步反哺：
+  - `ModelService`
+  - `NodeService`
+  - `RuntimeObjectService`（新增）
+- `RuntimeObjectService.ApplyAgentTaskObservation` 新增：
+  - 消费 precheck/docker/snapshot 结果
+  - 更新 `RuntimeInstance` 的 `observed_state/readiness/health_message/precheck_*`
+  - 记录 runtime instance 元数据中的快照事实与容器事实
+
+### 前端与 smoke
+
+- 任务列表新增“检查/执行/观测”分类（agent 任务可快速区分执行类与检查类）。
+- 节点卡片增加 local-agent 可见性：`preferred_local_agent_id`、最近 agent 动作与时间。
+- runtime instance 卡片增加最近执行类动作摘要。
+- `scripts/controller_api_smoke.sh` 增强：支持 local-agent 路径触发并等待
+  - `agent.runtime_precheck`
+  - `agent.docker_inspect`
+  - `agent.resource_snapshot`
+- 新增 `testsystem/scenarios/local_agent_execution_smoke.sh`，并在 `TestRunService` 中开放 `local_agent_execution_smoke` 场景。
+
+### fallback/self-check（当前仍保留）
+
+- controller `self-check`：SQLite/目录/启动前最小检查（不扩展为节点动作执行）。
+- runtime 动作：当 local-agent-first 子任务不可用或失败时，仍回退 controller direct 路径（兼容期保留）。
+
+### 阶段 A 第 1 步：agent 任务切换到 instance-first 视角
+
+本轮重点不是执行器大改，而是把 agent 任务输入协议从 `model/runtime` 粗粒度升级为围绕运行对象：
+
+- `RuntimeInstance`
+- `RuntimeBinding`
+- `RuntimeTemplate`
+- `RuntimeBundleManifest`
+
+### 协议字段与上下文补齐
+
+- agent node-local 任务 payload/detail 新增（或统一透传）：
+  - `runtime_instance_id`
+  - `runtime_binding_id`
+  - `runtime_template_id`
+  - `manifest_id`
+  - `node_id`
+  - `model_id`
+  - `task_scope`
+  - `payload_context`
+  - `resolved_context`
+- 兼容原则：`tasks` 表结构不变，继续通过 JSON 字段持久化与 API 输出。
+
+### controller 侧能力
+
+- `TaskService` 支持最小输入仅 `runtime_instance_id` 创建 node-local agent task。
+- 创建时执行解析链：
+  - `RuntimeInstance -> RuntimeBinding -> RuntimeTemplate -> RuntimeBundleManifest`
+- 自动补齐 node/agent 选择与 resolved context（binding mode/runtime kind/template type/路径/脚本/端口/env 约束）。
+- 增加清晰错误：instance/binding/template/manifest 缺失或不匹配时直接返回可定位错误。
+
+### API 增量
+
+- 新增：
+  - `POST /api/v1/tasks/agent/instance-local`（instance-first 创建入口）
+  - `GET /api/v1/runtime-instances/{id}/tasks`（查询某 runtime instance 最近 agent tasks）
+- 增强：
+  - `POST /api/v1/tasks/agent/node-local` 支持 `runtime_instance_id` 与新上下文字段
+  - `GET /api/v1/tasks` 支持 `runtime_instance_id` / `agent_only` 过滤
+
+### agent 侧能力
+
+- agent 在执行前统一解析 `resolved_context/payload`：
+  - `runtime_instance_id`
+  - `binding_mode`
+  - `manifest` 核心字段（`runtime_kind/template_type/ports/env`）
+  - `model_path/script_ref/runtime_container_id` 等执行上下文
+- 上下文缺失改为结构化错误（`AgentTaskProtocolError`），不再只返回裸字符串。
+
+### 前端最小增强
+
+- 任务列表新增展示：
+  - `runtime_instance_id`
+  - `runtime_binding_id`
+  - `binding_mode`
+- runtime instance 列表新增“最近 agent task 摘要”。
+
+### compatibility path（保留）
+
+- `model_id/node_id` 直接创建路径继续保留用于兼容或过渡。
+- 当 instance 解析不可用时，任务会标记 `task_scope=legacy_model_or_node`（compatibility path）。
+
+### 2026-03-14 补充修复：agent/console 在 API 抖动或 SQLite 争用下的可用性
+
+- `sqlite` 增加运行时 pragma（`busy_timeout=5000`、`journal_mode=WAL`、`synchronous=NORMAL`）以降低 `SQLITE_BUSY` 导致的任务查询/agent 心跳失败概率。
+- agent `doJSON` 错误输出追加服务端 detail，避免只看到“拉取 agent task 失败/心跳失败”而无法定位根因。
+- 前端初始化改为 `Promise.allSettled`，`tasks` 接口失败不再拖垮整个控制台页面（节点/模型/runtime 视图可继续加载）。
+
 ## 2026-03-13
 
 ### 阶段 0（运行对象模型重构）插入为最高优先级

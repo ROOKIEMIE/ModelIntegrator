@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -22,6 +23,13 @@ var (
 	ErrRuntimeManifestNotFound  = errors.New("runtime manifest not found")
 	ErrRuntimeBindingValidation = errors.New("runtime binding validation failed")
 )
+
+type RuntimeInstanceResolvedContext struct {
+	Instance model.RuntimeInstance
+	Binding  model.RuntimeBinding
+	Template model.RuntimeTemplate
+	Manifest model.RuntimeBundleManifest
+}
 
 type RuntimeObjectService struct {
 	modelRegistry *registry.ModelRegistry
@@ -154,6 +162,9 @@ func (s *RuntimeObjectService) ListRuntimeInstances(ctx context.Context) ([]mode
 		if err != nil {
 			return nil, err
 		}
+		for i := range items {
+			s.hydrateRuntimeInstanceDerivedFields(&items[i])
+		}
 		s.mu.Lock()
 		for _, item := range items {
 			s.instances[item.ID] = item
@@ -165,6 +176,7 @@ func (s *RuntimeObjectService) ListRuntimeInstances(ctx context.Context) ([]mode
 	defer s.mu.RUnlock()
 	out := make([]model.RuntimeInstance, 0, len(s.instances))
 	for _, item := range s.instances {
+		s.hydrateRuntimeInstanceDerivedFields(&item)
 		out = append(out, item)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
@@ -184,6 +196,7 @@ func (s *RuntimeObjectService) GetRuntimeInstance(ctx context.Context, id string
 		if !ok {
 			return model.RuntimeInstance{}, ErrRuntimeInstanceNotFound
 		}
+		s.hydrateRuntimeInstanceDerivedFields(&item)
 		s.mu.Lock()
 		s.instances[item.ID] = item
 		s.mu.Unlock()
@@ -195,7 +208,571 @@ func (s *RuntimeObjectService) GetRuntimeInstance(ctx context.Context, id string
 	if !ok {
 		return model.RuntimeInstance{}, ErrRuntimeInstanceNotFound
 	}
+	s.hydrateRuntimeInstanceDerivedFields(&item)
 	return item, nil
+}
+
+func (s *RuntimeObjectService) GetRuntimeInstanceByModelID(ctx context.Context, modelID string) (model.RuntimeInstance, error) {
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return model.RuntimeInstance{}, ErrRuntimeInstanceNotFound
+	}
+	items, err := s.ListRuntimeInstances(ctx)
+	if err != nil {
+		return model.RuntimeInstance{}, err
+	}
+	for _, item := range items {
+		if strings.TrimSpace(item.ModelID) == modelID {
+			return item, nil
+		}
+	}
+	return model.RuntimeInstance{}, ErrRuntimeInstanceNotFound
+}
+
+func (s *RuntimeObjectService) GetManifestByID(ctx context.Context, manifestID string) (model.RuntimeBundleManifest, error) {
+	manifestID = strings.TrimSpace(manifestID)
+	if manifestID == "" {
+		return model.RuntimeBundleManifest{}, ErrRuntimeManifestNotFound
+	}
+	if s.store != nil {
+		item, ok, err := s.store.GetRuntimeBundleManifestByID(ctx, manifestID)
+		if err != nil {
+			return model.RuntimeBundleManifest{}, err
+		}
+		if ok {
+			s.mu.Lock()
+			s.manifests[item.ID] = item
+			s.mu.Unlock()
+			return item, nil
+		}
+	}
+	s.mu.RLock()
+	item, ok := s.manifests[manifestID]
+	s.mu.RUnlock()
+	if !ok {
+		return model.RuntimeBundleManifest{}, ErrRuntimeManifestNotFound
+	}
+	return item, nil
+}
+
+func (s *RuntimeObjectService) ResolveRuntimeInstanceContext(ctx context.Context, runtimeInstanceID string) (RuntimeInstanceResolvedContext, error) {
+	if s.templates == nil {
+		return RuntimeInstanceResolvedContext{}, fmt.Errorf("resolve runtime_instance_id=%s failed: runtime template service is nil", strings.TrimSpace(runtimeInstanceID))
+	}
+	instance, err := s.GetRuntimeInstance(ctx, runtimeInstanceID)
+	if err != nil {
+		return RuntimeInstanceResolvedContext{}, fmt.Errorf("resolve runtime_instance_id=%s failed: %w", strings.TrimSpace(runtimeInstanceID), err)
+	}
+	bindingID := strings.TrimSpace(instance.BindingID)
+	if bindingID == "" {
+		return RuntimeInstanceResolvedContext{}, fmt.Errorf("resolve runtime_instance_id=%s failed: binding_id is empty", strings.TrimSpace(runtimeInstanceID))
+	}
+	binding, err := s.GetBinding(ctx, bindingID)
+	if err != nil {
+		return RuntimeInstanceResolvedContext{}, fmt.Errorf("resolve runtime_binding_id=%s failed: %w", bindingID, err)
+	}
+
+	templateID := firstNonEmpty(strings.TrimSpace(instance.TemplateID), strings.TrimSpace(binding.TemplateID))
+	if templateID == "" {
+		return RuntimeInstanceResolvedContext{}, fmt.Errorf("resolve runtime_instance_id=%s failed: runtime_template_id is empty", strings.TrimSpace(runtimeInstanceID))
+	}
+	template, ok := s.templates.GetTemplate(ctx, templateID)
+	if !ok {
+		return RuntimeInstanceResolvedContext{}, fmt.Errorf("resolve runtime_template_id=%s failed: %w", templateID, ErrRuntimeTemplateNotFound)
+	}
+
+	manifestID := strings.TrimSpace(binding.ManifestID)
+	var manifest model.RuntimeBundleManifest
+	if manifestID != "" {
+		manifest, err = s.GetManifestByID(ctx, manifestID)
+		if err != nil {
+			return RuntimeInstanceResolvedContext{}, fmt.Errorf("resolve manifest_id=%s failed: %w", manifestID, err)
+		}
+	} else {
+		manifest, err = s.GetTemplateManifest(ctx, templateID)
+		if err != nil {
+			return RuntimeInstanceResolvedContext{}, fmt.Errorf("resolve manifest by template_id=%s failed: %w", templateID, err)
+		}
+	}
+	if strings.TrimSpace(manifest.ID) == "" {
+		return RuntimeInstanceResolvedContext{}, fmt.Errorf("resolve runtime_instance_id=%s failed: %w", strings.TrimSpace(runtimeInstanceID), ErrRuntimeManifestNotFound)
+	}
+
+	return RuntimeInstanceResolvedContext{
+		Instance: instance,
+		Binding:  binding,
+		Template: template,
+		Manifest: manifest,
+	}, nil
+}
+
+func (s *RuntimeObjectService) ApplyAgentTaskObservation(ctx context.Context, task model.Task) error {
+	if !isSupportedAgentTaskType(task.Type) {
+		return nil
+	}
+
+	instanceID := strings.TrimSpace(readStringFromObjectMap(task.Payload, "runtime_instance_id"))
+	if instanceID == "" {
+		instanceID = strings.TrimSpace(readStringFromNestedObjectMap(task.Payload, "resolved_context", "runtime_instance_id"))
+	}
+	if instanceID == "" {
+		instanceID = strings.TrimSpace(readStringFromObjectMap(task.Detail, "runtime_instance_id"))
+	}
+	if instanceID == "" && task.TargetType == model.TaskTargetRuntime {
+		modelID := strings.TrimSpace(task.TargetID)
+		if modelID != "" {
+			if item, err := s.GetRuntimeInstanceByModelID(ctx, modelID); err == nil {
+				instanceID = strings.TrimSpace(item.ID)
+			}
+		}
+	}
+	if instanceID == "" {
+		return nil
+	}
+
+	item, err := s.GetRuntimeInstance(ctx, instanceID)
+	if err != nil {
+		if errors.Is(err, ErrRuntimeInstanceNotFound) {
+			return nil
+		}
+		return err
+	}
+
+	now := time.Now().UTC()
+	success := task.Status == model.TaskStatusSuccess
+	msg := firstNonEmpty(strings.TrimSpace(task.Message), strings.TrimSpace(task.Error))
+	if msg == "" {
+		msg = "agent task reported"
+	}
+	s.hydrateRuntimeInstanceDerivedFields(&item)
+	if item.Metadata == nil {
+		item.Metadata = map[string]string{}
+	}
+	item.LastAgentTask = &model.RuntimeInstanceAgentTaskSummary{
+		TaskID:          strings.TrimSpace(task.ID),
+		TaskType:        task.Type,
+		TaskStatus:      task.Status,
+		Message:         msg,
+		WorkerID:        strings.TrimSpace(task.WorkerID),
+		AssignedAgentID: strings.TrimSpace(task.AssignedAgentID),
+		TriggeredBy:     strings.TrimSpace(fmt.Sprint(task.Payload["triggered_by"])),
+		FinishedAt:      chooseTaskEventTime(task, now),
+	}
+
+	if item.NodeID == "" {
+		item.NodeID = firstNonEmpty(
+			strings.TrimSpace(readStringFromObjectMap(task.Payload, "node_id")),
+			strings.TrimSpace(readStringFromNestedObjectMap(task.Payload, "resolved_context", "node_id")),
+			item.NodeID,
+		)
+	}
+	item.BindingMode = model.RuntimeBindingMode(firstNonEmpty(
+		strings.TrimSpace(readStringFromObjectMap(task.Payload, "binding_mode")),
+		strings.TrimSpace(readStringFromNestedObjectMap(task.Payload, "resolved_context", "binding_mode")),
+		strings.TrimSpace(string(item.BindingMode)),
+	))
+	item.ManifestID = firstNonEmpty(
+		strings.TrimSpace(readStringFromObjectMap(task.Payload, "manifest_id")),
+		strings.TrimSpace(readStringFromNestedObjectMap(task.Payload, "resolved_context", "manifest_id")),
+		strings.TrimSpace(item.ManifestID),
+	)
+
+	if endpoint := firstNonEmpty(
+		strings.TrimSpace(fmt.Sprint(task.Detail["runtime_service_endpoint"])),
+		strings.TrimSpace(fmt.Sprint(task.Detail["endpoint"])),
+		strings.TrimSpace(readStringFromObjectMap(task.Payload, "endpoint")),
+		strings.TrimSpace(readStringFromNestedObjectMap(task.Payload, "resolved_context", "endpoint")),
+	); endpoint != "" && endpoint != "<nil>" {
+		item.Endpoint = endpoint
+	}
+	if containerID := firstNonEmpty(
+		strings.TrimSpace(fmt.Sprint(task.Detail["runtime_container_id"])),
+		strings.TrimSpace(readStringFromObjectMap(task.Payload, "runtime_container_id")),
+		strings.TrimSpace(readStringFromNestedObjectMap(task.Payload, "resolved_context", "runtime_container_id")),
+	); containerID != "" && containerID != "<nil>" {
+		item.Metadata["runtime_container_id"] = containerID
+	}
+	if mounts := firstNonEmptyStringSlice(
+		readStringSliceFromObjectMap(task.Detail, "resolved_mounts"),
+		readStringSliceFromObjectMap(task.Payload, "binding_mount_rules"),
+		readStringSliceFromObjectMap(task.Payload, "mount_points"),
+	); len(mounts) > 0 {
+		item.ResolvedMounts = cloneStringSlice(mounts)
+		item.MountedPaths = cloneStringSlice(mounts)
+	}
+	if ports := firstNonEmptyStringSlice(
+		readStringSliceFromObjectMap(task.Detail, "resolved_ports"),
+		readStringSliceFromObjectMap(task.Payload, "exposed_ports"),
+		readStringSliceFromObjectMap(task.Payload, "resolved_ports"),
+	); len(ports) > 0 {
+		item.ResolvedPorts = cloneStringSlice(ports)
+	}
+	if script := firstNonEmpty(
+		strings.TrimSpace(fmt.Sprint(task.Detail["resolved_script"])),
+		strings.TrimSpace(readStringFromObjectMap(task.Payload, "script_ref")),
+		strings.TrimSpace(readStringFromNestedObjectMap(task.Payload, "resolved_context", "script_ref")),
+	); script != "" && script != "<nil>" {
+		item.ResolvedScript = script
+		item.ScriptUsed = script
+	}
+
+	switch task.Type {
+	case model.TaskTypeAgentRuntimePrecheck:
+		item.LastPrecheckTaskID = task.ID
+		item.LastPrecheckAt = now
+		if success {
+			item.PrecheckStatus = model.PrecheckStatusOK
+			item.PrecheckGating = false
+			item.PrecheckReasons = nil
+		} else {
+			item.PrecheckStatus = model.PrecheckStatusFailed
+			item.PrecheckGating = true
+			item.PrecheckReasons = cloneStringSlice(readStringSliceFromObjectMap(task.Detail, "precheck_failures"))
+		}
+		if precheck := decodeRuntimePrecheckResult(task.Detail["precheck_result"]); precheck != nil {
+			item.PrecheckResult = precheck
+			item.PrecheckStatus = precheck.OverallStatus
+			item.PrecheckGating = precheck.Gating
+			item.PrecheckReasons = extractPrecheckReasonCodes(precheck.Reasons)
+			if len(precheck.ResolvedMounts) > 0 {
+				item.ResolvedMounts = cloneStringSlice(precheck.ResolvedMounts)
+				item.MountedPaths = cloneStringSlice(precheck.ResolvedMounts)
+			}
+			if len(precheck.ResolvedPorts) > 0 {
+				item.ResolvedPorts = cloneStringSlice(precheck.ResolvedPorts)
+			}
+			if script := strings.TrimSpace(precheck.ResolvedScript); script != "" {
+				item.ResolvedScript = script
+				item.ScriptUsed = script
+			}
+			if len(precheck.ResolvedEnv) > 0 {
+				item.InjectedEnv = cloneStringMap(precheck.ResolvedEnv)
+			}
+		}
+		if item.PrecheckGating {
+			item.Readiness = model.ReadinessNotReady
+			item.DriftReason = firstNonEmpty(item.DriftReason, "precheck_gating=true")
+		}
+		item.HealthMessage = firstNonEmpty(msg, item.HealthMessage)
+	case model.TaskTypeAgentRuntimeReadiness:
+		ready, hasReady := boolFromTaskDetail(task.Detail, "runtime_ready")
+		if !hasReady {
+			ready, hasReady = boolFromTaskDetail(task.Detail, "ready")
+		}
+		if hasReady {
+			if ready {
+				item.Readiness = model.ReadinessReady
+				item.ObservedState = firstNonEmpty(strings.TrimSpace(item.ObservedState), "running")
+			} else {
+				item.Readiness = model.ReadinessNotReady
+			}
+		} else if success {
+			item.Readiness = model.ReadinessReady
+		} else {
+			item.Readiness = model.ReadinessNotReady
+		}
+		item.HealthMessage = firstNonEmpty(msg, item.HealthMessage)
+	case model.TaskTypeAgentPortCheck:
+		if hostPort := strings.TrimSpace(fmt.Sprint(task.Detail["host_port"])); hostPort != "" && hostPort != "<nil>" {
+			item.ResolvedPorts = appendUniqueString(item.ResolvedPorts, hostPort)
+		}
+		if !success {
+			item.Readiness = model.ReadinessNotReady
+		}
+		item.HealthMessage = firstNonEmpty(msg, item.HealthMessage)
+	case model.TaskTypeAgentModelPathCheck:
+		if absPath := strings.TrimSpace(fmt.Sprint(task.Detail["abs_path"])); absPath != "" && absPath != "<nil>" {
+			item.ResolvedMounts = appendUniqueString(item.ResolvedMounts, absPath)
+			item.MountedPaths = appendUniqueString(item.MountedPaths, absPath)
+		}
+		if exists, ok := boolFromTaskDetail(task.Detail, "exists"); ok && !exists {
+			item.Readiness = model.ReadinessNotReady
+		}
+		if !success {
+			item.Readiness = model.ReadinessNotReady
+		}
+		item.HealthMessage = firstNonEmpty(msg, item.HealthMessage)
+	case model.TaskTypeAgentDockerInspect, model.TaskTypeAgentDockerStart, model.TaskTypeAgentDockerStop:
+		exists, hasExists := boolFromTaskDetail(task.Detail, "runtime_exists")
+		running, hasRunning := boolFromTaskDetail(task.Detail, "runtime_running")
+		if hasExists && !exists {
+			item.ObservedState = "stopped"
+			item.Readiness = model.ReadinessNotReady
+		} else if hasRunning && running {
+			item.ObservedState = "running"
+			if ready, ok := boolFromTaskDetail(task.Detail, "runtime_ready"); ok && !ready {
+				item.Readiness = model.ReadinessNotReady
+			} else {
+				item.Readiness = model.ReadinessReady
+			}
+		} else if hasExists && exists {
+			item.ObservedState = "loaded"
+			item.Readiness = model.ReadinessNotReady
+		}
+		item.HealthMessage = firstNonEmpty(msg, item.HealthMessage)
+	case model.TaskTypeAgentResourceSnapshot:
+		item.Metadata["last_resource_snapshot_task_id"] = task.ID
+		item.Metadata["last_resource_snapshot_at"] = now.Format(time.RFC3339)
+		if snapshot, ok := task.Detail["resource_snapshot"].(map[string]interface{}); ok {
+			if hostname := strings.TrimSpace(fmt.Sprint(snapshot["hostname"])); hostname != "" && hostname != "<nil>" {
+				item.Metadata["snapshot_hostname"] = hostname
+			}
+			if dockerRaw, ok := snapshot["docker_access"].(map[string]interface{}); ok {
+				item.Metadata["snapshot_docker_accessible"] = strings.TrimSpace(fmt.Sprint(dockerRaw["api_reachable"]))
+			}
+		}
+		item.HealthMessage = firstNonEmpty(msg, item.HealthMessage)
+	}
+
+	if observed := strings.TrimSpace(fmt.Sprint(task.Detail["observed_state"])); observed != "" && observed != "<nil>" {
+		item.ObservedState = observed
+	}
+	if item.PrecheckGating && item.Readiness == model.ReadinessReady {
+		item.Readiness = model.ReadinessNotReady
+	}
+	if item.DriftReason == "" {
+		if drift := inferDriftReasonFromInstance(item); drift != "" {
+			item.DriftReason = drift
+		}
+	}
+	item.LastReconciledAt = now
+	return s.upsertRuntimeInstance(ctx, item)
+}
+
+func decodeRuntimePrecheckResult(raw interface{}) *model.RuntimePrecheckResult {
+	if raw == nil {
+		return nil
+	}
+	bytes, err := json.Marshal(raw)
+	if err != nil || len(bytes) == 0 {
+		return nil
+	}
+	var out model.RuntimePrecheckResult
+	if err := json.Unmarshal(bytes, &out); err != nil {
+		return nil
+	}
+	if strings.TrimSpace(string(out.OverallStatus)) == "" {
+		return nil
+	}
+	return &out
+}
+
+func extractPrecheckReasonCodes(reasons []model.RuntimePrecheckReason) []string {
+	if len(reasons) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(reasons))
+	seen := map[string]struct{}{}
+	for _, reason := range reasons {
+		code := strings.TrimSpace(string(reason.Code))
+		if code == "" {
+			continue
+		}
+		if _, ok := seen[code]; ok {
+			continue
+		}
+		seen[code] = struct{}{}
+		out = append(out, code)
+	}
+	return out
+}
+
+func chooseTaskEventTime(task model.Task, fallback time.Time) time.Time {
+	if !task.FinishedAt.IsZero() {
+		return task.FinishedAt.UTC()
+	}
+	if !task.StartedAt.IsZero() {
+		return task.StartedAt.UTC()
+	}
+	if !task.AcceptedAt.IsZero() {
+		return task.AcceptedAt.UTC()
+	}
+	if !task.CreatedAt.IsZero() {
+		return task.CreatedAt.UTC()
+	}
+	return fallback.UTC()
+}
+
+func firstNonEmptyStringSlice(candidates ...[]string) []string {
+	for _, candidate := range candidates {
+		normalized := cloneStringSlice(candidate)
+		if len(normalized) > 0 {
+			return normalized
+		}
+	}
+	return nil
+}
+
+func appendUniqueString(in []string, value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return cloneStringSlice(in)
+	}
+	out := cloneStringSlice(in)
+	for _, existing := range out {
+		if strings.EqualFold(strings.TrimSpace(existing), value) {
+			return out
+		}
+	}
+	out = append(out, value)
+	return out
+}
+
+func (s *RuntimeObjectService) hydrateRuntimeInstanceDerivedFields(item *model.RuntimeInstance) {
+	if item == nil {
+		return
+	}
+	if item.Metadata == nil {
+		item.Metadata = map[string]string{}
+	}
+	if strings.TrimSpace(string(item.BindingMode)) == "" {
+		item.BindingMode = model.RuntimeBindingMode(strings.TrimSpace(item.Metadata["binding_mode"]))
+	}
+	if strings.TrimSpace(item.ManifestID) == "" {
+		item.ManifestID = strings.TrimSpace(item.Metadata["manifest_id"])
+	}
+	if len(item.ResolvedMounts) == 0 {
+		item.ResolvedMounts = cloneStringSlice(item.MountedPaths)
+	}
+	if len(item.ResolvedMounts) == 0 {
+		item.ResolvedMounts = parseJSONStringSlice(item.Metadata["resolved_mounts_json"])
+	}
+	if len(item.ResolvedPorts) == 0 {
+		item.ResolvedPorts = parseJSONStringSlice(item.Metadata["resolved_ports_json"])
+	}
+	if strings.TrimSpace(item.ResolvedScript) == "" {
+		item.ResolvedScript = firstNonEmpty(strings.TrimSpace(item.ScriptUsed), strings.TrimSpace(item.Metadata["resolved_script"]))
+	}
+	if item.LastAgentTask == nil {
+		item.LastAgentTask = parseRuntimeInstanceAgentTaskSummary(item.Metadata["last_agent_task_json"])
+	}
+}
+
+func (s *RuntimeObjectService) persistRuntimeInstanceDerivedFields(item *model.RuntimeInstance) {
+	if item == nil {
+		return
+	}
+	if item.Metadata == nil {
+		item.Metadata = map[string]string{}
+	}
+	if strings.TrimSpace(string(item.BindingMode)) != "" {
+		item.Metadata["binding_mode"] = strings.TrimSpace(string(item.BindingMode))
+	}
+	if strings.TrimSpace(item.ManifestID) != "" {
+		item.Metadata["manifest_id"] = strings.TrimSpace(item.ManifestID)
+	}
+	if len(item.ResolvedMounts) == 0 {
+		item.ResolvedMounts = cloneStringSlice(item.MountedPaths)
+	}
+	if len(item.MountedPaths) == 0 {
+		item.MountedPaths = cloneStringSlice(item.ResolvedMounts)
+	}
+	if len(item.ResolvedMounts) > 0 {
+		item.Metadata["resolved_mounts_json"] = mustJSON(item.ResolvedMounts, "[]")
+	}
+	if len(item.ResolvedPorts) > 0 {
+		item.Metadata["resolved_ports_json"] = mustJSON(item.ResolvedPorts, "[]")
+	}
+	if strings.TrimSpace(item.ResolvedScript) == "" {
+		item.ResolvedScript = strings.TrimSpace(item.ScriptUsed)
+	}
+	if strings.TrimSpace(item.ScriptUsed) == "" {
+		item.ScriptUsed = strings.TrimSpace(item.ResolvedScript)
+	}
+	if strings.TrimSpace(item.ResolvedScript) != "" {
+		item.Metadata["resolved_script"] = strings.TrimSpace(item.ResolvedScript)
+	}
+	if item.LastAgentTask != nil {
+		item.Metadata["last_agent_task_json"] = encodeRuntimeInstanceAgentTaskSummary(item.LastAgentTask)
+		item.Metadata["last_agent_task_type"] = strings.TrimSpace(string(item.LastAgentTask.TaskType))
+		item.Metadata["last_agent_task_status"] = strings.TrimSpace(string(item.LastAgentTask.TaskStatus))
+		item.Metadata["last_agent_task_id"] = strings.TrimSpace(item.LastAgentTask.TaskID)
+		item.Metadata["last_agent_task_message"] = strings.TrimSpace(item.LastAgentTask.Message)
+		if !item.LastAgentTask.FinishedAt.IsZero() {
+			item.Metadata["last_agent_task_at"] = item.LastAgentTask.FinishedAt.UTC().Format(time.RFC3339)
+		}
+	}
+}
+
+func parseJSONStringSlice(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "{}" {
+		return nil
+	}
+	var out []string
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil
+	}
+	return cloneStringSlice(out)
+}
+
+func parseRuntimeInstanceAgentTaskSummary(raw string) *model.RuntimeInstanceAgentTaskSummary {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "{}" {
+		return nil
+	}
+	var out model.RuntimeInstanceAgentTaskSummary
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil
+	}
+	if strings.TrimSpace(out.TaskID) == "" && strings.TrimSpace(string(out.TaskType)) == "" {
+		return nil
+	}
+	return &out
+}
+
+func encodeRuntimeInstanceAgentTaskSummary(summary *model.RuntimeInstanceAgentTaskSummary) string {
+	if summary == nil {
+		return "{}"
+	}
+	return mustJSON(summary, "{}")
+}
+
+func mustJSON(v interface{}, fallback string) string {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return fallback
+	}
+	out := strings.TrimSpace(string(raw))
+	if out == "" {
+		return fallback
+	}
+	return out
+}
+
+func readStringSliceFromObjectMap(in map[string]interface{}, key string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	raw, ok := in[key]
+	if !ok || raw == nil {
+		return nil
+	}
+	switch value := raw.(type) {
+	case []string:
+		return cloneStringSlice(value)
+	case []interface{}:
+		out := make([]string, 0, len(value))
+		for _, item := range value {
+			text := strings.TrimSpace(fmt.Sprint(item))
+			if text == "" || text == "<nil>" {
+				continue
+			}
+			out = append(out, text)
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func inferDriftReasonFromInstance(item model.RuntimeInstance) string {
+	desired := strings.TrimSpace(strings.ToLower(item.DesiredState))
+	observed := strings.TrimSpace(strings.ToLower(item.ObservedState))
+	if desired == "" || observed == "" || desired == observed {
+		return ""
+	}
+	return fmt.Sprintf("desired=%s observed=%s", item.DesiredState, item.ObservedState)
 }
 
 func (s *RuntimeObjectService) GetTemplateManifest(ctx context.Context, templateID string) (model.RuntimeBundleManifest, error) {
@@ -340,11 +917,23 @@ func (s *RuntimeObjectService) upsertRuntimeInstanceFromBinding(ctx context.Cont
 	for k, v := range binding.EnvOverrides {
 		injectedEnv[strings.TrimSpace(k)] = strings.TrimSpace(v)
 	}
+	resolvedPorts := normalizeStringList(tpl.ExposedPorts)
+	if len(resolvedPorts) == 0 {
+		if manifestID := strings.TrimSpace(binding.ManifestID); manifestID != "" {
+			if manifest, getErr := s.GetManifestByID(ctx, manifestID); getErr == nil {
+				resolvedPorts = normalizeStringList(manifest.ExposedPorts)
+			}
+		} else if manifest, getErr := s.GetTemplateManifest(ctx, binding.TemplateID); getErr == nil {
+			resolvedPorts = normalizeStringList(manifest.ExposedPorts)
+		}
+	}
 	instance := model.RuntimeInstance{
 		ID:               id,
 		ModelID:          item.ID,
 		TemplateID:       binding.TemplateID,
 		BindingID:        binding.ID,
+		BindingMode:      binding.BindingMode,
+		ManifestID:       strings.TrimSpace(binding.ManifestID),
 		NodeID:           firstNonEmpty(strings.TrimSpace(binding.PreferredNode), strings.TrimSpace(item.HostNodeID)),
 		DesiredState:     desiredState,
 		ObservedState:    observedState,
@@ -356,13 +945,18 @@ func (s *RuntimeObjectService) upsertRuntimeInstanceFromBinding(ctx context.Cont
 		MountedPaths:     mergePreferredStringList(nil, binding.MountRules, tpl.InjectableMounts, tpl.Volumes),
 		InjectedEnv:      injectedEnv,
 		ScriptUsed:       firstNonEmpty(strings.TrimSpace(binding.ScriptRef), strings.TrimSpace(item.ScriptRef)),
+		ResolvedMounts:   mergePreferredStringList(nil, binding.MountRules, tpl.InjectableMounts, tpl.Volumes),
+		ResolvedScript:   firstNonEmpty(strings.TrimSpace(binding.ScriptRef), strings.TrimSpace(item.ScriptRef)),
+		ResolvedPorts:    cloneStringSlice(resolvedPorts),
 		LastReconciledAt: item.LastReconciledAt,
 		Metadata: map[string]string{
 			"binding_mode": string(binding.BindingMode),
-			"phase":        "stage-0",
+			"manifest_id":  strings.TrimSpace(binding.ManifestID),
+			"phase":        "stage-a",
 		},
-		CreatedAt: createdAt,
-		UpdatedAt: time.Now().UTC(),
+		PrecheckStatus: model.PrecheckStatusUnknown,
+		CreatedAt:      createdAt,
+		UpdatedAt:      time.Now().UTC(),
 	}
 	if instance.NodeID == "" {
 		nodes := s.nodeRegistry.List()
@@ -370,11 +964,23 @@ func (s *RuntimeObjectService) upsertRuntimeInstanceFromBinding(ctx context.Cont
 			instance.NodeID = nodes[0].ID
 		}
 	}
+	if strings.TrimSpace(instance.ManifestID) == "" {
+		if manifest, getErr := s.GetTemplateManifest(ctx, binding.TemplateID); getErr == nil {
+			instance.ManifestID = strings.TrimSpace(manifest.ID)
+			instance.Metadata["manifest_id"] = strings.TrimSpace(manifest.ID)
+			if len(instance.ResolvedPorts) == 0 {
+				instance.ResolvedPorts = normalizeStringList(manifest.ExposedPorts)
+			}
+		}
+	}
 	if !ok && item.LastReconciledAt.IsZero() {
 		instance.LastReconciledAt = time.Now().UTC()
 	}
 	if instance.Readiness == "" {
 		instance.Readiness = model.ReadinessUnknown
+	}
+	if strings.TrimSpace(string(instance.PrecheckStatus)) == "" {
+		instance.PrecheckStatus = model.PrecheckStatusUnknown
 	}
 	if err := s.upsertRuntimeInstance(ctx, instance); err != nil {
 		return model.RuntimeInstance{}, err
@@ -522,11 +1128,13 @@ func (s *RuntimeObjectService) upsertBinding(ctx context.Context, item model.Run
 }
 
 func (s *RuntimeObjectService) upsertRuntimeInstance(ctx context.Context, item model.RuntimeInstance) error {
+	s.persistRuntimeInstanceDerivedFields(&item)
 	if s.store != nil {
 		if err := s.store.UpsertRuntimeInstance(ctx, item); err != nil {
 			return err
 		}
 	}
+	s.hydrateRuntimeInstanceDerivedFields(&item)
 	s.mu.Lock()
 	s.instances[item.ID] = item
 	s.mu.Unlock()
@@ -574,6 +1182,7 @@ func (s *RuntimeObjectService) reloadInstancesFromStore(ctx context.Context) err
 	defer s.mu.Unlock()
 	s.instances = make(map[string]model.RuntimeInstance, len(items))
 	for _, item := range items {
+		s.hydrateRuntimeInstanceDerivedFields(&item)
 		s.instances[item.ID] = item
 	}
 	return nil

@@ -97,6 +97,7 @@ else
 fi
 
 PROFILE_ARGS=()
+LOCAL_AGENT_ENABLED=true
 for arg in "$@"; do
   case "$arg" in
     --addons)
@@ -112,14 +113,23 @@ for arg in "$@"; do
       echo "[INFO] 将一并启动 vLLM 运行模板容器"
       ;;
     --local-agent)
-      PROFILE_ARGS+=(--profile local-agent)
-      echo "[INFO] 将一并启动 controller 节点本机 agent（local-agent profile）"
+      LOCAL_AGENT_ENABLED=true
+      echo "[INFO] 已显式启用 controller 节点本机 agent（local-agent profile）"
+      ;;
+    --no-local-agent)
+      LOCAL_AGENT_ENABLED=false
+      echo "[INFO] 已关闭 local-agent profile（将回退 controller direct/self-check 兼容路径）"
       ;;
     *)
       echo "[WARN] 忽略未知参数: $arg"
       ;;
   esac
 done
+
+if [ "$LOCAL_AGENT_ENABLED" = "true" ]; then
+  PROFILE_ARGS+=(--profile local-agent)
+  echo "[INFO] 默认启用 local-agent-first：将启动 controller 节点本机 agent"
+fi
 
 echo "[INFO] 校验 compose 配置..."
 docker compose "${PROFILE_ARGS[@]}" config >/dev/null

@@ -51,11 +51,14 @@ chmod 666 resources/config/controller.db
 启动：
 
 ```bash
-# 核心（推荐）
+# 核心（推荐，默认启用 controller node local-agent）
 ./scripts/one-click-up.sh
 
-# 核心 + 本机 agent（推荐用于同机链路验证）
+# 显式启用本机 agent（等价于默认行为）
 ./scripts/one-click-up.sh --local-agent
+
+# 关闭本机 agent（仅用于兼容排障，回退 controller direct/self-check）
+./scripts/one-click-up.sh --no-local-agent
 
 # 核心 + addons
 ./scripts/one-click-up.sh --addons
@@ -131,6 +134,14 @@ curl -sS http://127.0.0.1:59081/api/v1/nodes
 - `POST /api/v1/runtime-templates/validate`
 - `POST /api/v1/runtime-templates`
 
+运行对象（instance-first）：
+
+- `GET /api/v1/runtime-bindings`
+- `GET /api/v1/runtime-instances`
+- `GET /api/v1/runtime-instances/{id}`
+- `GET /api/v1/runtime-instances/{id}/tasks`
+- `GET /api/v1/runtime-instances/{id}/summary`
+
 agent 与任务：
 
 - `GET /api/v1/agents`
@@ -148,8 +159,27 @@ agent 与任务：
 - `POST /api/v1/tasks/agent/runtime-readiness`
 - `POST /api/v1/tasks/agent/node-local`
 
+节点执行类 agent task（通过 `POST /api/v1/tasks/agent/node-local` 提交）：
+
+- `agent.runtime_precheck`
+- `agent.resource_snapshot`
+- `agent.docker_inspect`
+- `agent.docker_start_container`
+- `agent.docker_stop_container`
+
 测试运行：
 
 - `GET /api/v1/test-runs`
 - `GET /api/v1/test-runs/{id}`
 - `POST /api/v1/test-runs`
+
+脚本化 smoke（local-agent 路径）：
+
+- `scripts/controller_api_smoke.sh <base_url> [token] [agent_id] [model_id]`
+- `testsystem/scenarios/local_agent_execution_smoke.sh`
+
+阶段 A 收口（当前状态）：
+
+- agent 结果优先回写 `RuntimeInstance`（precheck/readiness/drift/resolved 状态 + 最近 task 摘要）。
+- `Node` 侧保留节点资源与 agent 在线事实，`Model` 侧优先消费 instance 投影。
+- 阶段 B 重点：instance-first reconcile、precheck/conflict/drift 深化、继续减少 direct fallback。

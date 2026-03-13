@@ -168,6 +168,79 @@ const (
 	ReadinessNotReady ReadinessState = "not_ready"
 )
 
+type PrecheckOverallStatus string
+
+const (
+	PrecheckStatusUnknown PrecheckOverallStatus = "unknown"
+	PrecheckStatusOK      PrecheckOverallStatus = "ok"
+	PrecheckStatusWarning PrecheckOverallStatus = "warning"
+	PrecheckStatusFailed  PrecheckOverallStatus = "failed"
+)
+
+type PrecheckCheckStatus string
+
+const (
+	PrecheckCheckPass    PrecheckCheckStatus = "pass"
+	PrecheckCheckWarning PrecheckCheckStatus = "warning"
+	PrecheckCheckFailed  PrecheckCheckStatus = "failed"
+	PrecheckCheckSkipped PrecheckCheckStatus = "skipped"
+)
+
+type PrecheckReasonCode string
+
+const (
+	PrecheckReasonModelPathMissing          PrecheckReasonCode = "model_path_missing"
+	PrecheckReasonRequiredEnvMissing        PrecheckReasonCode = "required_env_missing"
+	PrecheckReasonScriptMissing             PrecheckReasonCode = "script_missing"
+	PrecheckReasonPortConflict              PrecheckReasonCode = "port_conflict"
+	PrecheckReasonModelTypeMismatch         PrecheckReasonCode = "model_type_mismatch"
+	PrecheckReasonModelFormatMismatch       PrecheckReasonCode = "model_format_mismatch"
+	PrecheckReasonCommandOverrideNotAllowed PrecheckReasonCode = "command_override_not_allowed"
+	PrecheckReasonScriptMountNotAllowed     PrecheckReasonCode = "script_mount_not_allowed"
+	PrecheckReasonManifestInvalid           PrecheckReasonCode = "manifest_invalid"
+	PrecheckReasonBindingInvalid            PrecheckReasonCode = "binding_invalid"
+)
+
+type RuntimePrecheckReason struct {
+	Code     PrecheckReasonCode     `json:"code"`
+	Message  string                 `json:"message"`
+	Blocking bool                   `json:"blocking"`
+	Detail   map[string]interface{} `json:"detail,omitempty"`
+}
+
+type RuntimePrecheckCheckResult struct {
+	Name     string                 `json:"name"`
+	Status   PrecheckCheckStatus    `json:"status"`
+	Blocking bool                   `json:"blocking"`
+	Message  string                 `json:"message,omitempty"`
+	Detail   map[string]interface{} `json:"detail,omitempty"`
+}
+
+type RuntimePrecheckCompatibilityResult struct {
+	ModelType              string   `json:"model_type,omitempty"`
+	ModelFormat            string   `json:"model_format,omitempty"`
+	SupportedModelTypes    []string `json:"supported_model_types,omitempty"`
+	SupportedFormats       []string `json:"supported_formats,omitempty"`
+	ModelTypeMatched       bool     `json:"model_type_matched"`
+	ModelFormatMatched     bool     `json:"model_format_matched"`
+	CommandOverrideAllowed *bool    `json:"command_override_allowed,omitempty"`
+	ScriptMountAllowed     *bool    `json:"script_mount_allowed,omitempty"`
+}
+
+type RuntimePrecheckResult struct {
+	OverallStatus       PrecheckOverallStatus              `json:"overall_status"`
+	Gating              bool                               `json:"gating"`
+	Reasons             []RuntimePrecheckReason            `json:"reasons,omitempty"`
+	Checks              []RuntimePrecheckCheckResult       `json:"checks,omitempty"`
+	ResolvedMounts      []string                           `json:"resolved_mounts,omitempty"`
+	ResolvedEnv         map[string]string                  `json:"resolved_env,omitempty"`
+	ResolvedScript      string                             `json:"resolved_script,omitempty"`
+	ResolvedPorts       []string                           `json:"resolved_ports,omitempty"`
+	CompatibilityResult RuntimePrecheckCompatibilityResult `json:"compatibility_result"`
+	StartedAt           time.Time                          `json:"started_at,omitempty"`
+	FinishedAt          time.Time                          `json:"finished_at,omitempty"`
+}
+
 type TaskStatus string
 
 const (
@@ -193,6 +266,8 @@ const (
 	TaskTypeAgentModelPathCheck   TaskType = "agent.model_path_check"
 	TaskTypeAgentResourceSnapshot TaskType = "agent.resource_snapshot"
 	TaskTypeAgentDockerInspect    TaskType = "agent.docker_inspect"
+	TaskTypeAgentDockerStart      TaskType = "agent.docker_start_container"
+	TaskTypeAgentDockerStop       TaskType = "agent.docker_stop_container"
 )
 
 type TaskTargetType string
@@ -436,30 +511,94 @@ type RuntimeBinding struct {
 	UpdatedAt            time.Time           `json:"updated_at,omitempty"`
 }
 
+type RuntimeInstanceAgentTaskSummary struct {
+	TaskID          string     `json:"task_id,omitempty"`
+	TaskType        TaskType   `json:"task_type,omitempty"`
+	TaskStatus      TaskStatus `json:"task_status,omitempty"`
+	Message         string     `json:"message,omitempty"`
+	WorkerID        string     `json:"worker_id,omitempty"`
+	AssignedAgentID string     `json:"assigned_agent_id,omitempty"`
+	TriggeredBy     string     `json:"triggered_by,omitempty"`
+	FinishedAt      time.Time  `json:"finished_at,omitempty"`
+}
+
 type RuntimeInstance struct {
-	ID               string            `json:"id"`
-	ModelID          string            `json:"model_id"`
-	TemplateID       string            `json:"template_id"`
-	BindingID        string            `json:"binding_id"`
-	NodeID           string            `json:"node_id"`
-	DesiredState     string            `json:"desired_state,omitempty"`
-	ObservedState    string            `json:"observed_state,omitempty"`
-	Readiness        ReadinessState    `json:"readiness,omitempty"`
-	HealthMessage    string            `json:"health_message,omitempty"`
-	DriftReason      string            `json:"drift_reason,omitempty"`
-	Endpoint         string            `json:"endpoint,omitempty"`
-	LaunchedCommand  []string          `json:"launched_command,omitempty"`
-	MountedPaths     []string          `json:"mounted_paths,omitempty"`
-	InjectedEnv      map[string]string `json:"injected_env,omitempty"`
-	ScriptUsed       string            `json:"script_used,omitempty"`
-	LastReconciledAt time.Time         `json:"last_reconciled_at,omitempty"`
-	Metadata         map[string]string `json:"metadata,omitempty"`
-	CreatedAt        time.Time         `json:"created_at,omitempty"`
-	UpdatedAt        time.Time         `json:"updated_at,omitempty"`
+	ID                 string                           `json:"id"`
+	ModelID            string                           `json:"model_id"`
+	TemplateID         string                           `json:"template_id"`
+	BindingID          string                           `json:"binding_id"`
+	BindingMode        RuntimeBindingMode               `json:"binding_mode,omitempty"`
+	ManifestID         string                           `json:"manifest_id,omitempty"`
+	NodeID             string                           `json:"node_id"`
+	DesiredState       string                           `json:"desired_state,omitempty"`
+	ObservedState      string                           `json:"observed_state,omitempty"`
+	Readiness          ReadinessState                   `json:"readiness,omitempty"`
+	HealthMessage      string                           `json:"health_message,omitempty"`
+	DriftReason        string                           `json:"drift_reason,omitempty"`
+	Endpoint           string                           `json:"endpoint,omitempty"`
+	LaunchedCommand    []string                         `json:"launched_command,omitempty"`
+	MountedPaths       []string                         `json:"mounted_paths,omitempty"`
+	InjectedEnv        map[string]string                `json:"injected_env,omitempty"`
+	ScriptUsed         string                           `json:"script_used,omitempty"`
+	ResolvedMounts     []string                         `json:"resolved_mounts,omitempty"`
+	ResolvedPorts      []string                         `json:"resolved_ports,omitempty"`
+	ResolvedScript     string                           `json:"resolved_script,omitempty"`
+	LastReconciledAt   time.Time                        `json:"last_reconciled_at,omitempty"`
+	Metadata           map[string]string                `json:"metadata,omitempty"`
+	LastAgentTask      *RuntimeInstanceAgentTaskSummary `json:"last_agent_task,omitempty"`
+	PrecheckStatus     PrecheckOverallStatus            `json:"precheck_status,omitempty"`
+	PrecheckGating     bool                             `json:"precheck_gating"`
+	PrecheckReasons    []string                         `json:"precheck_reasons,omitempty"`
+	LastPrecheckTaskID string                           `json:"last_precheck_task_id,omitempty"`
+	LastPrecheckAt     time.Time                        `json:"last_precheck_at,omitempty"`
+	PrecheckResult     *RuntimePrecheckResult           `json:"precheck_result,omitempty"`
+	CreatedAt          time.Time                        `json:"created_at,omitempty"`
+	UpdatedAt          time.Time                        `json:"updated_at,omitempty"`
 }
 
 type LaunchProfile = RuntimeBinding
 type RuntimeDeployment = RuntimeInstance
+
+type AgentTaskResolvedContext struct {
+	TaskScope              string              `json:"task_scope,omitempty"`
+	RuntimeInstanceID      string              `json:"runtime_instance_id,omitempty"`
+	RuntimeBindingID       string              `json:"runtime_binding_id,omitempty"`
+	RuntimeTemplateID      string              `json:"runtime_template_id,omitempty"`
+	ManifestID             string              `json:"manifest_id,omitempty"`
+	NodeID                 string              `json:"node_id,omitempty"`
+	ModelID                string              `json:"model_id,omitempty"`
+	BindingMode            RuntimeBindingMode  `json:"binding_mode,omitempty"`
+	RuntimeKind            RuntimeKind         `json:"runtime_kind,omitempty"`
+	TemplateType           RuntimeTemplateType `json:"template_type,omitempty"`
+	Endpoint               string              `json:"endpoint,omitempty"`
+	HealthPath             string              `json:"health_path,omitempty"`
+	ModelPath              string              `json:"model_path,omitempty"`
+	ScriptRef              string              `json:"script_ref,omitempty"`
+	RuntimeContainerID     string              `json:"runtime_container_id,omitempty"`
+	ExposedPorts           []string            `json:"exposed_ports,omitempty"`
+	RequiredEnv            []string            `json:"required_env,omitempty"`
+	OptionalEnv            []string            `json:"optional_env,omitempty"`
+	MountPoints            []string            `json:"mount_points,omitempty"`
+	CommandOverrideAllowed *bool               `json:"command_override_allowed,omitempty"`
+	ScriptMountAllowed     *bool               `json:"script_mount_allowed,omitempty"`
+	CommandOverride        []string            `json:"command_override,omitempty"`
+	BindingMountRules      []string            `json:"binding_mount_rules,omitempty"`
+	BindingEnvOverrides    map[string]string   `json:"binding_env_overrides,omitempty"`
+	SupportedModelTypes    []string            `json:"supported_model_types,omitempty"`
+	SupportedFormats       []string            `json:"supported_formats,omitempty"`
+	ModelType              string              `json:"model_type,omitempty"`
+	ModelFormat            string              `json:"model_format,omitempty"`
+	ManifestVersion        string              `json:"manifest_version,omitempty"`
+	Metadata               map[string]string   `json:"metadata,omitempty"`
+}
+
+type AgentTaskProtocolError struct {
+	Code          string                 `json:"code"`
+	Message       string                 `json:"message"`
+	MissingFields []string               `json:"missing_fields,omitempty"`
+	Recoverable   bool                   `json:"recoverable"`
+	Detail        map[string]interface{} `json:"detail,omitempty"`
+}
 
 type Task struct {
 	ID              string                 `json:"id"`

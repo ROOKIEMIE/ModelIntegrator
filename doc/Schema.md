@@ -94,6 +94,72 @@ Model(asset)
 - 阶段 C 使用 `RuntimeInstance.endpoint/exposed_ports` 承接 Nginx/LiteLLM/外部 client 联调。
 - 阶段 D 在 `custom_bundle + manifest` 约束下演进专家模式，避免一次性 hack。
 
+## 0.1 阶段 A 第 1 步：Agent 任务输入升级为 Instance-First（2026-03-14）
+
+阶段 0 已把运行对象拆分完成，但 agent 任务仍主要依赖 `model_id/runtime_id` 粗粒度输入。  
+如果不升级输入协议，controller 在创建节点本地任务时仍要靠模型 metadata 猜上下文，agent 端也无法稳定获得 binding/manifest 约束信息。
+
+本轮原则：
+
+- agent 任务以 `RuntimeInstance` 为第一入口对象（`runtime_instance_id`）。
+- controller 创建任务时先解析：`RuntimeInstance -> RuntimeBinding -> RuntimeTemplate -> RuntimeBundleManifest`。
+- 解析结果写入任务 `payload/detail/resolved_context`，agent 拉到任务即可直接消费。
+- 旧 `model_id/node_id` 路径仅保留兼容用途，标记为 `legacy/compatibility`。
+
+### A. task 与 instance/binding/manifest 的关系（阶段 A 第 1 步）
+
+```text
+Task(agent.*)
+  input: runtime_instance_id (preferred)
+    -> resolve RuntimeInstance
+    -> resolve RuntimeBinding
+    -> resolve RuntimeTemplate
+    -> resolve RuntimeBundleManifest
+  output payload:
+    runtime_instance_id/runtime_binding_id/runtime_template_id/manifest_id
+    node_id/model_id/task_scope
+    resolved_context(binding_mode/runtime_kind/template_type/model_path/script_ref/ports/env...)
+```
+
+### B. 为什么必须升级输入对象
+
+- `RuntimeInstance` 才是 controller reconcile 与节点执行的运行态对象。
+- `RuntimeBinding` 才能表达 binding mode/script/env/挂载策略。
+- `RuntimeBundleManifest` 才能表达模板约束（runtime kind、ports、required env）。
+- 只有把三者一起放入 agent 任务上下文，后续 preflight、bundle 检查、状态反哺才可持续演进。
+
+## 0.2 阶段 A 第 4 步：状态归属收口到 RuntimeInstance（2026-03-14）
+
+阶段 A 第 4 步把“agent 节点事实”统一收口到 `RuntimeInstance`，形成 instance-first 运行态视图。
+
+### A. 状态归属原则（收口版）
+
+- `RuntimeInstance`：实例运行态主对象，优先承载 `precheck_* / observed_state / readiness / health_message / drift_reason / resolved_* / last_agent_task`。
+- `Node`：节点级事实对象，承载 agent 在线状态、资源快照摘要、节点能力画像、last_seen。
+- `Model`：资产与对外能力对象，优先消费 instance 投影，不再沉淀过多实例级检查细节。
+- `Task`：一次动作过程对象，保留原始 detail/result，不是长期运行态唯一归宿。
+
+### B. 统一映射（agent -> instance-first）
+
+| agent task type | RuntimeInstance 主更新 | Node 摘要回写 | Model 投影 |
+| --- | --- | --- | --- |
+| `agent.runtime_precheck` | `precheck_status/gating/reasons/precheck_result/resolved_mounts/resolved_ports/resolved_script` | 无强制（可留 task 原文） | 读取 instance 投影更新 readiness/health |
+| `agent.runtime_readiness_check` | `readiness/health_message/observed_state` | 无强制 | 读取 instance 投影 |
+| `agent.port_check` | `resolved_ports/health_message`（失败可降 readiness） | 无强制 | 读取 instance 投影 |
+| `agent.model_path_check` | `resolved_mounts/health_message`（失败可降 readiness） | 无强制 | 读取 instance 投影 |
+| `agent.resource_snapshot` | `last_agent_task + instance metadata snapshot 摘要` | 节点资源摘要（CPU/内存/磁盘/docker 可达性） | 仅保留轻量 metadata |
+| `agent.docker_inspect` | `observed_state/readiness/endpoint/health_message` | 运行时在线状态摘要 | 读取 instance 投影 |
+| `agent.docker_start_container` / `agent.docker_stop_container` | `observed_state/readiness/health_message` | 节点 runtime 在线状态摘要 | 读取 instance 投影 |
+
+### C. 阶段 B 进入条件（文档口径）
+
+满足以下条件即可进入阶段 B：
+
+1. agent 检查/执行结果已稳定先写入 `RuntimeInstance`。  
+2. API/前端可直接观察 instance 的 precheck/readiness/drift/last agent task。  
+3. controller 仍保留 direct fallback，但已是兼容路径而非主路径。  
+4. testsystem 可重复验证“任务成功 + instance 状态变化”链路。  
+
 ## 第一部分（前半）：当前项目架构设计
 
 ### 1. 架构基准（2026-03 第一阶段修正版）
@@ -117,6 +183,7 @@ Model(asset)
 - controller node 也运行 local agent。
 - controller 与 local agent 复用与 remote agent 一致的协议链路。
 - 目标：统一执行路径、减少本机特例、简化同机联调和回归。
+- 阶段 A 第 3 步约定：`one-click-up` 默认启用 local-agent，controller node 的节点局部动作优先走 agent。
 
 #### 1.4 Controller 最小降级自检边界
 
@@ -278,6 +345,19 @@ src/pkg/
 - `agent.model_path_check`
 - `agent.resource_snapshot`
 - `agent.docker_inspect`
+- `agent.docker_start_container`
+- `agent.docker_stop_container`
+
+执行类与检查类边界（阶段 A）：
+
+- 检查类：`runtime_precheck/runtime_readiness/port_check/model_path_check`
+- 执行类：`docker_start_container/docker_stop_container`
+- 观测类：`docker_inspect/resource_snapshot`
+
+local-agent-first（controller node）：
+
+- `runtime.start/stop/refresh` 在 controller node 场景优先派发 local-agent 子任务。
+- controller direct 路径保留为 compatibility fallback（agent 不在线或子任务失败时触发）。
 
 核心接口：
 
@@ -290,6 +370,7 @@ src/pkg/
 - `scripts/run_test.sh`
 - `scripts/collect_logs.sh`
 - `scenarios/e5_embedding_smoke.sh`
+- `scenarios/local_agent_execution_smoke.sh`
 - 日志输出：`./testsystem/logs/<run-id>/`
 
 #### 13.6 controller 测试运行能力 + 前端一键测试

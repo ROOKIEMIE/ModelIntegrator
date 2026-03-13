@@ -219,10 +219,23 @@ function normalizeModelRecord(model) {
   };
 }
 
+function readTaskContextField(task, key) {
+  if (!task || typeof task !== "object") {
+    return "";
+  }
+  const payload = task.payload && typeof task.payload === "object" ? task.payload : {};
+  const detail = task.detail && typeof task.detail === "object" ? task.detail : {};
+  const resolvedContext = payload.resolved_context && typeof payload.resolved_context === "object" ? payload.resolved_context : {};
+  const raw = resolvedContext[key] ?? payload[key] ?? detail[key];
+  return String(raw || "").trim();
+}
+
 function normalizeTaskRecord(task) {
   if (!task || typeof task !== "object") {
     return task;
   }
+  const payload = task.payload && typeof task.payload === "object" ? { ...task.payload } : {};
+  const resolvedContext = payload.resolved_context && typeof payload.resolved_context === "object" ? { ...payload.resolved_context } : {};
   const detail = task.detail && typeof task.detail === "object" ? { ...task.detail } : task.detail;
   if (detail && typeof detail === "object") {
     if (typeof detail.execution_worker === "string") {
@@ -232,13 +245,46 @@ function normalizeTaskRecord(task) {
       detail.node_id = normalizeNodeReference(detail.node_id);
     }
   }
+  const runtimeInstanceID = readTaskContextField({ payload, detail }, "runtime_instance_id");
+  const runtimeBindingID = readTaskContextField({ payload, detail }, "runtime_binding_id");
+  const runtimeTemplateID = readTaskContextField({ payload, detail }, "runtime_template_id");
+  const manifestID = readTaskContextField({ payload, detail }, "manifest_id");
+  const bindingMode = readTaskContextField({ payload, detail }, "binding_mode");
+  if (runtimeInstanceID) {
+    payload.runtime_instance_id = runtimeInstanceID;
+    if (resolvedContext && typeof resolvedContext === "object") {
+      resolvedContext.runtime_instance_id = runtimeInstanceID;
+    }
+  }
+  if (runtimeBindingID) {
+    payload.runtime_binding_id = runtimeBindingID;
+    if (resolvedContext && typeof resolvedContext === "object") {
+      resolvedContext.runtime_binding_id = runtimeBindingID;
+    }
+  }
+  if (runtimeTemplateID) {
+    payload.runtime_template_id = runtimeTemplateID;
+  }
+  if (manifestID) {
+    payload.manifest_id = manifestID;
+  }
+  if (bindingMode) {
+    payload.binding_mode = bindingMode;
+  }
+  payload.resolved_context = resolvedContext;
   return {
     ...task,
+    payload,
     worker_id: normalizeNodeText(task.worker_id),
     assigned_agent_id: normalizeNodeText(task.assigned_agent_id),
     target_id: normalizeNodeReference(task.target_id) || normalizeNodeText(task.target_id),
     message: normalizeNodeText(task.message),
     error: normalizeNodeText(task.error),
+    runtime_instance_id: runtimeInstanceID,
+    runtime_binding_id: runtimeBindingID,
+    runtime_template_id: runtimeTemplateID,
+    manifest_id: manifestID,
+    binding_mode: bindingMode,
     detail,
   };
 }
@@ -334,7 +380,11 @@ function renderNodes() {
     const managedNodeRaw = String(metadata.managed_node || "").toLowerCase();
     const isManagedNode = managedNodeRaw === "" || managedNodeRaw === "true";
     const localAgentExpected = String(metadata.local_agent_expected || "").toLowerCase();
+    const preferredLocalAgentID = String(metadata.preferred_local_agent_id || "").trim();
     const localAgentHint = localAgentExpected === "true" ? "应运行本机 agent" : localAgentExpected === "false" ? "本机 agent 非强制" : "-";
+    const lastAgentTaskType = String(metadata.last_agent_task_type || "").trim() || "-";
+    const lastAgentTaskAt = String(metadata.last_agent_task_at || "").trim();
+    const lastAgentTaskMsg = String(metadata.last_agent_task_message || "").trim() || "-";
     const architectureRole = isControllerNode && isManagedNode ? "controller + managed node" : isControllerNode ? "controller" : isManagedNode ? "managed node" : "unknown";
     const runtimeCount = Array.isArray(node.runtimes) ? node.runtimes.length : 0;
     const summaryParts = [
@@ -360,9 +410,10 @@ function renderNodes() {
         <div class="node-detail">
           <div class="meta">描述: ${escapeHTML(node.description || "-")}</div>
           <div class="meta">架构角色: ${escapeHTML(architectureRole)} | 分类: ${escapeHTML(node.classification || "-")} | 状态: ${escapeHTML(node.status || "unknown")} | 类型: ${escapeHTML(node.type || "-")} | 主机: ${escapeHTML(node.host || "-")}</div>
-          <div class="meta">角色字段: ${escapeHTML(node.role || "-")} | Managed Node: ${isManagedNode ? "yes" : "no"} | 本机 Agent 期望: ${escapeHTML(localAgentHint)}</div>
+          <div class="meta">角色字段: ${escapeHTML(node.role || "-")} | Managed Node: ${isManagedNode ? "yes" : "no"} | 本机 Agent 期望: ${escapeHTML(localAgentHint)} | 首选本机 Agent: ${escapeHTML(preferredLocalAgentID || "-")}</div>
           <div class="meta">能力分级: ${escapeHTML(node.capability_tier || "unknown")} | 能力来源: ${escapeHTML(node.capability_source || "unknown")} | 操作级别: ${escapeHTML(node.operation_level || "-")}</div>
           <div class="meta">Agent 状态: ${escapeHTML(agentStatus)} | 最近心跳: ${escapeHTML(formatTime(heartbeatAt))}</div>
+          <div class="meta">最近 Agent 动作: ${escapeHTML(lastAgentTaskType)} @ ${escapeHTML(formatTime(lastAgentTaskAt))} | 消息: ${escapeHTML(lastAgentTaskMsg)}</div>
           <div class="meta">能力说明: ${escapeHTML(node.capability_note || "-")}</div>
           <div class="meta">平台: ${(node.platform && node.platform.accelerator) || "unknown"} | GPU: ${(node.platform && node.platform.gpu) || "unknown"} | CUDA: ${(node.platform && node.platform.cuda_version) || "unknown"} | Driver: ${(node.platform && node.platform.driver) || "unknown"}</div>
           <div class="meta">Runtime 数量: ${runtimeCount} | 已装载模型: ${nodeLoadedCount}</div>
@@ -495,6 +546,20 @@ function statusPill(status) {
   return `<span class="status-pill status-${escapeHTML(cls)}">${escapeHTML(value)}</span>`;
 }
 
+function classifyAgentTask(type) {
+  const taskType = String(type || "").trim();
+  if (!taskType.startsWith("agent.")) {
+    return "controller";
+  }
+  if (taskType === "agent.runtime_precheck" || taskType.endsWith(".check") || taskType.includes("readiness")) {
+    return "check";
+  }
+  if (taskType === "agent.resource_snapshot") {
+    return "observe";
+  }
+  return "execute";
+}
+
 function renderTasks() {
   if (!tasksEl) {
     return;
@@ -510,10 +575,15 @@ function renderTasks() {
     const detailRaw = task.detail && typeof task.detail === "object" ? JSON.stringify(task.detail) : "";
     const detail = normalizeNodeText(detailRaw);
     const executionPath = task.detail && typeof task.detail === "object" ? String(task.detail.execution_path || "").trim() : "";
+    const runtimeInstanceID = String(task.runtime_instance_id || "").trim() || "-";
+    const runtimeBindingID = String(task.runtime_binding_id || "").trim() || "-";
+    const bindingMode = String(task.binding_mode || "").trim() || "-";
+    const taskClass = classifyAgentTask(task.type);
     item.innerHTML = `
       <div class="item-title">${escapeHTML(task.type)} (${escapeHTML(task.id)})</div>
-      <div class="meta">状态: ${statusPill(task.status)} | 进度: ${escapeHTML(String(task.progress || 0))}%</div>
+      <div class="meta">状态: ${statusPill(task.status)} | 分类: ${escapeHTML(taskClass)} | 进度: ${escapeHTML(String(task.progress || 0))}%</div>
       <div class="meta">目标: ${escapeHTML(task.target_type || "-")} / ${escapeHTML(task.target_id || "-")}</div>
+      <div class="meta">RuntimeInstance: ${escapeHTML(runtimeInstanceID)} | Binding: ${escapeHTML(runtimeBindingID)} | Binding Mode: ${escapeHTML(bindingMode)}</div>
       <div class="meta">执行者: ${escapeHTML(task.worker_id || task.assigned_agent_id || "-")} | 执行路径: ${escapeHTML(executionPath || "controller-direct")} | 开始: ${escapeHTML(formatTime(task.started_at))} | 结束: ${escapeHTML(formatTime(task.finished_at))}</div>
       <div class="meta">消息: ${escapeHTML(task.message || "-")}</div>
       <div class="meta">错误: ${escapeHTML(task.error || "-")}</div>
@@ -555,13 +625,44 @@ function renderRuntimeInstances() {
   }
   runtimeInstancesEl.innerHTML = "";
   state.runtimeInstances.slice(0, 20).forEach((instance) => {
+    const binding = Array.isArray(state.runtimeBindings)
+      ? state.runtimeBindings.find((item) => String(item.id || "").trim() === String(instance.binding_id || "").trim())
+      : null;
+    const bindingMode = String(instance.binding_mode || (binding && binding.binding_mode) || "").trim() || "-";
+    const precheckStatus = String(instance.precheck_status || "unknown").trim() || "unknown";
+    const precheckGating = instance.precheck_gating === true;
+    const precheckReasons = Array.isArray(instance.precheck_reasons) ? instance.precheck_reasons.filter(Boolean) : [];
+    const resolvedMounts = Array.isArray(instance.resolved_mounts) ? instance.resolved_mounts.filter(Boolean) : [];
+    const resolvedPorts = Array.isArray(instance.resolved_ports) ? instance.resolved_ports.filter(Boolean) : [];
+    const resolvedScript = String(instance.resolved_script || "").trim();
+    const lastAgentTask = instance.last_agent_task && typeof instance.last_agent_task === "object" ? instance.last_agent_task : null;
+    const lastAgentTaskSummary = lastAgentTask
+      ? `${lastAgentTask.task_type || "-"}:${lastAgentTask.task_status || "-"} @ ${formatTime(lastAgentTask.finished_at || lastAgentTask.created_at)}`
+      : "-";
+    const recentAgentTasks = Array.isArray(state.tasks)
+      ? state.tasks
+          .filter((task) => String(task.runtime_instance_id || "").trim() === String(instance.id || "").trim())
+          .filter((task) => String(task.type || "").startsWith("agent."))
+          .slice(0, 3)
+      : [];
+    const latestExecTask = recentAgentTasks.find((task) => classifyAgentTask(task.type) === "execute");
+    const taskSummary = recentAgentTasks.length > 0
+      ? recentAgentTasks
+          .map((task) => `[${classifyAgentTask(task.type)}] ${task.type || "-"}:${task.status || "-"}(${formatTime(task.finished_at || task.created_at)})`)
+          .join(" | ")
+      : "-";
     const item = document.createElement("div");
     item.className = "list-item";
     item.innerHTML = `
       <div class="item-title">${escapeHTML(instance.id || "-")}</div>
-      <div class="meta">model: ${escapeHTML(instance.model_id || "-")} | template: ${escapeHTML(instance.template_id || "-")} | binding: ${escapeHTML(instance.binding_id || "-")}</div>
+      <div class="meta">model: ${escapeHTML(instance.model_id || "-")} | template: ${escapeHTML(instance.template_id || "-")} | binding: ${escapeHTML(instance.binding_id || "-")} | mode: ${escapeHTML(bindingMode)}</div>
       <div class="meta">node: ${escapeHTML(instance.node_id || "-")} | desired/observed: ${escapeHTML(instance.desired_state || "-")} / ${escapeHTML(instance.observed_state || "-")} | readiness: ${escapeHTML(instance.readiness || "unknown")}</div>
-      <div class="meta">endpoint: ${escapeHTML(instance.endpoint || "-")} | drift: ${escapeHTML(instance.drift_reason || "-")}</div>
+      <div class="meta">precheck: ${statusPill(precheckStatus)} | gating: ${precheckGating ? "blocked" : "pass"} | reasons: ${escapeHTML(precheckReasons.join(",") || "-")}</div>
+      <div class="meta">endpoint: ${escapeHTML(instance.endpoint || "-")} | health: ${escapeHTML(instance.health_message || "-")} | drift: ${escapeHTML(instance.drift_reason || "-")}</div>
+      <div class="meta">resolved mounts: ${escapeHTML(resolvedMounts.join(",") || "-")} | resolved ports: ${escapeHTML(resolvedPorts.join(",") || "-")} | resolved script: ${escapeHTML(resolvedScript || "-")}</div>
+      <div class="meta">最近 instance agent 摘要: ${escapeHTML(lastAgentTaskSummary)}</div>
+      <div class="meta">最近 Agent Tasks: ${escapeHTML(taskSummary)}</div>
+      <div class="meta">最近执行类动作: ${escapeHTML(latestExecTask ? `${latestExecTask.type}:${latestExecTask.status}` : "-")}</div>
     `;
     runtimeInstancesEl.appendChild(item);
   });
@@ -969,6 +1070,7 @@ function renderModels() {
 
     const detailPanel = document.createElement("div");
     detailPanel.className = "model-detail-panel hidden";
+    const runtimeInstanceBindingMode = runtimeInstance && runtimeInstance.binding_mode ? runtimeInstance.binding_mode : (binding ? binding.binding_mode || "-" : "-");
     const detailLines = [
       `Provider: ${m.provider || "-"}`,
       `Runtime ID: ${m.runtime_id || "-"}`,
@@ -978,8 +1080,12 @@ function renderModels() {
       `Binding: ${binding ? binding.id || "-" : "-"} | mode: ${binding ? binding.binding_mode || "-" : "-"}`,
       `Binding compatibility: ${binding ? binding.compatibility_status || "unknown" : "unknown"} | message: ${binding ? binding.compatibility_message || "-" : "-"}`,
       `RuntimeInstance: ${runtimeInstance ? runtimeInstance.id || "-" : "-"} | node: ${runtimeInstance ? runtimeInstance.node_id || "-" : "-"}`,
+      `Runtime 链路: ${m.id || "-"} -> ${bindingTemplateID || "-"} -> ${binding ? binding.id || "-" : "-"} -> ${runtimeInstance ? runtimeInstance.id || "-" : "-"}`,
+      `RuntimeInstance binding mode: ${runtimeInstanceBindingMode || "-"} | manifest: ${runtimeInstance ? runtimeInstance.manifest_id || "-" : "-"}`,
       `RuntimeInstance desired/observed: ${runtimeInstance ? runtimeInstance.desired_state || "-" : "-"} / ${runtimeInstance ? runtimeInstance.observed_state || "-" : "-"}`,
       `RuntimeInstance readiness: ${runtimeInstance ? runtimeInstance.readiness || "unknown" : "unknown"} | drift: ${runtimeInstance ? runtimeInstance.drift_reason || "-" : "-"}`,
+      `RuntimeInstance precheck: ${runtimeInstance ? runtimeInstance.precheck_status || "unknown" : "unknown"} | gating: ${runtimeInstance && runtimeInstance.precheck_gating ? "blocked" : "pass"} | reasons: ${runtimeInstance && Array.isArray(runtimeInstance.precheck_reasons) ? runtimeInstance.precheck_reasons.join(",") || "-" : "-"}`,
+      `RuntimeInstance health: ${runtimeInstance ? runtimeInstance.health_message || "-" : "-"}`,
     ];
     detailLines.forEach((line) => {
       const detailRow = document.createElement("div");
@@ -1176,7 +1282,31 @@ function bindTestActions() {
 
     let runtimeTemplatesLoadFailed = false;
     await loadNodes();
-    await Promise.all([loadModels(), loadTasks(), loadTestRuns(), loadRuntimeBindings(), loadRuntimeInstances()]);
+    const loadResults = await Promise.allSettled([loadModels(), loadTasks(), loadTestRuns(), loadRuntimeBindings(), loadRuntimeInstances()]);
+    const loadErrors = loadResults
+      .map((result, idx) => {
+        if (result.status === "fulfilled") {
+          return "";
+        }
+        switch (idx) {
+          case 0:
+            return `模型加载失败: ${result.reason?.message || "unknown"}`;
+          case 1:
+            return `任务加载失败: ${result.reason?.message || "unknown"}`;
+          case 2:
+            return `测试加载失败: ${result.reason?.message || "unknown"}`;
+          case 3:
+            return `runtime binding 加载失败: ${result.reason?.message || "unknown"}`;
+          case 4:
+            return `runtime instance 加载失败: ${result.reason?.message || "unknown"}`;
+          default:
+            return "";
+        }
+      })
+      .filter((msg) => msg);
+    if (loadErrors.length > 0) {
+      showToast(loadErrors[0]);
+    }
     try {
       await loadRuntimeTemplates();
     } catch (err) {
@@ -1203,14 +1333,18 @@ function bindTestActions() {
     }
 
     setInterval(async () => {
-      try {
-        await Promise.all([loadTasks(), loadTestRuns(), loadRuntimeBindings(), loadRuntimeInstances()]);
-        renderRuntimeBindings();
-        renderRuntimeInstances();
+      const periodic = await Promise.allSettled([loadTasks(), loadTestRuns(), loadRuntimeBindings(), loadRuntimeInstances()]);
+      if (periodic[0].status === "fulfilled") {
         renderTasks();
+      }
+      if (periodic[1].status === "fulfilled") {
         renderTestRuns();
-      } catch (err) {
-        // no-op
+      }
+      if (periodic[2].status === "fulfilled") {
+        renderRuntimeBindings();
+      }
+      if (periodic[3].status === "fulfilled") {
+        renderRuntimeInstances();
       }
     }, 5000);
   } catch (err) {

@@ -242,6 +242,89 @@ func (h *Handler) GetRuntimeInstance(w http.ResponseWriter, r *http.Request) {
 	OK(w, item)
 }
 
+type runtimeInstanceStatusSummary struct {
+	RuntimeInstance  model.RuntimeInstance                  `json:"runtime_instance"`
+	RecentAgentTasks []model.Task                           `json:"recent_agent_tasks,omitempty"`
+	PrecheckStatus   model.PrecheckOverallStatus            `json:"precheck_status,omitempty"`
+	PrecheckGating   bool                                   `json:"precheck_gating"`
+	PrecheckReasons  []string                               `json:"precheck_reasons,omitempty"`
+	Readiness        model.ReadinessState                   `json:"readiness,omitempty"`
+	HealthMessage    string                                 `json:"health_message,omitempty"`
+	DriftReason      string                                 `json:"drift_reason,omitempty"`
+	LastAgentTask    *model.RuntimeInstanceAgentTaskSummary `json:"last_agent_task,omitempty"`
+}
+
+func (h *Handler) GetRuntimeInstanceSummary(w http.ResponseWriter, r *http.Request) {
+	if h.runtimeObjectService == nil {
+		Fail(w, http.StatusServiceUnavailable, "runtime object 服务未就绪", nil)
+		return
+	}
+	if h.taskService == nil {
+		Fail(w, http.StatusServiceUnavailable, "task 服务未就绪", nil)
+		return
+	}
+	runtimeInstanceID := strings.TrimSpace(chi.URLParam(r, "id"))
+	if runtimeInstanceID == "" {
+		Fail(w, http.StatusBadRequest, "runtime_instance_id 不能为空", nil)
+		return
+	}
+	limit := 5
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		if n, convErr := strconv.Atoi(raw); convErr == nil && n > 0 {
+			limit = n
+		}
+	}
+	instance, err := h.runtimeObjectService.GetRuntimeInstance(r.Context(), runtimeInstanceID)
+	if err != nil {
+		if errors.Is(err, service.ErrRuntimeInstanceNotFound) {
+			Fail(w, http.StatusNotFound, "runtime instance 不存在", map[string]string{"id": runtimeInstanceID})
+			return
+		}
+		Fail(w, http.StatusInternalServerError, "查询 runtime instance 失败", err.Error())
+		return
+	}
+	tasks, err := h.taskService.ListRuntimeInstanceAgentTasks(r.Context(), runtimeInstanceID, limit)
+	if err != nil {
+		Fail(w, http.StatusInternalServerError, "查询 runtime instance tasks 失败", err.Error())
+		return
+	}
+	OK(w, runtimeInstanceStatusSummary{
+		RuntimeInstance:  instance,
+		RecentAgentTasks: tasks,
+		PrecheckStatus:   instance.PrecheckStatus,
+		PrecheckGating:   instance.PrecheckGating,
+		PrecheckReasons:  instance.PrecheckReasons,
+		Readiness:        instance.Readiness,
+		HealthMessage:    instance.HealthMessage,
+		DriftReason:      instance.DriftReason,
+		LastAgentTask:    instance.LastAgentTask,
+	})
+}
+
+func (h *Handler) ListRuntimeInstanceAgentTasks(w http.ResponseWriter, r *http.Request) {
+	if h.taskService == nil {
+		Fail(w, http.StatusServiceUnavailable, "task 服务未就绪", nil)
+		return
+	}
+	runtimeInstanceID := strings.TrimSpace(chi.URLParam(r, "id"))
+	if runtimeInstanceID == "" {
+		Fail(w, http.StatusBadRequest, "runtime_instance_id 不能为空", nil)
+		return
+	}
+	limit := 20
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		if n, convErr := strconv.Atoi(raw); convErr == nil && n > 0 {
+			limit = n
+		}
+	}
+	items, err := h.taskService.ListRuntimeInstanceAgentTasks(r.Context(), runtimeInstanceID, limit)
+	if err != nil {
+		Fail(w, http.StatusInternalServerError, "查询 runtime instance agent tasks 失败", err.Error())
+		return
+	}
+	OK(w, items)
+}
+
 func (h *Handler) GetRuntimeTemplateManifest(w http.ResponseWriter, r *http.Request) {
 	if h.runtimeObjectService == nil {
 		Fail(w, http.StatusServiceUnavailable, "runtime object 服务未就绪", nil)
@@ -384,13 +467,18 @@ func (h *Handler) ListTasks(w http.ResponseWriter, r *http.Request) {
 	}
 	targetType := strings.TrimSpace(r.URL.Query().Get("target_type"))
 	targetID := strings.TrimSpace(r.URL.Query().Get("target_id"))
+	runtimeInstanceID := strings.TrimSpace(r.URL.Query().Get("runtime_instance_id"))
+	agentOnly := false
+	if raw := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("agent_only"))); raw == "1" || raw == "true" || raw == "yes" {
+		agentOnly = true
+	}
 	limit := 100
 	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
 		if n, convErr := strconv.Atoi(raw); convErr == nil && n > 0 {
 			limit = n
 		}
 	}
-	items, err := h.taskService.ListTasks(r.Context(), targetType, targetID, limit)
+	items, err := h.taskService.ListTasksFiltered(r.Context(), targetType, targetID, runtimeInstanceID, agentOnly, limit)
 	if err != nil {
 		Fail(w, http.StatusInternalServerError, "查询任务列表失败", err.Error())
 		return
@@ -447,6 +535,31 @@ func (h *Handler) CreateAgentNodeLocalTask(w http.ResponseWriter, r *http.Reques
 	item, err := h.taskService.CreateAgentNodeTask(r.Context(), req)
 	if err != nil {
 		Fail(w, http.StatusBadRequest, "创建 agent node-local task 失败", err.Error())
+		return
+	}
+	OK(w, item)
+}
+
+func (h *Handler) CreateAgentInstanceLocalTask(w http.ResponseWriter, r *http.Request) {
+	if h.taskService == nil {
+		Fail(w, http.StatusServiceUnavailable, "task 服务未就绪", nil)
+		return
+	}
+	req, err := parseAgentNodeLocalTaskPayload(r)
+	if err != nil {
+		Fail(w, http.StatusBadRequest, "agent instance-local task 请求体错误", err.Error())
+		return
+	}
+	if strings.TrimSpace(req.RuntimeInstanceID) == "" {
+		Fail(w, http.StatusBadRequest, "runtime_instance_id 不能为空", nil)
+		return
+	}
+	if strings.TrimSpace(req.TaskScope) == "" {
+		req.TaskScope = "runtime_instance"
+	}
+	item, err := h.taskService.CreateAgentNodeTask(r.Context(), req)
+	if err != nil {
+		Fail(w, http.StatusBadRequest, "创建 agent instance-local task 失败", err.Error())
 		return
 	}
 	OK(w, item)
@@ -735,22 +848,37 @@ func parseRuntimeTaskPayload(r *http.Request) (runtimeTaskPayload, error) {
 }
 
 type agentRuntimeTaskPayload struct {
-	AgentID        string `json:"agent_id"`
-	ModelID        string `json:"model_id"`
-	TargetID       string `json:"target_id"`
-	Endpoint       string `json:"endpoint"`
-	HealthPath     string `json:"health_path"`
-	TimeoutSeconds int    `json:"timeout_seconds"`
-	TriggeredBy    string `json:"triggered_by"`
+	RuntimeInstanceID string                 `json:"runtime_instance_id"`
+	RuntimeBindingID  string                 `json:"runtime_binding_id"`
+	RuntimeTemplateID string                 `json:"runtime_template_id"`
+	ManifestID        string                 `json:"manifest_id"`
+	AgentID           string                 `json:"agent_id"`
+	NodeID            string                 `json:"node_id"`
+	ModelID           string                 `json:"model_id"`
+	TargetID          string                 `json:"target_id"`
+	TaskScope         string                 `json:"task_scope"`
+	PayloadContext    map[string]interface{} `json:"payload_context"`
+	ResolvedContext   map[string]interface{} `json:"resolved_context"`
+	Endpoint          string                 `json:"endpoint"`
+	HealthPath        string                 `json:"health_path"`
+	TimeoutSeconds    int                    `json:"timeout_seconds"`
+	TriggeredBy       string                 `json:"triggered_by"`
 }
 
 type agentNodeLocalTaskPayload struct {
-	AgentID     string                 `json:"agent_id"`
-	NodeID      string                 `json:"node_id"`
-	ModelID     string                 `json:"model_id"`
-	TaskType    string                 `json:"task_type"`
-	Payload     map[string]interface{} `json:"payload"`
-	TriggeredBy string                 `json:"triggered_by"`
+	AgentID           string                 `json:"agent_id"`
+	NodeID            string                 `json:"node_id"`
+	ModelID           string                 `json:"model_id"`
+	RuntimeInstanceID string                 `json:"runtime_instance_id"`
+	RuntimeBindingID  string                 `json:"runtime_binding_id"`
+	RuntimeTemplateID string                 `json:"runtime_template_id"`
+	ManifestID        string                 `json:"manifest_id"`
+	TaskScope         string                 `json:"task_scope"`
+	PayloadContext    map[string]interface{} `json:"payload_context"`
+	ResolvedContext   map[string]interface{} `json:"resolved_context"`
+	TaskType          string                 `json:"task_type"`
+	Payload           map[string]interface{} `json:"payload"`
+	TriggeredBy       string                 `json:"triggered_by"`
 }
 
 func parseAgentRuntimeTaskPayload(r *http.Request) (service.AgentRuntimeReadinessTaskRequest, error) {
@@ -766,16 +894,22 @@ func parseAgentRuntimeTaskPayload(r *http.Request) (service.AgentRuntimeReadines
 		return service.AgentRuntimeReadinessTaskRequest{}, fmt.Errorf("解析 JSON 失败: %w", err)
 	}
 	modelID := strings.TrimSpace(firstNonEmpty(payload.ModelID, payload.TargetID))
-	if strings.TrimSpace(payload.AgentID) == "" || modelID == "" {
-		return service.AgentRuntimeReadinessTaskRequest{}, fmt.Errorf("agent_id/model_id 不能为空")
+	runtimeInstanceID := strings.TrimSpace(payload.RuntimeInstanceID)
+	if runtimeInstanceID == "" && modelID == "" {
+		return service.AgentRuntimeReadinessTaskRequest{}, fmt.Errorf("runtime_instance_id/model_id 不能为空")
+	}
+	if strings.TrimSpace(payload.AgentID) == "" && strings.TrimSpace(payload.NodeID) == "" && runtimeInstanceID == "" {
+		return service.AgentRuntimeReadinessTaskRequest{}, fmt.Errorf("agent_id/node_id 不能为空（未提供 runtime_instance_id 时）")
 	}
 	return service.AgentRuntimeReadinessTaskRequest{
-		AgentID:        strings.TrimSpace(payload.AgentID),
-		ModelID:        modelID,
-		Endpoint:       strings.TrimSpace(payload.Endpoint),
-		HealthPath:     strings.TrimSpace(payload.HealthPath),
-		TimeoutSeconds: payload.TimeoutSeconds,
-		TriggeredBy:    strings.TrimSpace(payload.TriggeredBy),
+		RuntimeInstanceID: runtimeInstanceID,
+		AgentID:           strings.TrimSpace(payload.AgentID),
+		NodeID:            strings.TrimSpace(payload.NodeID),
+		ModelID:           modelID,
+		Endpoint:          strings.TrimSpace(payload.Endpoint),
+		HealthPath:        strings.TrimSpace(payload.HealthPath),
+		TimeoutSeconds:    payload.TimeoutSeconds,
+		TriggeredBy:       strings.TrimSpace(payload.TriggeredBy),
 	}, nil
 }
 
@@ -798,20 +932,32 @@ func parseAgentNodeLocalTaskPayload(r *http.Request) (service.AgentNodeLocalTask
 		model.TaskTypeAgentPortCheck,
 		model.TaskTypeAgentModelPathCheck,
 		model.TaskTypeAgentResourceSnapshot,
-		model.TaskTypeAgentDockerInspect:
+		model.TaskTypeAgentDockerInspect,
+		model.TaskTypeAgentDockerStart,
+		model.TaskTypeAgentDockerStop:
 	default:
 		return service.AgentNodeLocalTaskRequest{}, fmt.Errorf("不支持的 agent task_type: %s", payload.TaskType)
 	}
-	if strings.TrimSpace(payload.AgentID) == "" && strings.TrimSpace(payload.NodeID) == "" {
-		return service.AgentNodeLocalTaskRequest{}, fmt.Errorf("agent_id 或 node_id 不能为空")
+	if strings.TrimSpace(payload.RuntimeInstanceID) == "" && strings.TrimSpace(payload.AgentID) == "" && strings.TrimSpace(payload.NodeID) == "" {
+		return service.AgentNodeLocalTaskRequest{}, fmt.Errorf("agent_id / node_id / runtime_instance_id 至少需要一个")
+	}
+	if strings.TrimSpace(payload.RuntimeInstanceID) == "" && strings.TrimSpace(payload.ModelID) == "" && strings.TrimSpace(payload.NodeID) == "" {
+		return service.AgentNodeLocalTaskRequest{}, fmt.Errorf("runtime_instance_id/model_id/node_id 至少需要一个")
 	}
 	return service.AgentNodeLocalTaskRequest{
-		AgentID:     strings.TrimSpace(payload.AgentID),
-		NodeID:      strings.TrimSpace(payload.NodeID),
-		ModelID:     strings.TrimSpace(payload.ModelID),
-		TaskType:    taskType,
-		Payload:     payload.Payload,
-		TriggeredBy: strings.TrimSpace(payload.TriggeredBy),
+		AgentID:           strings.TrimSpace(payload.AgentID),
+		NodeID:            strings.TrimSpace(payload.NodeID),
+		ModelID:           strings.TrimSpace(payload.ModelID),
+		RuntimeInstanceID: strings.TrimSpace(payload.RuntimeInstanceID),
+		RuntimeBindingID:  strings.TrimSpace(payload.RuntimeBindingID),
+		RuntimeTemplateID: strings.TrimSpace(payload.RuntimeTemplateID),
+		ManifestID:        strings.TrimSpace(payload.ManifestID),
+		TaskScope:         strings.TrimSpace(payload.TaskScope),
+		PayloadContext:    payload.PayloadContext,
+		ResolvedContext:   payload.ResolvedContext,
+		TaskType:          taskType,
+		Payload:           payload.Payload,
+		TriggeredBy:       strings.TrimSpace(payload.TriggeredBy),
 	}, nil
 }
 

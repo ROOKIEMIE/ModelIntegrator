@@ -42,6 +42,7 @@ type ModelService struct {
 
 type RuntimeObjectSyncer interface {
 	SyncModelRuntimeObjects(ctx context.Context, item model.Model) error
+	GetRuntimeInstanceByModelID(ctx context.Context, modelID string) (model.RuntimeInstance, error)
 }
 
 func NewModelService(
@@ -245,57 +246,36 @@ func (s *ModelService) ApplyAgentTaskObservation(ctx context.Context, task model
 	}
 	task.Detail["task_type"] = string(task.Type)
 	task.Detail["execution_path"] = "agent"
+	if s.runtimeSyncer != nil {
+		if instance, err := s.runtimeSyncer.GetRuntimeInstanceByModelID(ctx, modelID); err == nil {
+			applyModelRuntimeProjectionFromInstance(&m, instance, task, now, s.scheduler)
+			s.modelRegistry.Upsert(m)
+			return s.persistModel(ctx, m)
+		}
+	}
 
 	switch task.Type {
 	case model.TaskTypeAgentRuntimeReadiness, model.TaskTypeAgentRuntimePrecheck:
 		if success {
 			m.Readiness = model.ReadinessReady
-			if strings.TrimSpace(m.ObservedState) == "" {
-				m.ObservedState = string(model.ModelStateRunning)
-			}
-			m.HealthMessage = firstNonEmpty(message, "agent precheck passed")
+			m.HealthMessage = firstNonEmpty(message, m.HealthMessage, "agent check passed")
 		} else {
 			m.Readiness = model.ReadinessNotReady
-			m.HealthMessage = firstNonEmpty(message, "agent precheck failed")
+			m.HealthMessage = firstNonEmpty(message, "agent check failed")
 		}
 	case model.TaskTypeAgentPortCheck, model.TaskTypeAgentModelPathCheck:
 		if success {
-			m.HealthMessage = firstNonEmpty(message, m.HealthMessage, "agent node-local check passed")
+			m.HealthMessage = firstNonEmpty(message, m.HealthMessage, "agent check passed")
 		} else {
 			m.Readiness = model.ReadinessNotReady
-			m.HealthMessage = firstNonEmpty(message, "agent node-local check failed")
+			m.HealthMessage = firstNonEmpty(message, "agent check failed")
 		}
-	case model.TaskTypeAgentDockerInspect:
-		applyContainerRuntimeDetail(task.Detail, &m)
-		exists, hasExists := boolFromDetail(task.Detail, "runtime_exists")
-		running, hasRunning := boolFromDetail(task.Detail, "runtime_running")
-		switch {
-		case hasExists && !exists:
-			m.State = model.ModelStateStopped
-			m.ObservedState = string(model.ModelStateStopped)
+	case model.TaskTypeAgentDockerInspect, model.TaskTypeAgentDockerStart, model.TaskTypeAgentDockerStop:
+		if success {
+			m.HealthMessage = firstNonEmpty(message, m.HealthMessage, "agent runtime action finished")
+		} else {
 			m.Readiness = model.ReadinessNotReady
-			m.HealthMessage = firstNonEmpty(message, "agent docker inspect: container not exists")
-			clearContainerMetadata(&m)
-			s.scheduler.MarkStopped(m.ID)
-		case hasRunning && running:
-			m.State = model.ModelStateRunning
-			m.ObservedState = string(model.ModelStateRunning)
-			if ready, ok := boolFromDetail(task.Detail, "runtime_ready"); ok && !ready {
-				m.Readiness = model.ReadinessNotReady
-				m.HealthMessage = firstNonEmpty(message, "agent docker inspect: running but not ready")
-			} else {
-				m.Readiness = model.ReadinessReady
-				m.HealthMessage = firstNonEmpty(message, "agent docker inspect: running")
-			}
-			s.scheduler.MarkRunning(m)
-		case hasExists && exists:
-			m.State = model.ModelStateLoaded
-			m.ObservedState = string(model.ModelStateLoaded)
-			m.Readiness = model.ReadinessNotReady
-			m.HealthMessage = firstNonEmpty(message, "agent docker inspect: loaded")
-			s.scheduler.MarkStopped(m.ID)
-		default:
-			m.HealthMessage = firstNonEmpty(message, m.HealthMessage)
+			m.HealthMessage = firstNonEmpty(message, "agent runtime action failed")
 		}
 	case model.TaskTypeAgentResourceSnapshot:
 		if m.Metadata == nil {
@@ -306,10 +286,8 @@ func (s *ModelService) ApplyAgentTaskObservation(ctx context.Context, task model
 		m.HealthMessage = firstNonEmpty(message, m.HealthMessage)
 	}
 
-	if observed, ok := task.Detail["observed_state"]; ok {
-		if value := strings.TrimSpace(fmt.Sprint(observed)); value != "" {
-			m.ObservedState = value
-		}
+	if observed := strings.TrimSpace(fmt.Sprint(task.Detail["observed_state"])); observed != "" && observed != "<nil>" {
+		m.ObservedState = observed
 	}
 	if strings.TrimSpace(m.DesiredState) == "" {
 		m.DesiredState = string(m.State)
@@ -318,6 +296,79 @@ func (s *ModelService) ApplyAgentTaskObservation(ctx context.Context, task model
 	applyDrift(&m)
 	s.modelRegistry.Upsert(m)
 	return s.persistModel(ctx, m)
+}
+
+func applyModelRuntimeProjectionFromInstance(
+	m *model.Model,
+	instance model.RuntimeInstance,
+	task model.Task,
+	now time.Time,
+	schedulerRef *scheduler.Scheduler,
+) {
+	if m == nil {
+		return
+	}
+	if m.Metadata == nil {
+		m.Metadata = map[string]string{}
+	}
+	m.Metadata["runtime_instance_id"] = strings.TrimSpace(instance.ID)
+	m.Metadata["runtime_binding_id"] = strings.TrimSpace(instance.BindingID)
+	m.Metadata["runtime_template_id"] = strings.TrimSpace(instance.TemplateID)
+	if mode := strings.TrimSpace(string(instance.BindingMode)); mode != "" {
+		m.Metadata["runtime_binding_mode"] = mode
+	}
+	if manifestID := strings.TrimSpace(instance.ManifestID); manifestID != "" {
+		m.Metadata["runtime_manifest_id"] = manifestID
+	}
+	m.Metadata["runtime_instance_precheck_status"] = strings.TrimSpace(string(instance.PrecheckStatus))
+	m.Metadata["runtime_instance_precheck_gating"] = fmt.Sprintf("%t", instance.PrecheckGating)
+	if len(instance.PrecheckReasons) > 0 {
+		m.Metadata["runtime_instance_precheck_reasons"] = strings.Join(instance.PrecheckReasons, ",")
+	}
+	if instance.LastAgentTask != nil {
+		m.Metadata["runtime_instance_last_agent_task_type"] = strings.TrimSpace(string(instance.LastAgentTask.TaskType))
+		m.Metadata["runtime_instance_last_agent_task_status"] = strings.TrimSpace(string(instance.LastAgentTask.TaskStatus))
+		if !instance.LastAgentTask.FinishedAt.IsZero() {
+			m.Metadata["runtime_instance_last_agent_task_at"] = instance.LastAgentTask.FinishedAt.UTC().Format(time.RFC3339)
+		}
+	}
+
+	if endpoint := strings.TrimSpace(instance.Endpoint); endpoint != "" {
+		m.Endpoint = endpoint
+	}
+	if observed := strings.TrimSpace(instance.ObservedState); observed != "" {
+		m.ObservedState = observed
+		switch strings.ToLower(observed) {
+		case "running":
+			m.State = model.ModelStateRunning
+			if schedulerRef != nil {
+				schedulerRef.MarkRunning(*m)
+			}
+		case "loaded":
+			m.State = model.ModelStateLoaded
+			if schedulerRef != nil {
+				schedulerRef.MarkStopped(m.ID)
+			}
+		case "stopped":
+			m.State = model.ModelStateStopped
+			if schedulerRef != nil {
+				schedulerRef.MarkStopped(m.ID)
+			}
+		}
+	}
+	if strings.TrimSpace(string(instance.Readiness)) != "" {
+		m.Readiness = instance.Readiness
+	}
+	if msg := strings.TrimSpace(instance.HealthMessage); msg != "" {
+		m.HealthMessage = msg
+	} else if msg := strings.TrimSpace(task.Message); msg != "" {
+		m.HealthMessage = msg
+	}
+	if instance.LastReconciledAt.IsZero() {
+		m.LastReconciledAt = now
+	} else {
+		m.LastReconciledAt = instance.LastReconciledAt
+	}
 }
 
 func (s *ModelService) StartAutoRefresh(ctx context.Context, interval time.Duration) {

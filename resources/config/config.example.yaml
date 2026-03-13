@@ -23,6 +23,7 @@ controller:
   node_id: "node-controller"
   node_name: "Controller Node"
   node_host: "192.168.50.102"
+  # 阶段 A：controller node 同时作为 managed node，默认走 local-agent-first 执行路径。
   local_agent_expected: true
   local_agent_id: "agent-controller-local"
 

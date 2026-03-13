@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -62,8 +63,22 @@ func (s *Store) initSchema(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, `PRAGMA foreign_keys = ON;`); err != nil {
 		return fmt.Errorf("enable sqlite foreign keys failed: %w", err)
 	}
+	// 尽量减少多进程/多协程争用时的 SQLITE_BUSY，并提升读写并发容忍度。
+	for _, stmt := range []string{
+		`PRAGMA busy_timeout = 5000;`,
+		`PRAGMA journal_mode = WAL;`,
+		`PRAGMA synchronous = NORMAL;`,
+	} {
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+			s.logger.Warn("set sqlite pragma failed (continue)", "stmt", stmt, "error", err)
+		}
+	}
 	for _, stmt := range schemaStatements {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+			if isIgnorableLegacyIndexError(stmt, err) {
+				s.logger.Warn("skip legacy index creation before column migration", "stmt", stmt, "error", err)
+				continue
+			}
 			return fmt.Errorf("init sqlite schema failed: %w", err)
 		}
 	}
@@ -88,9 +103,48 @@ func (s *Store) initSchema(ctx context.Context) error {
 		{table: "models", column: "readiness", definition: "TEXT NOT NULL DEFAULT 'unknown'"},
 		{table: "models", column: "health_message", definition: "TEXT NOT NULL DEFAULT ''"},
 		{table: "models", column: "last_reconciled_at", definition: "TEXT NOT NULL DEFAULT ''"},
+		{table: "runtime_instances", column: "precheck_status", definition: "TEXT NOT NULL DEFAULT 'unknown'"},
+		{table: "runtime_instances", column: "precheck_gating", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{table: "runtime_instances", column: "precheck_reasons_json", definition: "TEXT NOT NULL DEFAULT '[]'"},
+		{table: "runtime_instances", column: "last_precheck_task_id", definition: "TEXT NOT NULL DEFAULT ''"},
+		{table: "runtime_instances", column: "last_precheck_at", definition: "TEXT NOT NULL DEFAULT ''"},
+		{table: "runtime_instances", column: "precheck_result_json", definition: "TEXT NOT NULL DEFAULT '{}'"},
+		{table: "tasks", column: "assigned_agent_id", definition: "TEXT NOT NULL DEFAULT ''"},
+		{table: "tasks", column: "worker_id", definition: "TEXT NOT NULL DEFAULT ''"},
+		{table: "tasks", column: "detail_json", definition: "TEXT NOT NULL DEFAULT '{}'"},
+		{table: "tasks", column: "payload_json", definition: "TEXT NOT NULL DEFAULT '{}'"},
+		{table: "tasks", column: "accepted_at", definition: "TEXT NOT NULL DEFAULT ''"},
+		{table: "tasks", column: "started_at", definition: "TEXT NOT NULL DEFAULT ''"},
+		{table: "tasks", column: "finished_at", definition: "TEXT NOT NULL DEFAULT ''"},
+		{table: "tasks", column: "updated_at", definition: "TEXT NOT NULL DEFAULT ''"},
 	} {
 		if err := s.ensureColumn(ctx, migration.table, migration.column, migration.definition); err != nil {
 			return err
+		}
+	}
+	if err := s.ensureTaskIndexes(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func isIgnorableLegacyIndexError(stmt string, err error) bool {
+	stmt = strings.TrimSpace(strings.ToLower(stmt))
+	if !strings.Contains(stmt, "create index if not exists idx_tasks_status_agent") &&
+		!strings.Contains(stmt, "create index if not exists idx_tasks_target") {
+		return false
+	}
+	errText := strings.ToLower(strings.TrimSpace(err.Error()))
+	return strings.Contains(errText, "no such column")
+}
+
+func (s *Store) ensureTaskIndexes(ctx context.Context) error {
+	for _, stmt := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_tasks_target ON tasks(target_type, target_id, created_at DESC);`,
+		`CREATE INDEX IF NOT EXISTS idx_tasks_status_agent ON tasks(status, assigned_agent_id, created_at DESC);`,
+	} {
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("init sqlite task index failed: %w", err)
 		}
 	}
 	return nil
@@ -799,8 +853,10 @@ func (s *Store) UpsertRuntimeInstance(ctx context.Context, item model.RuntimeIns
 			id, model_id, template_id, binding_id, node_id, desired_state, observed_state,
 			readiness, health_message, drift_reason, endpoint,
 			launched_command_json, mounted_paths_json, injected_env_json, script_used,
-			last_reconciled_at, metadata_json, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			last_reconciled_at, metadata_json,
+			precheck_status, precheck_gating, precheck_reasons_json, last_precheck_task_id, last_precheck_at, precheck_result_json,
+			created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			model_id = excluded.model_id,
 			template_id = excluded.template_id,
@@ -818,6 +874,12 @@ func (s *Store) UpsertRuntimeInstance(ctx context.Context, item model.RuntimeIns
 			script_used = excluded.script_used,
 			last_reconciled_at = excluded.last_reconciled_at,
 			metadata_json = excluded.metadata_json,
+			precheck_status = excluded.precheck_status,
+			precheck_gating = excluded.precheck_gating,
+			precheck_reasons_json = excluded.precheck_reasons_json,
+			last_precheck_task_id = excluded.last_precheck_task_id,
+			last_precheck_at = excluded.last_precheck_at,
+			precheck_result_json = excluded.precheck_result_json,
 			created_at = CASE WHEN runtime_instances.created_at = '' THEN excluded.created_at ELSE runtime_instances.created_at END,
 			updated_at = excluded.updated_at;
 	`,
@@ -838,6 +900,12 @@ func (s *Store) UpsertRuntimeInstance(ctx context.Context, item model.RuntimeIns
 		strings.TrimSpace(item.ScriptUsed),
 		timeToText(item.LastReconciledAt),
 		mustJSON(item.Metadata, "{}"),
+		firstNonEmpty(strings.TrimSpace(string(item.PrecheckStatus)), string(model.PrecheckStatusUnknown)),
+		boolToInt(item.PrecheckGating),
+		mustJSON(item.PrecheckReasons, "[]"),
+		strings.TrimSpace(item.LastPrecheckTaskID),
+		timeToText(item.LastPrecheckAt),
+		mustJSON(item.PrecheckResult, "{}"),
 		timeToText(createdAt),
 		timeToText(now),
 	)
@@ -852,7 +920,9 @@ func (s *Store) ListRuntimeInstances(ctx context.Context) ([]model.RuntimeInstan
 		SELECT id, model_id, template_id, binding_id, node_id, desired_state, observed_state,
 		       readiness, health_message, drift_reason, endpoint,
 		       launched_command_json, mounted_paths_json, injected_env_json, script_used,
-		       last_reconciled_at, metadata_json, created_at, updated_at
+		       last_reconciled_at, metadata_json,
+		       precheck_status, precheck_gating, precheck_reasons_json, last_precheck_task_id, last_precheck_at, precheck_result_json,
+		       created_at, updated_at
 		FROM runtime_instances
 		ORDER BY id;
 	`)
@@ -871,6 +941,12 @@ func (s *Store) ListRuntimeInstances(ctx context.Context) ([]model.RuntimeInstan
 			injectedEnvRaw     string
 			metadataRaw        string
 			lastReconciledRaw  string
+			precheckStatusRaw  string
+			precheckGatingRaw  int
+			precheckReasonsRaw string
+			lastPrecheckTaskID string
+			lastPrecheckAtRaw  string
+			precheckResultRaw  string
 			createdAtRaw       string
 			updatedAtRaw       string
 		)
@@ -878,7 +954,9 @@ func (s *Store) ListRuntimeInstances(ctx context.Context) ([]model.RuntimeInstan
 			&item.ID, &item.ModelID, &item.TemplateID, &item.BindingID, &item.NodeID, &item.DesiredState, &item.ObservedState,
 			&readinessRaw, &item.HealthMessage, &item.DriftReason, &item.Endpoint,
 			&launchedCommandRaw, &mountedPathsRaw, &injectedEnvRaw, &item.ScriptUsed,
-			&lastReconciledRaw, &metadataRaw, &createdAtRaw, &updatedAtRaw,
+			&lastReconciledRaw, &metadataRaw,
+			&precheckStatusRaw, &precheckGatingRaw, &precheckReasonsRaw, &lastPrecheckTaskID, &lastPrecheckAtRaw, &precheckResultRaw,
+			&createdAtRaw, &updatedAtRaw,
 		); err != nil {
 			return nil, fmt.Errorf("scan runtime instance failed: %w", err)
 		}
@@ -888,6 +966,12 @@ func (s *Store) ListRuntimeInstances(ctx context.Context) ([]model.RuntimeInstan
 		item.InjectedEnv = parseStringMap(injectedEnvRaw)
 		item.LastReconciledAt = textToTime(lastReconciledRaw)
 		item.Metadata = parseStringMap(metadataRaw)
+		item.PrecheckStatus = model.PrecheckOverallStatus(strings.TrimSpace(precheckStatusRaw))
+		item.PrecheckGating = precheckGatingRaw == 1
+		item.PrecheckReasons = parseStringSlice(precheckReasonsRaw)
+		item.LastPrecheckTaskID = strings.TrimSpace(lastPrecheckTaskID)
+		item.LastPrecheckAt = textToTime(lastPrecheckAtRaw)
+		item.PrecheckResult = parseRuntimePrecheckResult(precheckResultRaw)
 		item.CreatedAt = textToTime(createdAtRaw)
 		item.UpdatedAt = textToTime(updatedAtRaw)
 		out = append(out, item)
@@ -903,7 +987,9 @@ func (s *Store) GetRuntimeInstanceByID(ctx context.Context, id string) (model.Ru
 		SELECT id, model_id, template_id, binding_id, node_id, desired_state, observed_state,
 		       readiness, health_message, drift_reason, endpoint,
 		       launched_command_json, mounted_paths_json, injected_env_json, script_used,
-		       last_reconciled_at, metadata_json, created_at, updated_at
+		       last_reconciled_at, metadata_json,
+		       precheck_status, precheck_gating, precheck_reasons_json, last_precheck_task_id, last_precheck_at, precheck_result_json,
+		       created_at, updated_at
 		FROM runtime_instances
 		WHERE id = ? LIMIT 1;
 	`, strings.TrimSpace(id))
@@ -916,6 +1002,12 @@ func (s *Store) GetRuntimeInstanceByID(ctx context.Context, id string) (model.Ru
 		injectedEnvRaw     string
 		metadataRaw        string
 		lastReconciledRaw  string
+		precheckStatusRaw  string
+		precheckGatingRaw  int
+		precheckReasonsRaw string
+		lastPrecheckTaskID string
+		lastPrecheckAtRaw  string
+		precheckResultRaw  string
 		createdAtRaw       string
 		updatedAtRaw       string
 	)
@@ -923,7 +1015,9 @@ func (s *Store) GetRuntimeInstanceByID(ctx context.Context, id string) (model.Ru
 		&item.ID, &item.ModelID, &item.TemplateID, &item.BindingID, &item.NodeID, &item.DesiredState, &item.ObservedState,
 		&readinessRaw, &item.HealthMessage, &item.DriftReason, &item.Endpoint,
 		&launchedCommandRaw, &mountedPathsRaw, &injectedEnvRaw, &item.ScriptUsed,
-		&lastReconciledRaw, &metadataRaw, &createdAtRaw, &updatedAtRaw,
+		&lastReconciledRaw, &metadataRaw,
+		&precheckStatusRaw, &precheckGatingRaw, &precheckReasonsRaw, &lastPrecheckTaskID, &lastPrecheckAtRaw, &precheckResultRaw,
+		&createdAtRaw, &updatedAtRaw,
 	)
 	if err == sql.ErrNoRows {
 		return model.RuntimeInstance{}, false, nil
@@ -937,6 +1031,12 @@ func (s *Store) GetRuntimeInstanceByID(ctx context.Context, id string) (model.Ru
 	item.InjectedEnv = parseStringMap(injectedEnvRaw)
 	item.LastReconciledAt = textToTime(lastReconciledRaw)
 	item.Metadata = parseStringMap(metadataRaw)
+	item.PrecheckStatus = model.PrecheckOverallStatus(strings.TrimSpace(precheckStatusRaw))
+	item.PrecheckGating = precheckGatingRaw == 1
+	item.PrecheckReasons = parseStringSlice(precheckReasonsRaw)
+	item.LastPrecheckTaskID = strings.TrimSpace(lastPrecheckTaskID)
+	item.LastPrecheckAt = textToTime(lastPrecheckAtRaw)
+	item.PrecheckResult = parseRuntimePrecheckResult(precheckResultRaw)
 	item.CreatedAt = textToTime(createdAtRaw)
 	item.UpdatedAt = textToTime(updatedAtRaw)
 	return item, true, nil
@@ -1471,20 +1571,27 @@ func scanAgent(scanner agentScanner) (model.Agent, error) {
 
 func scanTask(scanner agentScanner) (model.Task, error) {
 	var (
-		item          model.Task
-		typeRaw       string
-		targetTypeRaw string
-		statusRaw     string
-		detailJSON    string
-		payloadJSON   string
-		createdAtRaw  string
-		acceptedAtRaw string
-		startedAtRaw  string
-		finishedAtRaw string
+		item           model.Task
+		idRaw          sql.NullString
+		typeRaw        sql.NullString
+		targetTypeRaw  sql.NullString
+		targetIDRaw    sql.NullString
+		assignedRaw    sql.NullString
+		workerRaw      sql.NullString
+		statusRaw      sql.NullString
+		progressRaw    interface{}
+		messageRaw     sql.NullString
+		detailJSONRaw  sql.NullString
+		payloadJSONRaw sql.NullString
+		errorRaw       sql.NullString
+		createdAtRaw   sql.NullString
+		acceptedAtRaw  sql.NullString
+		startedAtRaw   sql.NullString
+		finishedAtRaw  sql.NullString
 	)
 	if err := scanner.Scan(
-		&item.ID, &typeRaw, &targetTypeRaw, &item.TargetID, &item.AssignedAgentID, &item.WorkerID,
-		&statusRaw, &item.Progress, &item.Message, &detailJSON, &payloadJSON, &item.Error,
+		&idRaw, &typeRaw, &targetTypeRaw, &targetIDRaw, &assignedRaw, &workerRaw,
+		&statusRaw, &progressRaw, &messageRaw, &detailJSONRaw, &payloadJSONRaw, &errorRaw,
 		&createdAtRaw, &acceptedAtRaw, &startedAtRaw, &finishedAtRaw,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1492,17 +1599,67 @@ func scanTask(scanner agentScanner) (model.Task, error) {
 		}
 		return model.Task{}, fmt.Errorf("scan task failed: %w", err)
 	}
-	item.Type = model.TaskType(strings.TrimSpace(typeRaw))
-	item.TargetType = model.TaskTargetType(strings.TrimSpace(targetTypeRaw))
-	item.Status = model.TaskStatus(strings.TrimSpace(statusRaw))
-	item.Progress = clampProgress(item.Progress)
-	item.Detail = parseObjectMap(detailJSON)
-	item.Payload = parseObjectMap(payloadJSON)
-	item.CreatedAt = textToTime(createdAtRaw)
-	item.AcceptedAt = textToTime(acceptedAtRaw)
-	item.StartedAt = textToTime(startedAtRaw)
-	item.FinishedAt = textToTime(finishedAtRaw)
+	item.ID = strings.TrimSpace(idRaw.String)
+	item.Type = model.TaskType(strings.TrimSpace(typeRaw.String))
+	item.TargetType = model.TaskTargetType(strings.TrimSpace(targetTypeRaw.String))
+	item.TargetID = strings.TrimSpace(targetIDRaw.String)
+	item.AssignedAgentID = strings.TrimSpace(assignedRaw.String)
+	item.WorkerID = strings.TrimSpace(workerRaw.String)
+	item.Status = model.TaskStatus(strings.TrimSpace(statusRaw.String))
+	item.Progress = clampProgress(intFromDBValue(progressRaw))
+	item.Message = strings.TrimSpace(messageRaw.String)
+	item.Detail = parseObjectMap(strings.TrimSpace(detailJSONRaw.String))
+	item.Payload = parseObjectMap(strings.TrimSpace(payloadJSONRaw.String))
+	item.Error = strings.TrimSpace(errorRaw.String)
+	item.CreatedAt = textToTime(strings.TrimSpace(createdAtRaw.String))
+	item.AcceptedAt = textToTime(strings.TrimSpace(acceptedAtRaw.String))
+	item.StartedAt = textToTime(strings.TrimSpace(startedAtRaw.String))
+	item.FinishedAt = textToTime(strings.TrimSpace(finishedAtRaw.String))
 	return item, nil
+}
+
+func intFromDBValue(raw interface{}) int {
+	switch value := raw.(type) {
+	case nil:
+		return 0
+	case int:
+		return value
+	case int32:
+		return int(value)
+	case int64:
+		return int(value)
+	case float32:
+		return int(value)
+	case float64:
+		return int(value)
+	case []byte:
+		text := strings.TrimSpace(string(value))
+		if text == "" {
+			return 0
+		}
+		if parsed, err := strconv.Atoi(text); err == nil {
+			return parsed
+		}
+		return 0
+	case string:
+		text := strings.TrimSpace(value)
+		if text == "" {
+			return 0
+		}
+		if parsed, err := strconv.Atoi(text); err == nil {
+			return parsed
+		}
+		return 0
+	default:
+		text := strings.TrimSpace(fmt.Sprint(value))
+		if text == "" || text == "<nil>" {
+			return 0
+		}
+		if parsed, err := strconv.Atoi(text); err == nil {
+			return parsed
+		}
+		return 0
+	}
 }
 
 func scanTestRun(scanner agentScanner) (model.TestRun, error) {
@@ -1681,6 +1838,18 @@ func parseRuntimeHealthcheck(raw string) model.RuntimeHealthcheck {
 		return model.RuntimeHealthcheck{}
 	}
 	return out
+}
+
+func parseRuntimePrecheckResult(raw string) *model.RuntimePrecheckResult {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "{}" || raw == "null" {
+		return nil
+	}
+	var out model.RuntimePrecheckResult
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil
+	}
+	return &out
 }
 
 func timeToText(ts time.Time) string {
