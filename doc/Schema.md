@@ -4,12 +4,14 @@
 
 - 精简入口文档：[`../README.md`](../README.md)
 - 变更日志：[`./LOG.md`](./LOG.md)
+- 研究索引：[`./Research-Index.md`](./Research-Index.md)
+- 增强路线图：[`./Enhancement-Roadmap.md`](./Enhancement-Roadmap.md)
 
 ---
 
 ## 0. 阶段 0：运行对象模型重构（2026-03-13）
 
-本节是当前版本的建模基线，先于后续 A/B/C/D 阶段执行。目标是把“模型资产 / 运行模板 / 绑定配置 / 运行实例 / 运行包约束”彻底拆开，并给 controller 后续编排留出稳定对象面。
+本节是当前版本的建模基线，先于后续 A/B/C/D/E 阶段执行。目标是把“模型资产 / 运行模板 / 绑定配置 / 运行实例 / 运行包约束”彻底拆开，并给 controller 后续编排留出稳定对象面。
 
 ### A. 运行对象模型总览
 
@@ -76,7 +78,7 @@ Model(asset)
 - 进入系统前必须通过 `RuntimeBundleManifest`（能力、注入方式、健康检查、端口暴露、环境变量要求）的约束校验。
 - 阶段 0 已提供 manifest 数据结构、最小校验入口、API 可见性；完整 bundle 执行器放在后续阶段 D 演进。
 
-### F. 与阶段 A/B/C/D 的关系
+### F. 与阶段 A/B/C/D/E 的关系
 
 当前开发顺序（新计划）：
 
@@ -85,6 +87,7 @@ Model(asset)
 3. 阶段 B：Controller 编排内核做深
 4. 阶段 C：外围组件真实联调（Nginx -> LiteLLM -> 外部 embedding/RAG）
 5. 阶段 D：产品化与长期扩展（UI、更多模型类型、custom bundle/expert mode、审计恢复策略插件化）
+6. 阶段 E：应用层任务调度器（application planner / heterogeneous orchestration / workflow planner）
 
 衔接关系：
 
@@ -93,6 +96,7 @@ Model(asset)
 - 阶段 B 围绕 `RuntimeInstance` 进行 reconcile/conflict/drift 协调。
 - 阶段 C 使用 `RuntimeInstance.endpoint/exposed_ports` 承接 Nginx/LiteLLM/外部 client 联调。
 - 阶段 D 在 `custom_bundle + manifest` 约束下演进专家模式，避免一次性 hack。
+- 阶段 E 建立在 `controller + agent + RuntimeInstance` 之上，进入应用层任务拆解、模型选择、结果聚合编排。
 
 ## 0.1 阶段 A 第 1 步：Agent 任务输入升级为 Instance-First（2026-03-14）
 
@@ -210,6 +214,7 @@ controller 仅保留自举与存活必需的本机检查：
 - 阶段 B：Controller 编排内核做深（围绕 `RuntimeInstance` reconcile/precheck/conflict/drift）
 - 阶段 C：外围组件真实联调（Nginx -> LiteLLM -> 外部 embedding/RAG，以 E5 链路为第一条标准链）
 - 阶段 D：产品化与长期扩展（更完整 UI、多模型类型、custom bundle/expert mode、审计恢复与策略插件化）
+- 阶段 E：应用层任务调度器（在现有控制面之上实现 heterogeneous orchestration / workflow planner）
 
 ### 2. 当前系统形态（2026-03）
 
@@ -301,10 +306,13 @@ src/pkg/
 
 ### 12. 计划实现能力（阶段化）
 
-- 完整 remote agent 扩展与多节点规模化纳管
-- 更完整 runtime 类型覆盖与动作编排
-- 调度策略、冲突策略与动作审计增强
-- 下载编排 UI 与测试体系完善
+- 阶段 A（Layer 1/2 衔接）：agent 节点执行面继续做实，强化 instance-first 状态收口与 local-agent-first 主路径。
+- 阶段 B（Layer 2 重点）：controller 编排内核深化（instance-first reconcile、precheck/conflict/drift、load/unload planner）。
+- 阶段 C（Layer 1/2 联通）：外围组件真实联调（Nginx -> LiteLLM -> 外部 embedding/RAG）与端到端链路稳定化。
+- 阶段 D（Layer 1/2 完善）：产品化与专家模式演进（custom bundle 在 manifest 约束下扩展）。
+- 阶段 E（Layer 3 进入）：应用层任务调度器（application planner / workflow orchestrator），承接复杂任务拆解、模型选择与结果聚合。
+- 研究与增强资料索引：[`./Research-Index.md`](./Research-Index.md)
+- 阶段增强路线图：[`./Enhancement-Roadmap.md`](./Enhancement-Roadmap.md)
 
 ### 13. 功能详细说明
 
@@ -460,7 +468,47 @@ ${TEST_LOG_ROOT_HOST:-./testsystem/logs}:/workspace/test-logs
 
 ### 15. 路线说明（已确认）
 
-- 继续强化 agent-first 的节点动作链路
-- 扩展远端 agent/runtime 协调能力
-- 完善下载编排、测试覆盖与可观测性
-- 持续在 `doc/LOG.md` 维护演进记录
+- 路线已从“单轴阶段”升级为“阶段 + 三层增强”双视图：详见 [`./Enhancement-Roadmap.md`](./Enhancement-Roadmap.md)。
+- 阶段 A：继续做实 agent 节点执行面（Layer 1/2 衔接）。
+- 阶段 B：做深 controller 调度与编排内核（Layer 2 重点）。
+- 阶段 C：做通外围组件真实联调（Layer 1/2 系统联通）。
+- 阶段 D：做完产品化与专家模式（Layer 1/2 完善）。
+- 阶段 E：进入应用层任务调度器（Layer 3），但不替代当前 controller。
+- 演进记录继续在 [`./LOG.md`](./LOG.md) 维护。
+
+### 16. 研究参考与系统增强方向
+
+#### 16.1 A. 三层增强视图
+
+当前项目的增强路径不是单一控制面扩展，而是逐步形成三层系统：
+
+1. 底层：模型服务与动态装卸层（Layer 1）
+2. 中层：资源调度与 GPU 复用层（Layer 2）
+3. 上层：应用层任务路由与多模型协作层（Layer 3）
+
+对应文档：
+
+- [`./Research-L1-Serving-and-Dynamic-Loading.md`](./Research-L1-Serving-and-Dynamic-Loading.md)
+- [`./Research-L2-Scheduling-ColdStart-and-GPU-Pooling.md`](./Research-L2-Scheduling-ColdStart-and-GPU-Pooling.md)
+- [`./Research-L3-Routing-Cascade-and-MultiModel-Orchestration.md`](./Research-L3-Routing-Cascade-and-MultiModel-Orchestration.md)
+
+#### 16.2 B. 当前项目所处位置
+
+- 当前项目已较强覆盖底层控制平面与部分中层调度基础：对象模型已拆分、instance-first 已进入 agent/controller 协作主链路。
+- 当前项目尚未完成中层资源调度内核：系统化冷启动优化、GPU 池化、多模型并发策略仍在后续阶段。
+- 当前项目尚未进入完整上层 application planner 阶段：Layer 3 仍属长期目标，不是当前实现状态。
+
+#### 16.3 C. 后续阶段与三层增强路线对应关系
+
+- 阶段 A：Agent 节点执行面做实（衔接 Layer 1/2）。
+- 阶段 B：Controller 编排内核做深（重点进入 Layer 2）。
+- 阶段 C：外围组件真实联调（Layer 1/2 的系统联通）。
+- 阶段 D：产品化与专家模式（Layer 1/2 完善 + custom bundle）。
+- 阶段 E：应用层任务调度器 / heterogeneous orchestration / workflow planner（进入 Layer 3）。
+
+#### 16.4 D. 阶段 E 的定位
+
+- 阶段 E 不是替代当前 `controller`。
+- 阶段 E 建立在 `controller / agent / RuntimeInstance` 之上，消费现有控制面能力。
+- 阶段 E 负责复杂任务拆解、模型选择、阶段编排、结果合并。
+- 阶段 E 将把 Layer 3 的 FrugalGPT / RouteLLM / MoA 思想引入系统级策略。

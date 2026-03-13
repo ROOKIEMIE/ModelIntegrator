@@ -12,6 +12,11 @@ Detailed documentation has been moved to:
 
 - Full architecture and capability schema: [`doc/Schema.md`](./doc/Schema.md)
 - Change log and evolution history: [`doc/LOG.md`](./doc/LOG.md)
+- Layered research index: [`doc/Research-Index.md`](./doc/Research-Index.md)
+- Enhancement roadmap (A/B/C/D/E): [`doc/Enhancement-Roadmap.md`](./doc/Enhancement-Roadmap.md)
+- Layer 1 research: [`doc/Research-L1-Serving-and-Dynamic-Loading.md`](./doc/Research-L1-Serving-and-Dynamic-Loading.md)
+- Layer 2 research: [`doc/Research-L2-Scheduling-ColdStart-and-GPU-Pooling.md`](./doc/Research-L2-Scheduling-ColdStart-and-GPU-Pooling.md)
+- Layer 3 research: [`doc/Research-L3-Routing-Cascade-and-MultiModel-Orchestration.md`](./doc/Research-L3-Routing-Cascade-and-MultiModel-Orchestration.md)
 
 Architecture design details, system-shape sections, capability tiers, feature deep-dives, and troubleshooting guidance are now consolidated in `doc/Schema.md`, organized as:
 
@@ -25,6 +30,7 @@ Local LLM Control Plane is a local multi-node LLM control plane based on `contro
 ## Project Positioning
 
 - Built for local/LAN multi-node model operations
+- Short-term position: a model resource scheduling system; long-term evolution: a multi-model orchestration runtime for complex tasks
 - Controller owns unified API, state, scheduling, and orchestration
 - Agent executes node-local actions and reports facts back
 - Supports Docker/Portainer/LM Studio runtime integrations
@@ -98,6 +104,8 @@ Stop:
 - One-click scripts: `scripts/one-click-up.sh` / `scripts/one-click-down.sh`
 - Architecture schema: `doc/Schema.md`
 - Change log: `doc/LOG.md`
+- Research index: `doc/Research-Index.md`
+- Enhancement roadmap: `doc/Enhancement-Roadmap.md`
 
 ## Key Config Keys
 

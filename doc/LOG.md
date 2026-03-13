@@ -2,6 +2,50 @@
 
 ## 2026-03-14
 
+### 文档改造：外部参考脉络分层归档与增强路线补全
+
+本轮不是改代码主逻辑，而是补齐系统“外部参考脉络”，把成熟项目/论文与当前对象模型、阶段路线正式对齐。
+
+### 为什么现在做这件事
+
+- 阶段 0 已完成运行对象模型重构，阶段 A 已进入 instance-first 与 local-agent-first，系统基础面已具备“承接外部成熟成果”的条件。
+- 若继续只在 LOG 里追加零散说明，后续阶段 B/C/D/E 会缺少统一参考底座，评估与取舍容易漂移。
+- 因此本轮把研究材料下沉到 `doc/` 分层文档，并把增强计划提升为正式路线文档。
+
+### 新增文档（按三层归置）
+
+- Layer 1（模型服务 / 动态装卸 / 多模型 serving 原语）：
+  - `doc/Research-L1-Serving-and-Dynamic-Loading.md`
+- Layer 2（资源调度 / 冷启动 / GPU 复用 / 多模型并发 serving）：
+  - `doc/Research-L2-Scheduling-ColdStart-and-GPU-Pooling.md`
+- Layer 3（应用层路由 / 级联 / 多模型协作）：
+  - `doc/Research-L3-Routing-Cascade-and-MultiModel-Orchestration.md`
+- 总索引与路线图：
+  - `doc/Research-Index.md`
+  - `doc/Enhancement-Roadmap.md`
+
+### 路线更新（A/B/C/D/E）
+
+- 在 `doc/Schema.md` 正式补充“研究参考与系统增强方向”章节，明确三层增强视图与当前所处位置。
+- 后续路线从 A/B/C/D 扩展为 A/B/C/D/E，并明确：
+  - 阶段 A：Agent 节点执行面做实（Layer 1/2 衔接）
+  - 阶段 B：Controller 编排内核做深（Layer 2 重点）
+  - 阶段 C：外围组件真实联调（Layer 1/2 联通）
+  - 阶段 D：产品化与专家模式（Layer 1/2 完善）
+  - 阶段 E：应用层任务调度器（Layer 3 进入）
+
+### 为什么新增阶段 E
+
+- 项目长期价值不止于底层控制平面，还包括复杂任务的多模型协作编排。
+- 阶段 E 的定位是建立在 `controller + agent + RuntimeInstance` 之上的 application planner/workflow orchestrator。
+- 阶段 E 不是替代 controller，而是消费 controller 的底层能力，并把 FrugalGPT/RouteLLM/MoA 思想转化为上层策略。
+
+### 对后续阶段的影响
+
+- 阶段 A/B：继续优先做实 instance-first 执行与调度内核，为 Layer 2 打底。
+- 阶段 C/D：把 Layer 1/2 的能力做成可联调、可产品化、可治理的系统链路。
+- 阶段 E：在前述基础稳定后再进入 Layer 3，避免上层路由先行导致底层失稳。
+
 ### 阶段 A 第 4 步：agent 结果状态归属收口（instance-first）
 
 本轮把 agent 结果反哺规则明确为：`RuntimeInstance` 为第一落点，`Node/Model/Task` 为投影或过程承载。

@@ -12,6 +12,11 @@
 
 - 完整架构与功能说明：[`doc/Schema.md`](./doc/Schema.md)
 - 变更日志与演进记录：[`doc/LOG.md`](./doc/LOG.md)
+- 分层研究索引：[`doc/Research-Index.md`](./doc/Research-Index.md)
+- 增强路线图（A/B/C/D/E）：[`doc/Enhancement-Roadmap.md`](./doc/Enhancement-Roadmap.md)
+- Layer 1 研究：[`doc/Research-L1-Serving-and-Dynamic-Loading.md`](./doc/Research-L1-Serving-and-Dynamic-Loading.md)
+- Layer 2 研究：[`doc/Research-L2-Scheduling-ColdStart-and-GPU-Pooling.md`](./doc/Research-L2-Scheduling-ColdStart-and-GPU-Pooling.md)
+- Layer 3 研究：[`doc/Research-L3-Routing-Cascade-and-MultiModel-Orchestration.md`](./doc/Research-L3-Routing-Cascade-and-MultiModel-Orchestration.md)
 
 原 README 中的架构设计、系统形态、能力分级、功能细节、排障建议等章节，现统一收敛到 `doc/Schema.md`，并按“前半架构设计 / 后半能力与排障”重排。
 
@@ -22,6 +27,7 @@ Local LLM Control Plane 是一个本地多节点 LLM 控制平面，采用 `cont
 ## 项目定位
 
 - 面向本地/局域网环境的多节点模型控制平面
+- 短期定位：模型资源调度系统；长期演进：复杂任务的多模型编排运行时
 - controller 负责统一 API、状态、调度与编排
 - agent 负责节点本地动作执行与结果回传
 - 支持 Docker/Portainer/LM Studio 等运行时接入
@@ -95,6 +101,8 @@ curl -sS http://127.0.0.1:59081/api/v1/nodes
 - 一键脚本：`scripts/one-click-up.sh` / `scripts/one-click-down.sh`
 - 架构说明：`doc/Schema.md`
 - 变更日志：`doc/LOG.md`
+- 研究索引：`doc/Research-Index.md`
+- 增强路线图：`doc/Enhancement-Roadmap.md`
 
 ## 关键配置项
 
