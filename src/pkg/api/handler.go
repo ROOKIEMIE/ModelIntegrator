@@ -22,6 +22,7 @@ type Handler struct {
 	nodeService            *service.NodeService
 	modelService           *service.ModelService
 	runtimeTemplateService *service.RuntimeTemplateService
+	runtimeObjectService   *service.RuntimeObjectService
 	agentService           *service.AgentService
 	taskService            *service.TaskService
 	testRunService         *service.TestRunService
@@ -33,6 +34,7 @@ func NewHandler(
 	nodeService *service.NodeService,
 	modelService *service.ModelService,
 	runtimeTemplateService *service.RuntimeTemplateService,
+	runtimeObjectService *service.RuntimeObjectService,
 	agentService *service.AgentService,
 	taskService *service.TaskService,
 	testRunService *service.TestRunService,
@@ -43,6 +45,7 @@ func NewHandler(
 		nodeService:            nodeService,
 		modelService:           modelService,
 		runtimeTemplateService: runtimeTemplateService,
+		runtimeObjectService:   runtimeObjectService,
 		agentService:           agentService,
 		taskService:            taskService,
 		testRunService:         testRunService,
@@ -157,6 +160,104 @@ func (h *Handler) RegisterRuntimeTemplate(w http.ResponseWriter, r *http.Request
 		return
 	}
 	OK(w, res)
+}
+
+func (h *Handler) ListRuntimeBindings(w http.ResponseWriter, r *http.Request) {
+	if h.runtimeObjectService == nil {
+		Fail(w, http.StatusServiceUnavailable, "runtime object 服务未就绪", nil)
+		return
+	}
+	items, err := h.runtimeObjectService.ListBindings(r.Context())
+	if err != nil {
+		Fail(w, http.StatusInternalServerError, "查询 runtime bindings 失败", err.Error())
+		return
+	}
+	OK(w, items)
+}
+
+func (h *Handler) CreateRuntimeBinding(w http.ResponseWriter, r *http.Request) {
+	if h.runtimeObjectService == nil {
+		Fail(w, http.StatusServiceUnavailable, "runtime object 服务未就绪", nil)
+		return
+	}
+	item, err := parseRuntimeBindingPayload(r)
+	if err != nil {
+		Fail(w, http.StatusBadRequest, "runtime binding 请求体错误", err.Error())
+		return
+	}
+	created, err := h.runtimeObjectService.CreateBinding(r.Context(), item)
+	if err != nil {
+		Fail(w, http.StatusBadRequest, "创建 runtime binding 失败", err.Error())
+		return
+	}
+	OK(w, created)
+}
+
+func (h *Handler) GetRuntimeBinding(w http.ResponseWriter, r *http.Request) {
+	if h.runtimeObjectService == nil {
+		Fail(w, http.StatusServiceUnavailable, "runtime object 服务未就绪", nil)
+		return
+	}
+	id := strings.TrimSpace(chi.URLParam(r, "id"))
+	item, err := h.runtimeObjectService.GetBinding(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, service.ErrRuntimeBindingNotFound) {
+			Fail(w, http.StatusNotFound, "runtime binding 不存在", map[string]string{"id": id})
+			return
+		}
+		Fail(w, http.StatusInternalServerError, "查询 runtime binding 失败", err.Error())
+		return
+	}
+	OK(w, item)
+}
+
+func (h *Handler) ListRuntimeInstances(w http.ResponseWriter, r *http.Request) {
+	if h.runtimeObjectService == nil {
+		Fail(w, http.StatusServiceUnavailable, "runtime object 服务未就绪", nil)
+		return
+	}
+	items, err := h.runtimeObjectService.ListRuntimeInstances(r.Context())
+	if err != nil {
+		Fail(w, http.StatusInternalServerError, "查询 runtime instances 失败", err.Error())
+		return
+	}
+	OK(w, items)
+}
+
+func (h *Handler) GetRuntimeInstance(w http.ResponseWriter, r *http.Request) {
+	if h.runtimeObjectService == nil {
+		Fail(w, http.StatusServiceUnavailable, "runtime object 服务未就绪", nil)
+		return
+	}
+	id := strings.TrimSpace(chi.URLParam(r, "id"))
+	item, err := h.runtimeObjectService.GetRuntimeInstance(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, service.ErrRuntimeInstanceNotFound) {
+			Fail(w, http.StatusNotFound, "runtime instance 不存在", map[string]string{"id": id})
+			return
+		}
+		Fail(w, http.StatusInternalServerError, "查询 runtime instance 失败", err.Error())
+		return
+	}
+	OK(w, item)
+}
+
+func (h *Handler) GetRuntimeTemplateManifest(w http.ResponseWriter, r *http.Request) {
+	if h.runtimeObjectService == nil {
+		Fail(w, http.StatusServiceUnavailable, "runtime object 服务未就绪", nil)
+		return
+	}
+	id := strings.TrimSpace(chi.URLParam(r, "id"))
+	item, err := h.runtimeObjectService.GetTemplateManifest(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, service.ErrRuntimeTemplateNotFound) || errors.Is(err, service.ErrRuntimeManifestNotFound) {
+			Fail(w, http.StatusNotFound, "runtime template manifest 不存在", map[string]string{"template_id": id})
+			return
+		}
+		Fail(w, http.StatusBadRequest, "查询 runtime template manifest 失败", err.Error())
+		return
+	}
+	OK(w, item)
 }
 
 func (h *Handler) ListAgents(w http.ResponseWriter, r *http.Request) {
@@ -556,6 +657,64 @@ type runtimeTaskPayload struct {
 	TriggeredBy string `json:"triggered_by"`
 }
 
+type runtimeBindingPayload struct {
+	ID              string            `json:"id"`
+	ModelID         string            `json:"model_id"`
+	TemplateID      string            `json:"template_id"`
+	BindingMode     string            `json:"binding_mode"`
+	NodeSelector    map[string]string `json:"node_selector"`
+	PreferredNode   string            `json:"preferred_node"`
+	MountRules      []string          `json:"mount_rules"`
+	EnvOverrides    map[string]string `json:"env_overrides"`
+	CommandOverride []string          `json:"command_override"`
+	ScriptRef       string            `json:"script_ref"`
+	Enabled         *bool             `json:"enabled"`
+	ManifestID      string            `json:"manifest_id"`
+	Metadata        map[string]string `json:"metadata"`
+}
+
+func parseRuntimeBindingPayload(r *http.Request) (model.RuntimeBinding, error) {
+	var payload runtimeBindingPayload
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		return model.RuntimeBinding{}, fmt.Errorf("读取请求体失败: %w", err)
+	}
+	if len(strings.TrimSpace(string(body))) == 0 {
+		return model.RuntimeBinding{}, fmt.Errorf("请求体不能为空")
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return model.RuntimeBinding{}, fmt.Errorf("解析 JSON 失败: %w", err)
+	}
+	modelID := strings.TrimSpace(payload.ModelID)
+	templateID := strings.TrimSpace(payload.TemplateID)
+	if modelID == "" || templateID == "" {
+		return model.RuntimeBinding{}, fmt.Errorf("model_id/template_id 不能为空")
+	}
+	mode := strings.TrimSpace(strings.ToLower(payload.BindingMode))
+	if mode == "" {
+		mode = string(model.RuntimeBindingModeGenericInjected)
+	}
+	enabled := true
+	if payload.Enabled != nil {
+		enabled = *payload.Enabled
+	}
+	return model.RuntimeBinding{
+		ID:              strings.TrimSpace(payload.ID),
+		ModelID:         modelID,
+		TemplateID:      templateID,
+		BindingMode:     model.RuntimeBindingMode(mode),
+		NodeSelector:    payload.NodeSelector,
+		PreferredNode:   strings.TrimSpace(payload.PreferredNode),
+		MountRules:      payload.MountRules,
+		EnvOverrides:    payload.EnvOverrides,
+		CommandOverride: payload.CommandOverride,
+		ScriptRef:       strings.TrimSpace(payload.ScriptRef),
+		Enabled:         enabled,
+		ManifestID:      strings.TrimSpace(payload.ManifestID),
+		Metadata:        payload.Metadata,
+	}, nil
+}
+
 func parseRuntimeTaskPayload(r *http.Request) (runtimeTaskPayload, error) {
 	var payload runtimeTaskPayload
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
@@ -714,11 +873,23 @@ func runtimeTemplateIsZero(tpl model.RuntimeTemplate) bool {
 	return tpl.ID == "" &&
 		tpl.Name == "" &&
 		tpl.Description == "" &&
+		tpl.TemplateType == "" &&
+		tpl.RuntimeKind == "" &&
+		len(tpl.SupportedModelTypes) == 0 &&
+		len(tpl.SupportedFormats) == 0 &&
+		len(tpl.Capabilities) == 0 &&
+		tpl.ComposeRef == "" &&
+		tpl.ImageRef == "" &&
+		len(tpl.CommandTemplate) == 0 &&
+		len(tpl.InjectableMounts) == 0 &&
+		len(tpl.InjectableEnv) == 0 &&
+		len(tpl.ExposedPorts) == 0 &&
 		tpl.RuntimeType == "" &&
 		tpl.Image == "" &&
 		len(tpl.Command) == 0 &&
 		len(tpl.Env) == 0 &&
 		len(tpl.Volumes) == 0 &&
 		len(tpl.Ports) == 0 &&
-		len(tpl.Metadata) == 0
+		len(tpl.Metadata) == 0 &&
+		tpl.Manifest == nil
 }

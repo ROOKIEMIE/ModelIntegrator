@@ -1,5 +1,80 @@
 # 变更日志
 
+## 2026-03-13
+
+### 阶段 0（运行对象模型重构）插入为最高优先级
+
+- 当前系统已经有 `Model` 和 `RuntimeTemplate`，但二者关系长期靠隐式 metadata（如 `runtime_template_id`）拼接，controller 运行态也主要围绕 model 状态字段演进。
+- 若继续直接推进 agent 执行面（阶段 A）和 controller 编排（阶段 B），会把“模型=模板=实例”的历史耦合放大，后续 precheck/conflict/drift 很难收敛。
+- 因此先执行阶段 0，先把运行对象关系拆清，再推进 A/B/C/D。
+
+### 本轮架构拆分（正式对象）
+
+本轮在代码、存储、API、前端、文档同步落地：
+
+- `Model`：模型资产定义（新增 `display_name/model_type/source_type/format/path_or_ref/default_args/requires_script/script_ref/tags`）
+- `RuntimeTemplate`：运行环境模板（新增 `template_type/runtime_kind/supported_model_types/supported_formats/capabilities/injectable_* / healthcheck / exposed_ports / dedicated / manifest`）
+- `RuntimeBinding`（LaunchProfile）：模型与模板的桥接绑定对象
+- `RuntimeInstance`（Deployment）：运行态实例对象（controller 后续调度对象）
+- `RuntimeBundleManifest`：模板/自定义 bundle 的约束契约对象
+
+### Binding Modes 定稿（四种）
+
+- `dedicated`
+- `generic_injected`
+- `generic_with_script`
+- `custom_bundle`
+
+阶段 0 可执行路径：
+
+- 已最小可用：`dedicated`、`generic_injected`
+- 已建模+校验占位：`generic_with_script`、`custom_bundle`
+
+### 为什么需要 custom_bundle，但必须受 Manifest 约束
+
+- 真实生产场景存在多步骤/多容器/sidecar/脚本前后处理，必须保留高级托底模式。
+- 但“任意 compose + 任意脚本裸接入”会破坏控制面可审计性与可维护性。
+- 因此本轮将 custom 模式收敛为 `custom_bundle + RuntimeBundleManifest`，先立约束，再逐步放开执行能力。
+
+### 本轮代码落地范围（阶段 0 实施）
+
+- 数据模型：
+  - `src/pkg/model/types.go` 新增/增强 Model、RuntimeTemplate、RuntimeBinding、RuntimeInstance、RuntimeBundleManifest 结构与枚举。
+- SQLite schema/store：
+  - `src/pkg/store/sqlite/schema.go` 新增 `runtime_bindings`、`runtime_instances`、`runtime_bundle_manifests` 表，并扩展 `models` 字段。
+  - `src/pkg/store/sqlite/store.go` 新增 bindings/instances/manifests 的 upsert/list/get；Model 持久化字段扩展。
+- 服务层：
+  - 新增 `src/pkg/service/runtime_object_service.go`，实现：
+    - binding 创建/读取/列出
+    - template manifest 解析与最小校验
+    - `binding -> runtime instance` 生成更新
+    - 启动时 bootstrap 与模板 manifest 同步
+  - `ModelService` 接入 `RuntimeObjectSyncer`，在刷新/持久化链路中触发 runtime object 同步。
+- API：
+  - 新增接口：
+    - `GET /api/v1/runtime-bindings`
+    - `POST /api/v1/runtime-bindings`
+    - `GET /api/v1/runtime-bindings/{id}`
+    - `GET /api/v1/runtime-instances`
+    - `GET /api/v1/runtime-instances/{id}`
+    - `GET /api/v1/runtime-templates/{id}/manifest`
+- 前端（最小增量）：
+  - 模型卡片展示 binding/instance 关系（含 binding mode）
+  - Runtime/Observe 面板新增 runtime bindings、runtime instances 列表
+  - 模板列表新增 manifest 与绑定数量可见性
+- E5 样板迁移链路：
+  - `local-multilingual-e5-base`（Model）+
+  - `tei-embedding-e5-local` / `tei-embedding`（RuntimeTemplate）+
+  - 自动生成 `RuntimeBinding`（默认 `generic_injected`）+
+  - 自动生成 `RuntimeInstance`（`ri-local-multilingual-e5-base`）
+
+### 下一步与阶段 A/B/C/D 的衔接
+
+- 阶段 A：让 agent 任务直接引用 `RuntimeInstance`，并利用 binding/manifest 做节点侧 precheck 输入。
+- 阶段 B：controller reconcile 从 model 状态逐步转为 instance 优先，显式处理 conflict/drift。
+- 阶段 C：围绕 runtime instance endpoint/exposed_ports 对接 Nginx、LiteLLM 与外部 embedding/RAG client。
+- 阶段 D：在 manifest 约束下扩展 custom bundle/expert mode、审计恢复与策略插件化。
+
 ## 2026-03-12
 
 ### 架构术语与第一阶段计划修正（controller/agent/managed node）

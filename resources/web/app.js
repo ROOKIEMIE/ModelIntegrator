@@ -12,6 +12,8 @@ const runtimeTemplateResultEl = document.getElementById("runtime-template-result
 const runtimeTemplateFormEl = document.getElementById("runtime-template-form");
 const templateValidateBtn = document.getElementById("tpl-validate-btn");
 const templateRegisterBtn = document.getElementById("tpl-register-btn");
+const runtimeBindingsEl = document.getElementById("runtime-bindings");
+const runtimeInstancesEl = document.getElementById("runtime-instances");
 const tasksEl = document.getElementById("tasks");
 const testRunsEl = document.getElementById("test-runs");
 const runE5TestBtn = document.getElementById("run-e5-test-btn");
@@ -21,6 +23,8 @@ const state = {
   nodes: [],
   models: [],
   runtimeTemplates: [],
+  runtimeBindings: [],
+  runtimeInstances: [],
   tasks: [],
   testRuns: [],
   activeNodeId: "",
@@ -455,14 +459,22 @@ function renderRuntimeTemplates() {
   state.runtimeTemplates.forEach((tpl) => {
     const item = document.createElement("div");
     item.className = "template-item";
+    const relatedBindings = Array.isArray(state.runtimeBindings)
+      ? state.runtimeBindings.filter((binding) => String(binding.template_id || "").trim() === String(tpl.id || "").trim())
+      : [];
+    const manifest = tpl.manifest && typeof tpl.manifest === "object" ? tpl.manifest : null;
 
     const title = document.createElement("div");
     title.className = "item-title";
     title.textContent = `${tpl.name || tpl.id} (${tpl.id})`;
 
-    const meta = document.createElement("div");
-    meta.className = "meta";
-    meta.textContent = `runtime: ${tpl.runtime_type || "-"} | image: ${tpl.image || "-"} | source: ${tpl.source || "unknown"} | GPU: ${tpl.needs_gpu ? "yes" : "no"}`;
+    const summaryMeta = document.createElement("div");
+    summaryMeta.className = "meta";
+    summaryMeta.textContent = `runtime: ${tpl.runtime_type || "-"} | runtime_kind: ${tpl.runtime_kind || "-"} | image: ${tpl.image || "-"} | source: ${tpl.source || "unknown"} | GPU: ${tpl.needs_gpu ? "yes" : "no"} | bindings: ${relatedBindings.length}`;
+
+    const manifestMeta = document.createElement("div");
+    manifestMeta.className = "meta";
+    manifestMeta.textContent = `manifest: ${manifest ? manifest.manifest_version || "-" : "-"} | model_injection_mode: ${manifest ? manifest.model_injection_mode || "-" : "-"}`;
 
     const command = Array.isArray(tpl.command) ? tpl.command.join(" ") : "";
     const preview = document.createElement("div");
@@ -470,7 +482,8 @@ function renderRuntimeTemplates() {
     preview.textContent = command || "(no command)";
 
     item.appendChild(title);
-    item.appendChild(meta);
+    item.appendChild(summaryMeta);
+    item.appendChild(manifestMeta);
     item.appendChild(preview);
     runtimeTemplatesEl.appendChild(item);
   });
@@ -507,6 +520,50 @@ function renderTasks() {
       <div class="meta">明细: ${escapeHTML(detail || "-")}</div>
     `;
     tasksEl.appendChild(item);
+  });
+}
+
+function renderRuntimeBindings() {
+  if (!runtimeBindingsEl) {
+    return;
+  }
+  if (!Array.isArray(state.runtimeBindings) || state.runtimeBindings.length === 0) {
+    runtimeBindingsEl.textContent = "暂无 runtime bindings";
+    return;
+  }
+  runtimeBindingsEl.innerHTML = "";
+  state.runtimeBindings.slice(0, 20).forEach((binding) => {
+    const item = document.createElement("div");
+    item.className = "list-item";
+    item.innerHTML = `
+      <div class="item-title">${escapeHTML(binding.id || "-")}</div>
+      <div class="meta">model: ${escapeHTML(binding.model_id || "-")} | template: ${escapeHTML(binding.template_id || "-")} | mode: ${escapeHTML(binding.binding_mode || "-")}</div>
+      <div class="meta">compatibility: ${escapeHTML(binding.compatibility_status || "unknown")} | enabled: ${binding.enabled === false ? "no" : "yes"}</div>
+      <div class="meta">message: ${escapeHTML(binding.compatibility_message || "-")}</div>
+    `;
+    runtimeBindingsEl.appendChild(item);
+  });
+}
+
+function renderRuntimeInstances() {
+  if (!runtimeInstancesEl) {
+    return;
+  }
+  if (!Array.isArray(state.runtimeInstances) || state.runtimeInstances.length === 0) {
+    runtimeInstancesEl.textContent = "暂无 runtime instances";
+    return;
+  }
+  runtimeInstancesEl.innerHTML = "";
+  state.runtimeInstances.slice(0, 20).forEach((instance) => {
+    const item = document.createElement("div");
+    item.className = "list-item";
+    item.innerHTML = `
+      <div class="item-title">${escapeHTML(instance.id || "-")}</div>
+      <div class="meta">model: ${escapeHTML(instance.model_id || "-")} | template: ${escapeHTML(instance.template_id || "-")} | binding: ${escapeHTML(instance.binding_id || "-")}</div>
+      <div class="meta">node: ${escapeHTML(instance.node_id || "-")} | desired/observed: ${escapeHTML(instance.desired_state || "-")} / ${escapeHTML(instance.observed_state || "-")} | readiness: ${escapeHTML(instance.readiness || "unknown")}</div>
+      <div class="meta">endpoint: ${escapeHTML(instance.endpoint || "-")} | drift: ${escapeHTML(instance.drift_reason || "-")}</div>
+    `;
+    runtimeInstancesEl.appendChild(item);
   });
 }
 
@@ -619,6 +676,20 @@ function summarizeRuntimeLoad(node) {
   return parts.join(" | ");
 }
 
+function findBindingByModelID(modelID) {
+  if (!Array.isArray(state.runtimeBindings)) {
+    return null;
+  }
+  return state.runtimeBindings.find((item) => String(item.model_id || "").trim() === String(modelID || "").trim()) || null;
+}
+
+function findInstanceByModelID(modelID) {
+  if (!Array.isArray(state.runtimeInstances)) {
+    return null;
+  }
+  return state.runtimeInstances.find((item) => String(item.model_id || "").trim() === String(modelID || "").trim()) || null;
+}
+
 function actionsForModelBackend(backendType) {
   const normalized = normalizeBackendType(backendType);
   if (normalized === "lmstudio") {
@@ -708,10 +779,12 @@ function buildActionButton(modelId, action, nodeId, modelState, backendType) {
       }
       showToast(message);
       await loadModels({ refresh: true });
-      await Promise.all([loadTasks(), loadTestRuns()]);
+      await Promise.all([loadTasks(), loadTestRuns(), loadRuntimeBindings(), loadRuntimeInstances()]);
       renderNodes();
       renderModelTabs();
       renderModels();
+      renderRuntimeBindings();
+      renderRuntimeInstances();
       renderTasks();
       renderTestRuns();
     } catch (err) {
@@ -860,6 +933,8 @@ function renderModels() {
 
   modelsEl.innerHTML = "";
   visibleModels.forEach((m) => {
+    const binding = findBindingByModelID(m.id);
+    const runtimeInstance = findInstanceByModelID(m.id);
     const item = document.createElement("div");
     item.className = "list-item";
 
@@ -867,25 +942,71 @@ function renderModels() {
     title.className = "item-title";
     title.textContent = `${m.name} (${m.id})`;
 
-    const meta = document.createElement("div");
-    meta.className = "meta";
+    const summaryMeta = document.createElement("div");
+    summaryMeta.className = "meta";
     const templateID = m.metadata && m.metadata.runtime_template_id ? m.metadata.runtime_template_id : "-";
-    const metaParts = [
+    const bindingTemplateID = binding && binding.template_id ? binding.template_id : templateID;
+    const summaryParts = [
       `后端: ${m.backend_type}`,
       `节点: ${m.host_node_id}`,
       `状态: ${displayModelState(m.state, m.backend_type)}`,
-      `期望: ${m.desired_state || "-"}`,
-      `实际: ${m.observed_state || "-"}`,
-      `Readiness: ${m.readiness || "unknown"}`,
-      `装载: ${isLoadedState(m.state) ? "已装载" : "未装载"}`,
+      `模板: ${bindingTemplateID}`,
     ];
-    if (normalizeBackendType(m.backend_type) !== "lmstudio") {
-      metaParts.push(`模板: ${templateID}`);
-    }
-    meta.textContent = metaParts.join(" | ");
+    summaryMeta.textContent = summaryParts.join(" | ");
     const health = document.createElement("div");
     health.className = "meta";
     health.innerHTML = `健康信息: ${statusPill(m.readiness || "unknown")} ${escapeHTML(m.health_message || "-")} | endpoint: ${escapeHTML(m.endpoint || "-")} | 最近协调: ${escapeHTML(formatTime(m.last_reconciled_at))}`;
+
+    const detailToggle = document.createElement("div");
+    detailToggle.className = "model-detail-toggle";
+    detailToggle.setAttribute("role", "button");
+    detailToggle.setAttribute("tabindex", "0");
+    detailToggle.innerHTML = `
+      <span class="model-detail-divider" aria-hidden="true"></span>
+      <span class="model-detail-label">详情</span>
+      <span class="model-detail-arrow" aria-hidden="true">▸</span>
+    `;
+
+    const detailPanel = document.createElement("div");
+    detailPanel.className = "model-detail-panel hidden";
+    const detailLines = [
+      `Provider: ${m.provider || "-"}`,
+      `Runtime ID: ${m.runtime_id || "-"}`,
+      `Model ID: ${m.id || "-"}`,
+      `期望/实际: ${m.desired_state || "-"} / ${m.observed_state || "-"}`,
+      `Readiness: ${m.readiness || "unknown"} | 装载: ${isLoadedState(m.state) ? "已装载" : "未装载"}`,
+      `Binding: ${binding ? binding.id || "-" : "-"} | mode: ${binding ? binding.binding_mode || "-" : "-"}`,
+      `Binding compatibility: ${binding ? binding.compatibility_status || "unknown" : "unknown"} | message: ${binding ? binding.compatibility_message || "-" : "-"}`,
+      `RuntimeInstance: ${runtimeInstance ? runtimeInstance.id || "-" : "-"} | node: ${runtimeInstance ? runtimeInstance.node_id || "-" : "-"}`,
+      `RuntimeInstance desired/observed: ${runtimeInstance ? runtimeInstance.desired_state || "-" : "-"} / ${runtimeInstance ? runtimeInstance.observed_state || "-" : "-"}`,
+      `RuntimeInstance readiness: ${runtimeInstance ? runtimeInstance.readiness || "unknown" : "unknown"} | drift: ${runtimeInstance ? runtimeInstance.drift_reason || "-" : "-"}`,
+    ];
+    detailLines.forEach((line) => {
+      const detailRow = document.createElement("div");
+      detailRow.className = "meta";
+      detailRow.textContent = line;
+      detailPanel.appendChild(detailRow);
+    });
+
+    const detailArrow = detailToggle.querySelector(".model-detail-arrow");
+    const setExpanded = (expanded) => {
+      detailPanel.classList.toggle("hidden", !expanded);
+      if (detailArrow) {
+        detailArrow.textContent = expanded ? "▾" : "▸";
+      }
+    };
+    setExpanded(false);
+    detailToggle.addEventListener("click", () => {
+      const expanded = detailPanel.classList.contains("hidden");
+      setExpanded(expanded);
+    });
+    detailToggle.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        const expanded = detailPanel.classList.contains("hidden");
+        setExpanded(expanded);
+      }
+    });
 
     const actions = document.createElement("div");
     actions.className = "actions";
@@ -894,8 +1015,10 @@ function renderModels() {
     });
 
     item.appendChild(title);
-    item.appendChild(meta);
+    item.appendChild(summaryMeta);
     item.appendChild(health);
+    item.appendChild(detailToggle);
+    item.appendChild(detailPanel);
     item.appendChild(actions);
     modelsEl.appendChild(item);
   });
@@ -974,6 +1097,16 @@ async function loadRuntimeTemplates() {
   state.runtimeTemplates = Array.isArray(templates) ? templates : [];
 }
 
+async function loadRuntimeBindings() {
+  const bindings = await requestJSON("/api/v1/runtime-bindings");
+  state.runtimeBindings = Array.isArray(bindings) ? bindings : [];
+}
+
+async function loadRuntimeInstances() {
+  const instances = await requestJSON("/api/v1/runtime-instances");
+  state.runtimeInstances = Array.isArray(instances) ? instances : [];
+}
+
 async function loadTasks() {
   const tasks = await requestJSON("/api/v1/tasks?limit=20");
   state.tasks = Array.isArray(tasks) ? tasks.map((task) => normalizeTaskRecord(task)) : [];
@@ -1025,8 +1158,10 @@ function bindTestActions() {
         }),
       });
       await waitTaskDone(task.id, 90000);
-      await Promise.all([loadModels({ refresh: true }), loadTasks()]);
+      await Promise.all([loadModels({ refresh: true }), loadTasks(), loadRuntimeBindings(), loadRuntimeInstances()]);
       renderModels();
+      renderRuntimeBindings();
+      renderRuntimeInstances();
       renderTasks();
       showToast(`刷新完成: ${task.id}`);
     } catch (err) {
@@ -1041,7 +1176,7 @@ function bindTestActions() {
 
     let runtimeTemplatesLoadFailed = false;
     await loadNodes();
-    await Promise.all([loadModels(), loadTasks(), loadTestRuns()]);
+    await Promise.all([loadModels(), loadTasks(), loadTestRuns(), loadRuntimeBindings(), loadRuntimeInstances()]);
     try {
       await loadRuntimeTemplates();
     } catch (err) {
@@ -1059,6 +1194,8 @@ function bindTestActions() {
     renderNodes();
     renderModelTabs();
     renderModels();
+    renderRuntimeBindings();
+    renderRuntimeInstances();
     renderTasks();
     renderTestRuns();
     if (!runtimeTemplatesLoadFailed) {
@@ -1067,7 +1204,9 @@ function bindTestActions() {
 
     setInterval(async () => {
       try {
-        await Promise.all([loadTasks(), loadTestRuns()]);
+        await Promise.all([loadTasks(), loadTestRuns(), loadRuntimeBindings(), loadRuntimeInstances()]);
+        renderRuntimeBindings();
+        renderRuntimeInstances();
         renderTasks();
         renderTestRuns();
       } catch (err) {
@@ -1079,6 +1218,12 @@ function bindTestActions() {
     modelsEl.textContent = `加载失败: ${err.message}`;
     if (tasksEl) {
       tasksEl.textContent = `加载失败: ${err.message}`;
+    }
+    if (runtimeBindingsEl) {
+      runtimeBindingsEl.textContent = `加载失败: ${err.message}`;
+    }
+    if (runtimeInstancesEl) {
+      runtimeInstancesEl.textContent = `加载失败: ${err.message}`;
     }
     if (testRunsEl) {
       testRunsEl.textContent = `加载失败: ${err.message}`;

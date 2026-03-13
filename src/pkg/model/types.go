@@ -92,6 +92,74 @@ const (
 	ModelStateError   ModelState = "error"
 )
 
+type ModelKind string
+
+const (
+	ModelKindUnknown   ModelKind = "unknown"
+	ModelKindChat      ModelKind = "chat"
+	ModelKindEmbedding ModelKind = "embedding"
+	ModelKindRerank    ModelKind = "rerank"
+	ModelKindUtility   ModelKind = "utility"
+)
+
+type ModelSourceType string
+
+const (
+	ModelSourceUnknown   ModelSourceType = "unknown"
+	ModelSourceLocalPath ModelSourceType = "local_path"
+	ModelSourceLMStudio  ModelSourceType = "lmstudio"
+	ModelSourceHFRepo    ModelSourceType = "hf_repo"
+	ModelSourceRemote    ModelSourceType = "remote"
+)
+
+type ModelFormat string
+
+const (
+	ModelFormatUnknown     ModelFormat = "unknown"
+	ModelFormatGGUF        ModelFormat = "gguf"
+	ModelFormatSafeTensors ModelFormat = "safetensors"
+	ModelFormatMLX         ModelFormat = "mlx"
+)
+
+type RuntimeTemplateType string
+
+const (
+	RuntimeTemplateTypeUnknown         RuntimeTemplateType = "unknown"
+	RuntimeTemplateTypeDockerCompose   RuntimeTemplateType = "docker_compose"
+	RuntimeTemplateTypeSingleContainer RuntimeTemplateType = "single_container"
+	RuntimeTemplateTypeProcess         RuntimeTemplateType = "process"
+	RuntimeTemplateTypeAdapter         RuntimeTemplateType = "adapter"
+)
+
+type RuntimeKind string
+
+const (
+	RuntimeKindUnknown  RuntimeKind = "unknown"
+	RuntimeKindTEI      RuntimeKind = "tei"
+	RuntimeKindVLLM     RuntimeKind = "vllm"
+	RuntimeKindLlamaCPP RuntimeKind = "llama.cpp"
+	RuntimeKindLMStudio RuntimeKind = "lmstudio"
+	RuntimeKindCustom   RuntimeKind = "custom"
+)
+
+type RuntimeBindingMode string
+
+const (
+	RuntimeBindingModeDedicated         RuntimeBindingMode = "dedicated"
+	RuntimeBindingModeGenericInjected   RuntimeBindingMode = "generic_injected"
+	RuntimeBindingModeGenericWithScript RuntimeBindingMode = "generic_with_script"
+	RuntimeBindingModeCustomBundle      RuntimeBindingMode = "custom_bundle"
+)
+
+type CompatibilityStatus string
+
+const (
+	CompatibilityUnknown      CompatibilityStatus = "unknown"
+	CompatibilityCompatible   CompatibilityStatus = "compatible"
+	CompatibilityWarning      CompatibilityStatus = "warning"
+	CompatibilityIncompatible CompatibilityStatus = "incompatible"
+)
+
 type ReadinessState string
 
 const (
@@ -254,18 +322,34 @@ type AgentCapabilitiesReportResponse struct {
 type AgentCapabilityReportRequest = AgentCapabilitiesReportRequest
 
 type RuntimeTemplate struct {
-	ID          string            `json:"id" yaml:"id"`
-	Name        string            `json:"name" yaml:"name"`
-	Description string            `json:"description,omitempty" yaml:"description,omitempty"`
-	RuntimeType RuntimeType       `json:"runtime_type" yaml:"runtime_type"`
-	Image       string            `json:"image,omitempty" yaml:"image,omitempty"`
-	Command     []string          `json:"command,omitempty" yaml:"command,omitempty"`
-	Env         map[string]string `json:"env,omitempty" yaml:"env,omitempty"`
-	Volumes     []string          `json:"volumes,omitempty" yaml:"volumes,omitempty"`
-	Ports       []string          `json:"ports,omitempty" yaml:"ports,omitempty"`
-	NeedsGPU    bool              `json:"needs_gpu" yaml:"needs_gpu"`
-	Source      string            `json:"source,omitempty" yaml:"source,omitempty"`
-	Metadata    map[string]string `json:"metadata,omitempty" yaml:"metadata,omitempty"`
+	ID                     string                 `json:"id" yaml:"id"`
+	Name                   string                 `json:"name" yaml:"name"`
+	Description            string                 `json:"description,omitempty" yaml:"description,omitempty"`
+	TemplateType           RuntimeTemplateType    `json:"template_type,omitempty" yaml:"template_type,omitempty"`
+	RuntimeKind            RuntimeKind            `json:"runtime_kind,omitempty" yaml:"runtime_kind,omitempty"`
+	SupportedModelTypes    []ModelKind            `json:"supported_model_types,omitempty" yaml:"supported_model_types,omitempty"`
+	SupportedFormats       []ModelFormat          `json:"supported_formats,omitempty" yaml:"supported_formats,omitempty"`
+	Capabilities           []ModelKind            `json:"capabilities,omitempty" yaml:"capabilities,omitempty"`
+	ComposeRef             string                 `json:"compose_ref,omitempty" yaml:"compose_ref,omitempty"`
+	ImageRef               string                 `json:"image_ref,omitempty" yaml:"image_ref,omitempty"`
+	CommandTemplate        []string               `json:"command_template,omitempty" yaml:"command_template,omitempty"`
+	InjectableMounts       []string               `json:"injectable_mounts,omitempty" yaml:"injectable_mounts,omitempty"`
+	InjectableEnv          []string               `json:"injectable_env,omitempty" yaml:"injectable_env,omitempty"`
+	CommandOverrideAllowed bool                   `json:"command_override_allowed,omitempty" yaml:"command_override_allowed,omitempty"`
+	ScriptMountAllowed     bool                   `json:"script_mount_allowed,omitempty" yaml:"script_mount_allowed,omitempty"`
+	Healthcheck            RuntimeHealthcheck     `json:"healthcheck,omitempty" yaml:"healthcheck,omitempty"`
+	ExposedPorts           []string               `json:"exposed_ports,omitempty" yaml:"exposed_ports,omitempty"`
+	Dedicated              bool                   `json:"dedicated,omitempty" yaml:"dedicated,omitempty"`
+	Manifest               *RuntimeBundleManifest `json:"manifest,omitempty" yaml:"manifest,omitempty"`
+	RuntimeType            RuntimeType            `json:"runtime_type" yaml:"runtime_type"`
+	Image                  string                 `json:"image,omitempty" yaml:"image,omitempty"`
+	Command                []string               `json:"command,omitempty" yaml:"command,omitempty"`
+	Env                    map[string]string      `json:"env,omitempty" yaml:"env,omitempty"`
+	Volumes                []string               `json:"volumes,omitempty" yaml:"volumes,omitempty"`
+	Ports                  []string               `json:"ports,omitempty" yaml:"ports,omitempty"`
+	NeedsGPU               bool                   `json:"needs_gpu" yaml:"needs_gpu"`
+	Source                 string                 `json:"source,omitempty" yaml:"source,omitempty"`
+	Metadata               map[string]string      `json:"metadata,omitempty" yaml:"metadata,omitempty"`
 }
 
 type RuntimeTemplateValidationResult struct {
@@ -278,6 +362,16 @@ type RuntimeTemplateValidationResult struct {
 type Model struct {
 	ID               string            `json:"id" yaml:"id"`
 	Name             string            `json:"name" yaml:"name"`
+	DisplayName      string            `json:"display_name,omitempty" yaml:"display_name,omitempty"`
+	ModelType        ModelKind         `json:"model_type,omitempty" yaml:"model_type,omitempty"`
+	SourceType       ModelSourceType   `json:"source_type,omitempty" yaml:"source_type,omitempty"`
+	Format           ModelFormat       `json:"format,omitempty" yaml:"format,omitempty"`
+	PathOrRef        string            `json:"path_or_ref,omitempty" yaml:"path_or_ref,omitempty"`
+	SizeBytes        int64             `json:"size_bytes,omitempty" yaml:"size_bytes,omitempty"`
+	DefaultArgs      map[string]string `json:"default_args,omitempty" yaml:"default_args,omitempty"`
+	RequiresScript   bool              `json:"requires_script,omitempty" yaml:"requires_script,omitempty"`
+	ScriptRef        string            `json:"script_ref,omitempty" yaml:"script_ref,omitempty"`
+	Tags             []string          `json:"tags,omitempty" yaml:"tags,omitempty"`
 	Provider         string            `json:"provider" yaml:"provider"`
 	BackendType      RuntimeType       `json:"backend_type" yaml:"backend_type"`
 	HostNodeID       string            `json:"host_node_id" yaml:"host_node_id"`
@@ -292,6 +386,80 @@ type Model struct {
 	ContextLength    int               `json:"context_length" yaml:"context_length"`
 	Metadata         map[string]string `json:"metadata,omitempty" yaml:"metadata,omitempty"`
 }
+
+type RuntimeHealthcheck struct {
+	Path            string `json:"path,omitempty" yaml:"path,omitempty"`
+	Method          string `json:"method,omitempty" yaml:"method,omitempty"`
+	IntervalSeconds int    `json:"interval_seconds,omitempty" yaml:"interval_seconds,omitempty"`
+	TimeoutSeconds  int    `json:"timeout_seconds,omitempty" yaml:"timeout_seconds,omitempty"`
+	SuccessCodes    []int  `json:"success_codes,omitempty" yaml:"success_codes,omitempty"`
+}
+
+type RuntimeBundleManifest struct {
+	ID                     string              `json:"id" yaml:"id"`
+	TemplateID             string              `json:"template_id,omitempty" yaml:"template_id,omitempty"`
+	ManifestVersion        string              `json:"manifest_version" yaml:"manifest_version"`
+	TemplateType           RuntimeTemplateType `json:"template_type" yaml:"template_type"`
+	RuntimeKind            RuntimeKind         `json:"runtime_kind" yaml:"runtime_kind"`
+	SupportedModelTypes    []ModelKind         `json:"supported_model_types,omitempty" yaml:"supported_model_types,omitempty"`
+	SupportedFormats       []ModelFormat       `json:"supported_formats,omitempty" yaml:"supported_formats,omitempty"`
+	Capabilities           []ModelKind         `json:"capabilities,omitempty" yaml:"capabilities,omitempty"`
+	MountPoints            []string            `json:"mount_points,omitempty" yaml:"mount_points,omitempty"`
+	RequiredEnv            []string            `json:"required_env,omitempty" yaml:"required_env,omitempty"`
+	OptionalEnv            []string            `json:"optional_env,omitempty" yaml:"optional_env,omitempty"`
+	CommandOverrideAllowed bool                `json:"command_override_allowed,omitempty" yaml:"command_override_allowed,omitempty"`
+	ScriptMountAllowed     bool                `json:"script_mount_allowed,omitempty" yaml:"script_mount_allowed,omitempty"`
+	ModelInjectionMode     RuntimeBindingMode  `json:"model_injection_mode,omitempty" yaml:"model_injection_mode,omitempty"`
+	Healthcheck            RuntimeHealthcheck  `json:"healthcheck,omitempty" yaml:"healthcheck,omitempty"`
+	ExposedPorts           []string            `json:"exposed_ports,omitempty" yaml:"exposed_ports,omitempty"`
+	Notes                  string              `json:"notes,omitempty" yaml:"notes,omitempty"`
+	Metadata               map[string]string   `json:"metadata,omitempty" yaml:"metadata,omitempty"`
+}
+
+type RuntimeBinding struct {
+	ID                   string              `json:"id"`
+	ModelID              string              `json:"model_id"`
+	TemplateID           string              `json:"template_id"`
+	BindingMode          RuntimeBindingMode  `json:"binding_mode"`
+	NodeSelector         map[string]string   `json:"node_selector,omitempty"`
+	PreferredNode        string              `json:"preferred_node,omitempty"`
+	MountRules           []string            `json:"mount_rules,omitempty"`
+	EnvOverrides         map[string]string   `json:"env_overrides,omitempty"`
+	CommandOverride      []string            `json:"command_override,omitempty"`
+	ScriptRef            string              `json:"script_ref,omitempty"`
+	CompatibilityStatus  CompatibilityStatus `json:"compatibility_status,omitempty"`
+	CompatibilityMessage string              `json:"compatibility_message,omitempty"`
+	Enabled              bool                `json:"enabled"`
+	ManifestID           string              `json:"manifest_id,omitempty"`
+	Metadata             map[string]string   `json:"metadata,omitempty"`
+	CreatedAt            time.Time           `json:"created_at,omitempty"`
+	UpdatedAt            time.Time           `json:"updated_at,omitempty"`
+}
+
+type RuntimeInstance struct {
+	ID               string            `json:"id"`
+	ModelID          string            `json:"model_id"`
+	TemplateID       string            `json:"template_id"`
+	BindingID        string            `json:"binding_id"`
+	NodeID           string            `json:"node_id"`
+	DesiredState     string            `json:"desired_state,omitempty"`
+	ObservedState    string            `json:"observed_state,omitempty"`
+	Readiness        ReadinessState    `json:"readiness,omitempty"`
+	HealthMessage    string            `json:"health_message,omitempty"`
+	DriftReason      string            `json:"drift_reason,omitempty"`
+	Endpoint         string            `json:"endpoint,omitempty"`
+	LaunchedCommand  []string          `json:"launched_command,omitempty"`
+	MountedPaths     []string          `json:"mounted_paths,omitempty"`
+	InjectedEnv      map[string]string `json:"injected_env,omitempty"`
+	ScriptUsed       string            `json:"script_used,omitempty"`
+	LastReconciledAt time.Time         `json:"last_reconciled_at,omitempty"`
+	Metadata         map[string]string `json:"metadata,omitempty"`
+	CreatedAt        time.Time         `json:"created_at,omitempty"`
+	UpdatedAt        time.Time         `json:"updated_at,omitempty"`
+}
+
+type LaunchProfile = RuntimeBinding
+type RuntimeDeployment = RuntimeInstance
 
 type Task struct {
 	ID              string                 `json:"id"`

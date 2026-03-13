@@ -7,6 +7,93 @@
 
 ---
 
+## 0. 阶段 0：运行对象模型重构（2026-03-13）
+
+本节是当前版本的建模基线，先于后续 A/B/C/D 阶段执行。目标是把“模型资产 / 运行模板 / 绑定配置 / 运行实例 / 运行包约束”彻底拆开，并给 controller 后续编排留出稳定对象面。
+
+### A. 运行对象模型总览
+
+本轮正式引入五类对象：
+
+| 对象 | 语义 | 关键字段（节选） |
+| --- | --- | --- |
+| `Model` | 模型资产定义（模型是什么） | `id/name/display_name/model_type/source_type/format/path_or_ref/default_args/requires_script/script_ref/tags` |
+| `RuntimeTemplate` | 运行环境模板（怎么跑） | `template_type/runtime_kind/supported_model_types/supported_formats/capabilities/injectable_mounts/injectable_env/healthcheck/exposed_ports/dedicated` |
+| `RuntimeBinding` / `LaunchProfile` | 模型与模板之间的启动绑定层 | `model_id/template_id/binding_mode/node_selector/preferred_node/mount_rules/env_overrides/command_override/script_ref/compatibility_status` |
+| `RuntimeInstance` / `Deployment` | 实际运行态对象（调度与状态归集对象） | `binding_id/model_id/template_id/node_id/desired_state/observed_state/readiness/drift_reason/endpoint` |
+| `RuntimeBundleManifest` | 模板包/自定义包约束层（受控高级模式） | `manifest_version/template_type/runtime_kind/model_injection_mode/mount_points/required_env/healthcheck/exposed_ports` |
+
+### B. 五层对象关系说明
+
+```text
+Model(asset)
+  -> RuntimeBinding(launch profile, mode + overrides + compatibility)
+      -> RuntimeTemplate(runtime env recipe)
+          -> RuntimeBundleManifest(constraint contract)
+  -> RuntimeInstance(deployment/state object scheduled by controller)
+```
+
+强约束：
+
+- 模型不是模板：`Model` 只描述模型资产，不承载运行时拼装细节。
+- 模板不是实例：`RuntimeTemplate` 只定义运行环境，不代表已启动对象。
+- `Binding` 是桥梁：模型与模板必须通过 `RuntimeBinding` 关联。
+- `RuntimeInstance` 才是运行态：controller 后续 reconcile/precheck/conflict/drift 的主对象是实例。
+- `Manifest` 是约束层：高级模式必须通过受约束 manifest 进入系统，不允许裸接任意 compose+脚本。
+
+### C. Binding Modes（阶段 0 定稿）
+
+| 模式 | 典型场景 | 优点 | 局限（阶段 0） |
+| --- | --- | --- | --- |
+| `dedicated` | 模型专有模板 | 行为固定、可预测 | 复用性差，模板数量可能上升 |
+| `generic_injected` | 通用模板 + 模型目录/参数注入 | 复用性好，当前主路径 | 对注入规范和兼容性约束要求更高 |
+| `generic_with_script` | 通用模板 + 注入 + 脚本覆盖 | 可处理复杂启动前后动作 | 阶段 0 仅完成建模/校验，占位执行 |
+| `custom_bundle` | 专家模式/BYOR | 覆盖复杂多组件场景 | 阶段 0 仅开放受约束入口，非完整执行器 |
+
+阶段 0 可用性：
+
+- 已最小可用：`dedicated`、`generic_injected`（含 E5 样板链路）
+- 已建模并接入校验：`generic_with_script`、`custom_bundle`
+
+### D. 为什么“旧三类情况”不覆盖全部场景
+
+旧路径可以覆盖多数“本地目录挂载 + 单容器 + 简单参数注入”的 Docker 化模型场景，但不能覆盖全部：
+
+- 非本地目录挂载型模型（远程模型引用/下载中转）
+- 单 runtime 多模型并存（实例与模型一对多/多对一关系）
+- 多步骤/多容器/sidecar 场景
+- 模板与模型之间显式兼容性约束（model type / format / capability）
+
+因此本轮必须补齐：
+
+- `RuntimeBinding`：显式表达模型-模板关系与注入策略
+- `RuntimeBundleManifest`：显式表达模板/自定义运行包约束契约
+
+### E. `custom_bundle` 定位（受约束高级模式）
+
+- `custom_bundle` 是必要托底模式，用于专家/BYOR 场景。
+- 该模式不是“任意 compose + 任意脚本裸奔接入”。
+- 进入系统前必须通过 `RuntimeBundleManifest`（能力、注入方式、健康检查、端口暴露、环境变量要求）的约束校验。
+- 阶段 0 已提供 manifest 数据结构、最小校验入口、API 可见性；完整 bundle 执行器放在后续阶段 D 演进。
+
+### F. 与阶段 A/B/C/D 的关系
+
+当前开发顺序（新计划）：
+
+1. 阶段 0：运行对象模型重构（本次）
+2. 阶段 A：Agent 节点执行面做实
+3. 阶段 B：Controller 编排内核做深
+4. 阶段 C：外围组件真实联调（Nginx -> LiteLLM -> 外部 embedding/RAG）
+5. 阶段 D：产品化与长期扩展（UI、更多模型类型、custom bundle/expert mode、审计恢复策略插件化）
+
+衔接关系：
+
+- 阶段 0 先明确对象模型，避免后续执行面/编排面继续绑定在“模型即运行态”的旧路径上。
+- 阶段 A 使用 `RuntimeInstance + Binding + Manifest` 做节点侧 precheck/执行输入。
+- 阶段 B 围绕 `RuntimeInstance` 进行 reconcile/conflict/drift 协调。
+- 阶段 C 使用 `RuntimeInstance.endpoint/exposed_ports` 承接 Nginx/LiteLLM/外部 client 联调。
+- 阶段 D 在 `custom_bundle + manifest` 约束下演进专家模式，避免一次性 hack。
+
 ## 第一部分（前半）：当前项目架构设计
 
 ### 1. 架构基准（2026-03 第一阶段修正版）
@@ -49,19 +136,13 @@ controller 仅保留自举与存活必需的本机检查：
 
 先稳定同机协议链路，再扩展跨机变量，降低联调复杂度。
 
-#### 1.6 阶段计划（修正版）
+#### 1.6 阶段计划（新基线）
 
-第一阶段（当前）：
-
-- 增强 agent 任务执行面（`runtime_readiness_check`、`runtime_precheck`、`port_check`、`model_path_check`、`resource_snapshot`、`docker_inspect`）
-- 结果反哺 node/runtime/model 状态（含 readiness/drift）
-- controller 持续 reconcile，解释 desired/observed 差异
-- precheck/conflict 贯彻“局部事实走 agent、全局协调在 controller”
-
-第二阶段（后续）：
-
-- 外围组件联调（Nginx / LiteLLM / 外部 embedding client）
-- 完善 remote agent 与多 runtime 协同闭环、稳定性与回归体系
+- 阶段 0（当前最优先）：运行对象模型重构（`Model / RuntimeTemplate / RuntimeBinding / RuntimeInstance / RuntimeBundleManifest`）
+- 阶段 A：Agent 节点执行面做实（节点局部动作优先 agent，local-agent 成为标准路径）
+- 阶段 B：Controller 编排内核做深（围绕 `RuntimeInstance` reconcile/precheck/conflict/drift）
+- 阶段 C：外围组件真实联调（Nginx -> LiteLLM -> 外部 embedding/RAG，以 E5 链路为第一条标准链）
+- 阶段 D：产品化与长期扩展（更完整 UI、多模型类型、custom bundle/expert mode、审计恢复与策略插件化）
 
 ### 2. 当前系统形态（2026-03）
 
@@ -266,8 +347,14 @@ ${TEST_LOG_ROOT_HOST:-./testsystem/logs}:/workspace/test-logs
 - `GET /api/v1/runtime-templates`
 - `POST /api/v1/runtime-templates/validate`
 - `POST /api/v1/runtime-templates`
+- `GET /api/v1/runtime-templates/{id}/manifest`
+- `GET /api/v1/runtime-bindings`
+- `POST /api/v1/runtime-bindings`
+- `GET /api/v1/runtime-bindings/{id}`
+- `GET /api/v1/runtime-instances`
+- `GET /api/v1/runtime-instances/{id}`
 
-支持内置、配置、自定义模板统一注册。
+支持内置、配置、自定义模板统一注册，并提供 `binding -> instance` 运行态可见性。
 
 ### 14. 日志排障与运维建议
 

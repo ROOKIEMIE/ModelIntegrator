@@ -118,13 +118,22 @@ func main() {
 		log.Error("模型持久化状态加载失败", "error", err)
 		os.Exit(1)
 	}
+	runtimeObjectService := service.NewRuntimeObjectService(modelRegistry, nodeRegistry, runtimeTemplateService, log)
+	if err := runtimeObjectService.SetStore(context.Background(), sqliteStore); err != nil {
+		log.Error("runtime object 持久化状态加载失败", "error", err)
+		os.Exit(1)
+	}
+	modelService.SetRuntimeObjectSyncer(runtimeObjectService)
+	if err := runtimeObjectService.Bootstrap(context.Background()); err != nil {
+		log.Warn("runtime object bootstrap 失败（继续启动，保留兼容路径）", "error", err)
+	}
 	taskService := service.NewTaskService(sqliteStore, modelService, log)
 	taskService.SetAgentService(agentService)
 	taskService.SetNodeService(nodeService)
 	modelService.SetTaskService(taskService)
 	testRunService := service.NewTestRunService(sqliteStore, taskService, modelService, log, cfg.Testing.LogRootDir)
 
-	handler := api.NewHandler(nodeService, modelService, runtimeTemplateService, agentService, taskService, testRunService, log, version.Get())
+	handler := api.NewHandler(nodeService, modelService, runtimeTemplateService, runtimeObjectService, agentService, taskService, testRunService, log, version.Get())
 	router := api.NewRouter(handler, cfg.Server.StaticDir, cfg.Auth.Token, log)
 
 	httpServer := server.New(cfg, router, log)

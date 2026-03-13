@@ -37,6 +37,11 @@ type ModelService struct {
 	modelRootDir  string
 	nodeActionMu  sync.Mutex
 	nodeActionMap map[string]bool
+	runtimeSyncer RuntimeObjectSyncer
+}
+
+type RuntimeObjectSyncer interface {
+	SyncModelRuntimeObjects(ctx context.Context, item model.Model) error
 }
 
 func NewModelService(
@@ -138,6 +143,10 @@ func (s *ModelService) SyncRegistryToStore(ctx context.Context) error {
 
 func (s *ModelService) SetTaskService(taskSvc *TaskService) {
 	s.taskSvc = taskSvc
+}
+
+func (s *ModelService) SetRuntimeObjectSyncer(syncer RuntimeObjectSyncer) {
+	s.runtimeSyncer = syncer
 }
 
 func (s *ModelService) LoadModel(ctx context.Context, id string) (model.ActionResult, error) {
@@ -349,6 +358,7 @@ func (s *ModelService) RefreshModels(ctx context.Context) error {
 	recordStepErr("refresh_container_runtime_states", s.refreshContainerRuntimeStates(ctx))
 	recordStepErr("refresh_lmstudio_models", s.refreshLMStudioModels(ctx))
 	recordStepErr("persist_models", s.SyncRegistryToStore(ctx))
+	recordStepErr("sync_runtime_objects", s.syncRuntimeObjectsForAll(ctx))
 
 	return errors.Join(refreshErrors...)
 }
@@ -770,6 +780,38 @@ func (s *ModelService) refreshLocalModels(ctx context.Context) error {
 			modelEndpoint = inferredEndpoint
 			metadata["runtime_service_endpoint"] = inferredEndpoint
 		}
+		modelType := inferModelTypeByName(modelName, name)
+		if strings.TrimSpace(string(existing.ModelType)) != "" {
+			modelType = existing.ModelType
+		}
+		modelSourceType := model.ModelSourceLocalPath
+		if strings.TrimSpace(string(existing.SourceType)) != "" {
+			modelSourceType = existing.SourceType
+		}
+		modelFormat := inferModelFormatByEntryName(name)
+		if strings.TrimSpace(string(existing.Format)) != "" {
+			modelFormat = existing.Format
+		}
+		pathOrRef := path
+		if strings.TrimSpace(existing.PathOrRef) != "" {
+			pathOrRef = existing.PathOrRef
+		}
+		displayName := modelName
+		if strings.TrimSpace(existing.DisplayName) != "" {
+			displayName = existing.DisplayName
+		}
+		scriptRef := strings.TrimSpace(existing.ScriptRef)
+		if scriptRef == "" {
+			scriptRef = strings.TrimSpace(existing.Metadata["script_ref"])
+		}
+		requiresScript := existing.RequiresScript
+		if scriptRef != "" {
+			requiresScript = true
+		}
+		tags := inferModelTags(modelType, modelFormat, modelName)
+		if len(existing.Tags) > 0 {
+			tags = append([]string(nil), existing.Tags...)
+		}
 		desiredState := strings.TrimSpace(existing.DesiredState)
 		if desiredState == "" {
 			desiredState = string(state)
@@ -788,6 +830,16 @@ func (s *ModelService) refreshLocalModels(ctx context.Context) error {
 		scanned = append(scanned, model.Model{
 			ID:               modelID,
 			Name:             modelName,
+			DisplayName:      displayName,
+			ModelType:        modelType,
+			SourceType:       modelSourceType,
+			Format:           modelFormat,
+			PathOrRef:        pathOrRef,
+			SizeBytes:        existing.SizeBytes,
+			DefaultArgs:      cloneMetadataMap(existing.DefaultArgs),
+			RequiresScript:   requiresScript,
+			ScriptRef:        scriptRef,
+			Tags:             tags,
 			Provider:         "localfs",
 			BackendType:      backendType,
 			HostNodeID:       hostNodeID,
@@ -833,10 +885,36 @@ func (s *ModelService) refreshContainerRuntimeStates(ctx context.Context) error 
 }
 
 func (s *ModelService) persistModel(ctx context.Context, item model.Model) error {
-	if s.store == nil {
+	if s.store != nil {
+		if err := s.store.UpsertModel(ctx, item); err != nil {
+			return err
+		}
+	}
+	if err := s.syncRuntimeObjects(ctx, item); err != nil {
+		s.logger.Warn("同步 runtime objects 失败", "model_id", item.ID, "error", err)
+	}
+	return nil
+}
+
+func (s *ModelService) syncRuntimeObjects(ctx context.Context, item model.Model) error {
+	if s.runtimeSyncer == nil {
 		return nil
 	}
-	return s.store.UpsertModel(ctx, item)
+	return s.runtimeSyncer.SyncModelRuntimeObjects(ctx, item)
+}
+
+func (s *ModelService) syncRuntimeObjectsForAll(ctx context.Context) error {
+	if s.runtimeSyncer == nil {
+		return nil
+	}
+	models := s.modelRegistry.List()
+	var errs []error
+	for _, item := range models {
+		if err := s.runtimeSyncer.SyncModelRuntimeObjects(ctx, item); err != nil {
+			errs = append(errs, fmt.Errorf("model=%s: %w", item.ID, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func desiredStateForAction(action string, m model.Model) string {
@@ -1136,6 +1214,59 @@ func inferTemplateIDForLocalModel(modelName, entryName string) string {
 	return DefaultDockerTemplateID
 }
 
+func inferModelTypeByName(modelName, entryName string) model.ModelKind {
+	lower := strings.ToLower(strings.TrimSpace(modelName + " " + entryName))
+	switch {
+	case strings.Contains(lower, "embedding"), strings.Contains(lower, "e5"), strings.Contains(lower, "bge"), strings.Contains(lower, "gte"), strings.Contains(lower, "m3e"):
+		return model.ModelKindEmbedding
+	case strings.Contains(lower, "rerank"):
+		return model.ModelKindRerank
+	case strings.Contains(lower, "chat"), strings.Contains(lower, "instruct"), strings.Contains(lower, "llm"), strings.Contains(lower, "qwen"), strings.Contains(lower, "llama"):
+		return model.ModelKindChat
+	default:
+		return model.ModelKindUnknown
+	}
+}
+
+func inferModelFormatByEntryName(entryName string) model.ModelFormat {
+	ext := strings.ToLower(strings.TrimSpace(filepath.Ext(entryName)))
+	switch ext {
+	case ".gguf":
+		return model.ModelFormatGGUF
+	case ".safetensors":
+		return model.ModelFormatSafeTensors
+	case ".mlx":
+		return model.ModelFormatMLX
+	default:
+		return model.ModelFormatUnknown
+	}
+}
+
+func inferModelTags(kind model.ModelKind, format model.ModelFormat, name string) []string {
+	tags := make([]string, 0, 4)
+	appendTag := func(value string) {
+		value = strings.TrimSpace(strings.ToLower(value))
+		if value == "" {
+			return
+		}
+		for _, existing := range tags {
+			if existing == value {
+				return
+			}
+		}
+		tags = append(tags, value)
+	}
+	appendTag(string(kind))
+	appendTag(string(format))
+	if strings.Contains(strings.ToLower(name), "e5") {
+		appendTag("e5")
+	}
+	if len(tags) == 0 {
+		return nil
+	}
+	return tags
+}
+
 func preserveContainerMetadata(existing map[string]string, target map[string]string) {
 	if existing == nil || target == nil {
 		return
@@ -1389,6 +1520,42 @@ func mergeOneModel(base model.Model, persisted model.Model) model.Model {
 	}
 	if strings.TrimSpace(base.Name) == "" {
 		base.Name = persisted.Name
+	}
+	if strings.TrimSpace(base.DisplayName) == "" {
+		base.DisplayName = persisted.DisplayName
+	}
+	if strings.TrimSpace(string(base.ModelType)) == "" {
+		base.ModelType = persisted.ModelType
+	}
+	if strings.TrimSpace(string(base.SourceType)) == "" {
+		base.SourceType = persisted.SourceType
+	}
+	if strings.TrimSpace(string(base.Format)) == "" {
+		base.Format = persisted.Format
+	}
+	if strings.TrimSpace(base.PathOrRef) == "" {
+		base.PathOrRef = persisted.PathOrRef
+	}
+	if base.SizeBytes == 0 && persisted.SizeBytes > 0 {
+		base.SizeBytes = persisted.SizeBytes
+	}
+	if len(base.DefaultArgs) == 0 && len(persisted.DefaultArgs) > 0 {
+		base.DefaultArgs = cloneMetadataMap(persisted.DefaultArgs)
+	} else {
+		for k, v := range persisted.DefaultArgs {
+			if strings.TrimSpace(base.DefaultArgs[k]) == "" {
+				base.DefaultArgs[k] = v
+			}
+		}
+	}
+	if strings.TrimSpace(base.ScriptRef) == "" {
+		base.ScriptRef = persisted.ScriptRef
+	}
+	if !base.RequiresScript && persisted.RequiresScript {
+		base.RequiresScript = true
+	}
+	if len(base.Tags) == 0 && len(persisted.Tags) > 0 {
+		base.Tags = append([]string(nil), persisted.Tags...)
 	}
 	if strings.TrimSpace(base.Provider) == "" {
 		base.Provider = persisted.Provider

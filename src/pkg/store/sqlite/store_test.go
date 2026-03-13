@@ -198,3 +198,93 @@ func TestTaskAndTestRunRoundTrip(t *testing.T) {
 		t.Fatalf("unexpected test run snapshot: %+v", got)
 	}
 }
+
+func TestRuntimeBindingInstanceManifestRoundTrip(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+
+	if err := store.UpsertModel(ctx, model.Model{
+		ID:          "local-multilingual-e5-base",
+		Name:        "multilingual-e5-base",
+		DisplayName: "Multilingual E5 Base",
+		ModelType:   model.ModelKindEmbedding,
+		SourceType:  model.ModelSourceLocalPath,
+		Format:      model.ModelFormatSafeTensors,
+		PathOrRef:   "./resources/models/multilingual-e5-base",
+		BackendType: model.RuntimeTypeDocker,
+		State:       model.ModelStateStopped,
+	}); err != nil {
+		t.Fatalf("upsert model failed: %v", err)
+	}
+
+	manifest := model.RuntimeBundleManifest{
+		ID:                  "tei-embedding-e5-local",
+		TemplateID:          "tei-embedding-e5-local",
+		ManifestVersion:     "v1alpha1",
+		TemplateType:        model.RuntimeTemplateTypeSingleContainer,
+		RuntimeKind:         model.RuntimeKindTEI,
+		SupportedModelTypes: []model.ModelKind{model.ModelKindEmbedding},
+		SupportedFormats:    []model.ModelFormat{model.ModelFormatSafeTensors},
+		Capabilities:        []model.ModelKind{model.ModelKindEmbedding},
+		MountPoints:         []string{"/models"},
+		ModelInjectionMode:  model.RuntimeBindingModeGenericInjected,
+		ExposedPorts:        []string{"58001:80"},
+	}
+	if err := store.UpsertRuntimeBundleManifest(ctx, manifest); err != nil {
+		t.Fatalf("upsert runtime bundle manifest failed: %v", err)
+	}
+
+	binding := model.RuntimeBinding{
+		ID:                  "rb-local-multilingual-e5-base-tei-embedding-e5-local",
+		ModelID:             "local-multilingual-e5-base",
+		TemplateID:          "tei-embedding-e5-local",
+		BindingMode:         model.RuntimeBindingModeGenericInjected,
+		PreferredNode:       "node-controller",
+		MountRules:          []string{"./resources/models:/models:ro"},
+		CompatibilityStatus: model.CompatibilityCompatible,
+		Enabled:             true,
+		ManifestID:          manifest.ID,
+	}
+	if err := store.UpsertRuntimeBinding(ctx, binding); err != nil {
+		t.Fatalf("upsert runtime binding failed: %v", err)
+	}
+
+	instance := model.RuntimeInstance{
+		ID:            "ri-local-multilingual-e5-base",
+		ModelID:       "local-multilingual-e5-base",
+		TemplateID:    "tei-embedding-e5-local",
+		BindingID:     binding.ID,
+		NodeID:        "node-controller",
+		DesiredState:  "running",
+		ObservedState: "stopped",
+		Readiness:     model.ReadinessNotReady,
+		Endpoint:      "http://127.0.0.1:58001",
+	}
+	if err := store.UpsertRuntimeInstance(ctx, instance); err != nil {
+		t.Fatalf("upsert runtime instance failed: %v", err)
+	}
+
+	gotBinding, ok, err := store.GetRuntimeBindingByID(ctx, binding.ID)
+	if err != nil {
+		t.Fatalf("get runtime binding failed: %v", err)
+	}
+	if !ok || gotBinding.BindingMode != model.RuntimeBindingModeGenericInjected {
+		t.Fatalf("unexpected binding snapshot: %+v", gotBinding)
+	}
+
+	gotInstance, ok, err := store.GetRuntimeInstanceByID(ctx, instance.ID)
+	if err != nil {
+		t.Fatalf("get runtime instance failed: %v", err)
+	}
+	if !ok || gotInstance.BindingID != binding.ID {
+		t.Fatalf("unexpected runtime instance snapshot: %+v", gotInstance)
+	}
+
+	gotManifest, ok, err := store.GetRuntimeBundleManifestByTemplateID(ctx, "tei-embedding-e5-local")
+	if err != nil {
+		t.Fatalf("get runtime manifest failed: %v", err)
+	}
+	if !ok || gotManifest.RuntimeKind != model.RuntimeKindTEI {
+		t.Fatalf("unexpected runtime manifest snapshot: %+v", gotManifest)
+	}
+}

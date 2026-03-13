@@ -73,6 +73,16 @@ func (s *Store) initSchema(ctx context.Context) error {
 		column     string
 		definition string
 	}{
+		{table: "models", column: "display_name", definition: "TEXT NOT NULL DEFAULT ''"},
+		{table: "models", column: "model_type", definition: "TEXT NOT NULL DEFAULT 'unknown'"},
+		{table: "models", column: "source_type", definition: "TEXT NOT NULL DEFAULT 'unknown'"},
+		{table: "models", column: "model_format", definition: "TEXT NOT NULL DEFAULT 'unknown'"},
+		{table: "models", column: "path_or_ref", definition: "TEXT NOT NULL DEFAULT ''"},
+		{table: "models", column: "size_bytes", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{table: "models", column: "default_args_json", definition: "TEXT NOT NULL DEFAULT '{}'"},
+		{table: "models", column: "requires_script", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{table: "models", column: "script_ref", definition: "TEXT NOT NULL DEFAULT ''"},
+		{table: "models", column: "tags_json", definition: "TEXT NOT NULL DEFAULT '[]'"},
 		{table: "models", column: "desired_state", definition: "TEXT NOT NULL DEFAULT 'unknown'"},
 		{table: "models", column: "observed_state", definition: "TEXT NOT NULL DEFAULT 'unknown'"},
 		{table: "models", column: "readiness", definition: "TEXT NOT NULL DEFAULT 'unknown'"},
@@ -417,12 +427,24 @@ func (s *Store) UpsertModel(ctx context.Context, item model.Model) error {
 	now := time.Now().UTC()
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO models (
-			id, name, provider, backend_type, host_node_id, runtime_id,
+			id, name, display_name, model_type, source_type, model_format,
+			path_or_ref, size_bytes, default_args_json, requires_script, script_ref, tags_json,
+			provider, backend_type, host_node_id, runtime_id,
 			endpoint, state, desired_state, observed_state, readiness, health_message, last_reconciled_at,
 			context_length, metadata_json, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name = excluded.name,
+			display_name = excluded.display_name,
+			model_type = excluded.model_type,
+			source_type = excluded.source_type,
+			model_format = excluded.model_format,
+			path_or_ref = excluded.path_or_ref,
+			size_bytes = excluded.size_bytes,
+			default_args_json = excluded.default_args_json,
+			requires_script = excluded.requires_script,
+			script_ref = excluded.script_ref,
+			tags_json = excluded.tags_json,
 			provider = excluded.provider,
 			backend_type = excluded.backend_type,
 			host_node_id = excluded.host_node_id,
@@ -440,6 +462,16 @@ func (s *Store) UpsertModel(ctx context.Context, item model.Model) error {
 	`,
 		item.ID,
 		strings.TrimSpace(item.Name),
+		strings.TrimSpace(item.DisplayName),
+		firstNonEmpty(string(item.ModelType), string(model.ModelKindUnknown)),
+		firstNonEmpty(string(item.SourceType), string(model.ModelSourceUnknown)),
+		firstNonEmpty(string(item.Format), string(model.ModelFormatUnknown)),
+		strings.TrimSpace(item.PathOrRef),
+		item.SizeBytes,
+		mustJSON(item.DefaultArgs, "{}"),
+		boolToInt(item.RequiresScript),
+		strings.TrimSpace(item.ScriptRef),
+		mustJSON(item.Tags, "[]"),
 		strings.TrimSpace(item.Provider),
 		strings.TrimSpace(string(item.BackendType)),
 		strings.TrimSpace(item.HostNodeID),
@@ -475,7 +507,9 @@ func (s *Store) UpsertModels(ctx context.Context, items []model.Model) error {
 
 func (s *Store) ListModels(ctx context.Context) ([]model.Model, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, name, provider, backend_type, host_node_id, runtime_id,
+		SELECT id, name, display_name, model_type, source_type, model_format,
+		       path_or_ref, size_bytes, default_args_json, requires_script, script_ref, tags_json,
+		       provider, backend_type, host_node_id, runtime_id,
 		       endpoint, state, desired_state, observed_state, readiness, health_message, last_reconciled_at,
 		       context_length, metadata_json
 		FROM models
@@ -490,6 +524,12 @@ func (s *Store) ListModels(ctx context.Context) ([]model.Model, error) {
 	for rows.Next() {
 		var (
 			item              model.Model
+			modelTypeRaw      string
+			sourceTypeRaw     string
+			formatRaw         string
+			defaultArgsJSON   string
+			requiresScriptRaw int
+			tagsJSON          string
 			backendRaw        string
 			stateRaw          string
 			desiredStateRaw   string
@@ -499,12 +539,20 @@ func (s *Store) ListModels(ctx context.Context) ([]model.Model, error) {
 			metadata          string
 		)
 		if err := rows.Scan(
-			&item.ID, &item.Name, &item.Provider, &backendRaw, &item.HostNodeID, &item.RuntimeID,
+			&item.ID, &item.Name, &item.DisplayName, &modelTypeRaw, &sourceTypeRaw, &formatRaw,
+			&item.PathOrRef, &item.SizeBytes, &defaultArgsJSON, &requiresScriptRaw, &item.ScriptRef, &tagsJSON,
+			&item.Provider, &backendRaw, &item.HostNodeID, &item.RuntimeID,
 			&item.Endpoint, &stateRaw, &desiredStateRaw, &observedStateRaw, &readinessRaw, &item.HealthMessage, &lastReconciledRaw,
 			&item.ContextLength, &metadata,
 		); err != nil {
 			return nil, fmt.Errorf("scan model failed: %w", err)
 		}
+		item.ModelType = model.ModelKind(strings.TrimSpace(modelTypeRaw))
+		item.SourceType = model.ModelSourceType(strings.TrimSpace(sourceTypeRaw))
+		item.Format = model.ModelFormat(strings.TrimSpace(formatRaw))
+		item.DefaultArgs = parseStringMap(defaultArgsJSON)
+		item.RequiresScript = requiresScriptRaw == 1
+		item.Tags = parseStringSlice(tagsJSON)
 		item.BackendType = model.RuntimeType(strings.TrimSpace(backendRaw))
 		item.State = model.ModelState(strings.TrimSpace(stateRaw))
 		item.DesiredState = strings.TrimSpace(desiredStateRaw)
@@ -522,7 +570,9 @@ func (s *Store) ListModels(ctx context.Context) ([]model.Model, error) {
 
 func (s *Store) GetModelByID(ctx context.Context, id string) (model.Model, bool, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, name, provider, backend_type, host_node_id, runtime_id,
+		SELECT id, name, display_name, model_type, source_type, model_format,
+		       path_or_ref, size_bytes, default_args_json, requires_script, script_ref, tags_json,
+		       provider, backend_type, host_node_id, runtime_id,
 		       endpoint, state, desired_state, observed_state, readiness, health_message, last_reconciled_at,
 		       context_length, metadata_json
 		FROM models
@@ -531,6 +581,12 @@ func (s *Store) GetModelByID(ctx context.Context, id string) (model.Model, bool,
 
 	var (
 		item              model.Model
+		modelTypeRaw      string
+		sourceTypeRaw     string
+		formatRaw         string
+		defaultArgsJSON   string
+		requiresScriptRaw int
+		tagsJSON          string
 		backendRaw        string
 		stateRaw          string
 		desiredStateRaw   string
@@ -540,7 +596,9 @@ func (s *Store) GetModelByID(ctx context.Context, id string) (model.Model, bool,
 		metadata          string
 	)
 	err := row.Scan(
-		&item.ID, &item.Name, &item.Provider, &backendRaw, &item.HostNodeID, &item.RuntimeID,
+		&item.ID, &item.Name, &item.DisplayName, &modelTypeRaw, &sourceTypeRaw, &formatRaw,
+		&item.PathOrRef, &item.SizeBytes, &defaultArgsJSON, &requiresScriptRaw, &item.ScriptRef, &tagsJSON,
+		&item.Provider, &backendRaw, &item.HostNodeID, &item.RuntimeID,
 		&item.Endpoint, &stateRaw, &desiredStateRaw, &observedStateRaw, &readinessRaw, &item.HealthMessage, &lastReconciledRaw,
 		&item.ContextLength, &metadata,
 	)
@@ -550,6 +608,12 @@ func (s *Store) GetModelByID(ctx context.Context, id string) (model.Model, bool,
 	if err != nil {
 		return model.Model{}, false, fmt.Errorf("get model failed: %w", err)
 	}
+	item.ModelType = model.ModelKind(strings.TrimSpace(modelTypeRaw))
+	item.SourceType = model.ModelSourceType(strings.TrimSpace(sourceTypeRaw))
+	item.Format = model.ModelFormat(strings.TrimSpace(formatRaw))
+	item.DefaultArgs = parseStringMap(defaultArgsJSON)
+	item.RequiresScript = requiresScriptRaw == 1
+	item.Tags = parseStringSlice(tagsJSON)
 	item.BackendType = model.RuntimeType(strings.TrimSpace(backendRaw))
 	item.State = model.ModelState(strings.TrimSpace(stateRaw))
 	item.DesiredState = strings.TrimSpace(desiredStateRaw)
@@ -557,6 +621,454 @@ func (s *Store) GetModelByID(ctx context.Context, id string) (model.Model, bool,
 	item.Readiness = model.ReadinessState(strings.TrimSpace(readinessRaw))
 	item.LastReconciledAt = textToTime(lastReconciledRaw)
 	item.Metadata = parseStringMap(metadata)
+	return item, true, nil
+}
+
+func (s *Store) UpsertRuntimeBinding(ctx context.Context, item model.RuntimeBinding) error {
+	if strings.TrimSpace(item.ID) == "" {
+		return fmt.Errorf("runtime binding id is empty")
+	}
+	now := time.Now().UTC()
+	createdAt := item.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = now
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO runtime_bindings (
+			id, model_id, template_id, binding_mode, node_selector_json, preferred_node,
+			mount_rules_json, env_overrides_json, command_override_json, script_ref,
+			compatibility_status, compatibility_message, enabled, manifest_id, metadata_json,
+			created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			model_id = excluded.model_id,
+			template_id = excluded.template_id,
+			binding_mode = excluded.binding_mode,
+			node_selector_json = excluded.node_selector_json,
+			preferred_node = excluded.preferred_node,
+			mount_rules_json = excluded.mount_rules_json,
+			env_overrides_json = excluded.env_overrides_json,
+			command_override_json = excluded.command_override_json,
+			script_ref = excluded.script_ref,
+			compatibility_status = excluded.compatibility_status,
+			compatibility_message = excluded.compatibility_message,
+			enabled = excluded.enabled,
+			manifest_id = excluded.manifest_id,
+			metadata_json = excluded.metadata_json,
+			created_at = CASE WHEN runtime_bindings.created_at = '' THEN excluded.created_at ELSE runtime_bindings.created_at END,
+			updated_at = excluded.updated_at;
+	`,
+		item.ID,
+		strings.TrimSpace(item.ModelID),
+		strings.TrimSpace(item.TemplateID),
+		firstNonEmpty(string(item.BindingMode), string(model.RuntimeBindingModeGenericInjected)),
+		mustJSON(item.NodeSelector, "{}"),
+		strings.TrimSpace(item.PreferredNode),
+		mustJSON(item.MountRules, "[]"),
+		mustJSON(item.EnvOverrides, "{}"),
+		mustJSON(item.CommandOverride, "[]"),
+		strings.TrimSpace(item.ScriptRef),
+		firstNonEmpty(string(item.CompatibilityStatus), string(model.CompatibilityUnknown)),
+		strings.TrimSpace(item.CompatibilityMessage),
+		boolToInt(item.Enabled),
+		strings.TrimSpace(item.ManifestID),
+		mustJSON(item.Metadata, "{}"),
+		timeToText(createdAt),
+		timeToText(now),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert runtime binding failed: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ListRuntimeBindings(ctx context.Context) ([]model.RuntimeBinding, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, model_id, template_id, binding_mode, node_selector_json, preferred_node,
+		       mount_rules_json, env_overrides_json, command_override_json, script_ref,
+		       compatibility_status, compatibility_message, enabled, manifest_id, metadata_json,
+		       created_at, updated_at
+		FROM runtime_bindings
+		ORDER BY id;
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list runtime bindings failed: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]model.RuntimeBinding, 0, 32)
+	for rows.Next() {
+		var (
+			item                   model.RuntimeBinding
+			modeRaw                string
+			nodeSelectorJSON       string
+			mountRulesJSON         string
+			envOverridesJSON       string
+			commandOverrideJSON    string
+			compatibilityStatusRaw string
+			enabledRaw             int
+			metadataJSON           string
+			createdAtRaw           string
+			updatedAtRaw           string
+		)
+		if err := rows.Scan(
+			&item.ID, &item.ModelID, &item.TemplateID, &modeRaw, &nodeSelectorJSON, &item.PreferredNode,
+			&mountRulesJSON, &envOverridesJSON, &commandOverrideJSON, &item.ScriptRef,
+			&compatibilityStatusRaw, &item.CompatibilityMessage, &enabledRaw, &item.ManifestID, &metadataJSON,
+			&createdAtRaw, &updatedAtRaw,
+		); err != nil {
+			return nil, fmt.Errorf("scan runtime binding failed: %w", err)
+		}
+		item.BindingMode = model.RuntimeBindingMode(strings.TrimSpace(modeRaw))
+		item.NodeSelector = parseStringMap(nodeSelectorJSON)
+		item.MountRules = parseStringSlice(mountRulesJSON)
+		item.EnvOverrides = parseStringMap(envOverridesJSON)
+		item.CommandOverride = parseStringSlice(commandOverrideJSON)
+		item.CompatibilityStatus = model.CompatibilityStatus(strings.TrimSpace(compatibilityStatusRaw))
+		item.Enabled = enabledRaw == 1
+		item.Metadata = parseStringMap(metadataJSON)
+		item.CreatedAt = textToTime(createdAtRaw)
+		item.UpdatedAt = textToTime(updatedAtRaw)
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate runtime bindings failed: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Store) GetRuntimeBindingByID(ctx context.Context, id string) (model.RuntimeBinding, bool, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, model_id, template_id, binding_mode, node_selector_json, preferred_node,
+		       mount_rules_json, env_overrides_json, command_override_json, script_ref,
+		       compatibility_status, compatibility_message, enabled, manifest_id, metadata_json,
+		       created_at, updated_at
+		FROM runtime_bindings
+		WHERE id = ? LIMIT 1;
+	`, strings.TrimSpace(id))
+
+	var (
+		item                   model.RuntimeBinding
+		modeRaw                string
+		nodeSelectorJSON       string
+		mountRulesJSON         string
+		envOverridesJSON       string
+		commandOverrideJSON    string
+		compatibilityStatusRaw string
+		enabledRaw             int
+		metadataJSON           string
+		createdAtRaw           string
+		updatedAtRaw           string
+	)
+	err := row.Scan(
+		&item.ID, &item.ModelID, &item.TemplateID, &modeRaw, &nodeSelectorJSON, &item.PreferredNode,
+		&mountRulesJSON, &envOverridesJSON, &commandOverrideJSON, &item.ScriptRef,
+		&compatibilityStatusRaw, &item.CompatibilityMessage, &enabledRaw, &item.ManifestID, &metadataJSON,
+		&createdAtRaw, &updatedAtRaw,
+	)
+	if err == sql.ErrNoRows {
+		return model.RuntimeBinding{}, false, nil
+	}
+	if err != nil {
+		return model.RuntimeBinding{}, false, fmt.Errorf("get runtime binding failed: %w", err)
+	}
+	item.BindingMode = model.RuntimeBindingMode(strings.TrimSpace(modeRaw))
+	item.NodeSelector = parseStringMap(nodeSelectorJSON)
+	item.MountRules = parseStringSlice(mountRulesJSON)
+	item.EnvOverrides = parseStringMap(envOverridesJSON)
+	item.CommandOverride = parseStringSlice(commandOverrideJSON)
+	item.CompatibilityStatus = model.CompatibilityStatus(strings.TrimSpace(compatibilityStatusRaw))
+	item.Enabled = enabledRaw == 1
+	item.Metadata = parseStringMap(metadataJSON)
+	item.CreatedAt = textToTime(createdAtRaw)
+	item.UpdatedAt = textToTime(updatedAtRaw)
+	return item, true, nil
+}
+
+func (s *Store) UpsertRuntimeInstance(ctx context.Context, item model.RuntimeInstance) error {
+	if strings.TrimSpace(item.ID) == "" {
+		return fmt.Errorf("runtime instance id is empty")
+	}
+	now := time.Now().UTC()
+	createdAt := item.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = now
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO runtime_instances (
+			id, model_id, template_id, binding_id, node_id, desired_state, observed_state,
+			readiness, health_message, drift_reason, endpoint,
+			launched_command_json, mounted_paths_json, injected_env_json, script_used,
+			last_reconciled_at, metadata_json, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			model_id = excluded.model_id,
+			template_id = excluded.template_id,
+			binding_id = excluded.binding_id,
+			node_id = excluded.node_id,
+			desired_state = excluded.desired_state,
+			observed_state = excluded.observed_state,
+			readiness = excluded.readiness,
+			health_message = excluded.health_message,
+			drift_reason = excluded.drift_reason,
+			endpoint = excluded.endpoint,
+			launched_command_json = excluded.launched_command_json,
+			mounted_paths_json = excluded.mounted_paths_json,
+			injected_env_json = excluded.injected_env_json,
+			script_used = excluded.script_used,
+			last_reconciled_at = excluded.last_reconciled_at,
+			metadata_json = excluded.metadata_json,
+			created_at = CASE WHEN runtime_instances.created_at = '' THEN excluded.created_at ELSE runtime_instances.created_at END,
+			updated_at = excluded.updated_at;
+	`,
+		item.ID,
+		strings.TrimSpace(item.ModelID),
+		strings.TrimSpace(item.TemplateID),
+		strings.TrimSpace(item.BindingID),
+		strings.TrimSpace(item.NodeID),
+		firstNonEmpty(strings.TrimSpace(item.DesiredState), string(model.ModelStateUnknown)),
+		firstNonEmpty(strings.TrimSpace(item.ObservedState), string(model.ModelStateUnknown)),
+		firstNonEmpty(string(item.Readiness), string(model.ReadinessUnknown)),
+		strings.TrimSpace(item.HealthMessage),
+		strings.TrimSpace(item.DriftReason),
+		strings.TrimSpace(item.Endpoint),
+		mustJSON(item.LaunchedCommand, "[]"),
+		mustJSON(item.MountedPaths, "[]"),
+		mustJSON(item.InjectedEnv, "{}"),
+		strings.TrimSpace(item.ScriptUsed),
+		timeToText(item.LastReconciledAt),
+		mustJSON(item.Metadata, "{}"),
+		timeToText(createdAt),
+		timeToText(now),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert runtime instance failed: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ListRuntimeInstances(ctx context.Context) ([]model.RuntimeInstance, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, model_id, template_id, binding_id, node_id, desired_state, observed_state,
+		       readiness, health_message, drift_reason, endpoint,
+		       launched_command_json, mounted_paths_json, injected_env_json, script_used,
+		       last_reconciled_at, metadata_json, created_at, updated_at
+		FROM runtime_instances
+		ORDER BY id;
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list runtime instances failed: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]model.RuntimeInstance, 0, 32)
+	for rows.Next() {
+		var (
+			item               model.RuntimeInstance
+			readinessRaw       string
+			launchedCommandRaw string
+			mountedPathsRaw    string
+			injectedEnvRaw     string
+			metadataRaw        string
+			lastReconciledRaw  string
+			createdAtRaw       string
+			updatedAtRaw       string
+		)
+		if err := rows.Scan(
+			&item.ID, &item.ModelID, &item.TemplateID, &item.BindingID, &item.NodeID, &item.DesiredState, &item.ObservedState,
+			&readinessRaw, &item.HealthMessage, &item.DriftReason, &item.Endpoint,
+			&launchedCommandRaw, &mountedPathsRaw, &injectedEnvRaw, &item.ScriptUsed,
+			&lastReconciledRaw, &metadataRaw, &createdAtRaw, &updatedAtRaw,
+		); err != nil {
+			return nil, fmt.Errorf("scan runtime instance failed: %w", err)
+		}
+		item.Readiness = model.ReadinessState(strings.TrimSpace(readinessRaw))
+		item.LaunchedCommand = parseStringSlice(launchedCommandRaw)
+		item.MountedPaths = parseStringSlice(mountedPathsRaw)
+		item.InjectedEnv = parseStringMap(injectedEnvRaw)
+		item.LastReconciledAt = textToTime(lastReconciledRaw)
+		item.Metadata = parseStringMap(metadataRaw)
+		item.CreatedAt = textToTime(createdAtRaw)
+		item.UpdatedAt = textToTime(updatedAtRaw)
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate runtime instances failed: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Store) GetRuntimeInstanceByID(ctx context.Context, id string) (model.RuntimeInstance, bool, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, model_id, template_id, binding_id, node_id, desired_state, observed_state,
+		       readiness, health_message, drift_reason, endpoint,
+		       launched_command_json, mounted_paths_json, injected_env_json, script_used,
+		       last_reconciled_at, metadata_json, created_at, updated_at
+		FROM runtime_instances
+		WHERE id = ? LIMIT 1;
+	`, strings.TrimSpace(id))
+
+	var (
+		item               model.RuntimeInstance
+		readinessRaw       string
+		launchedCommandRaw string
+		mountedPathsRaw    string
+		injectedEnvRaw     string
+		metadataRaw        string
+		lastReconciledRaw  string
+		createdAtRaw       string
+		updatedAtRaw       string
+	)
+	err := row.Scan(
+		&item.ID, &item.ModelID, &item.TemplateID, &item.BindingID, &item.NodeID, &item.DesiredState, &item.ObservedState,
+		&readinessRaw, &item.HealthMessage, &item.DriftReason, &item.Endpoint,
+		&launchedCommandRaw, &mountedPathsRaw, &injectedEnvRaw, &item.ScriptUsed,
+		&lastReconciledRaw, &metadataRaw, &createdAtRaw, &updatedAtRaw,
+	)
+	if err == sql.ErrNoRows {
+		return model.RuntimeInstance{}, false, nil
+	}
+	if err != nil {
+		return model.RuntimeInstance{}, false, fmt.Errorf("get runtime instance failed: %w", err)
+	}
+	item.Readiness = model.ReadinessState(strings.TrimSpace(readinessRaw))
+	item.LaunchedCommand = parseStringSlice(launchedCommandRaw)
+	item.MountedPaths = parseStringSlice(mountedPathsRaw)
+	item.InjectedEnv = parseStringMap(injectedEnvRaw)
+	item.LastReconciledAt = textToTime(lastReconciledRaw)
+	item.Metadata = parseStringMap(metadataRaw)
+	item.CreatedAt = textToTime(createdAtRaw)
+	item.UpdatedAt = textToTime(updatedAtRaw)
+	return item, true, nil
+}
+
+func (s *Store) UpsertRuntimeBundleManifest(ctx context.Context, item model.RuntimeBundleManifest) error {
+	if strings.TrimSpace(item.ID) == "" {
+		return fmt.Errorf("runtime bundle manifest id is empty")
+	}
+	now := time.Now().UTC()
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO runtime_bundle_manifests (
+			id, template_id, manifest_version, template_type, runtime_kind,
+			supported_model_types_json, supported_formats_json, capabilities_json,
+			mount_points_json, required_env_json, optional_env_json,
+			command_override_allowed, script_mount_allowed, model_injection_mode,
+			healthcheck_json, exposed_ports_json, notes, metadata_json, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			template_id = excluded.template_id,
+			manifest_version = excluded.manifest_version,
+			template_type = excluded.template_type,
+			runtime_kind = excluded.runtime_kind,
+			supported_model_types_json = excluded.supported_model_types_json,
+			supported_formats_json = excluded.supported_formats_json,
+			capabilities_json = excluded.capabilities_json,
+			mount_points_json = excluded.mount_points_json,
+			required_env_json = excluded.required_env_json,
+			optional_env_json = excluded.optional_env_json,
+			command_override_allowed = excluded.command_override_allowed,
+			script_mount_allowed = excluded.script_mount_allowed,
+			model_injection_mode = excluded.model_injection_mode,
+			healthcheck_json = excluded.healthcheck_json,
+			exposed_ports_json = excluded.exposed_ports_json,
+			notes = excluded.notes,
+			metadata_json = excluded.metadata_json,
+			updated_at = excluded.updated_at;
+	`,
+		item.ID,
+		strings.TrimSpace(item.TemplateID),
+		strings.TrimSpace(item.ManifestVersion),
+		firstNonEmpty(string(item.TemplateType), string(model.RuntimeTemplateTypeUnknown)),
+		firstNonEmpty(string(item.RuntimeKind), string(model.RuntimeKindUnknown)),
+		mustJSON(item.SupportedModelTypes, "[]"),
+		mustJSON(item.SupportedFormats, "[]"),
+		mustJSON(item.Capabilities, "[]"),
+		mustJSON(item.MountPoints, "[]"),
+		mustJSON(item.RequiredEnv, "[]"),
+		mustJSON(item.OptionalEnv, "[]"),
+		boolToInt(item.CommandOverrideAllowed),
+		boolToInt(item.ScriptMountAllowed),
+		firstNonEmpty(string(item.ModelInjectionMode), string(model.RuntimeBindingModeGenericInjected)),
+		mustJSON(item.Healthcheck, "{}"),
+		mustJSON(item.ExposedPorts, "[]"),
+		strings.TrimSpace(item.Notes),
+		mustJSON(item.Metadata, "{}"),
+		timeToText(now),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert runtime bundle manifest failed: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ListRuntimeBundleManifests(ctx context.Context) ([]model.RuntimeBundleManifest, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, template_id, manifest_version, template_type, runtime_kind,
+		       supported_model_types_json, supported_formats_json, capabilities_json,
+		       mount_points_json, required_env_json, optional_env_json,
+		       command_override_allowed, script_mount_allowed, model_injection_mode,
+		       healthcheck_json, exposed_ports_json, notes, metadata_json
+		FROM runtime_bundle_manifests
+		ORDER BY id;
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list runtime bundle manifests failed: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]model.RuntimeBundleManifest, 0, 16)
+	for rows.Next() {
+		item, scanErr := scanRuntimeBundleManifest(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate runtime bundle manifests failed: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Store) GetRuntimeBundleManifestByID(ctx context.Context, id string) (model.RuntimeBundleManifest, bool, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, template_id, manifest_version, template_type, runtime_kind,
+		       supported_model_types_json, supported_formats_json, capabilities_json,
+		       mount_points_json, required_env_json, optional_env_json,
+		       command_override_allowed, script_mount_allowed, model_injection_mode,
+		       healthcheck_json, exposed_ports_json, notes, metadata_json
+		FROM runtime_bundle_manifests
+		WHERE id = ? LIMIT 1;
+	`, strings.TrimSpace(id))
+	item, err := scanRuntimeBundleManifest(row)
+	if err == sql.ErrNoRows {
+		return model.RuntimeBundleManifest{}, false, nil
+	}
+	if err != nil {
+		return model.RuntimeBundleManifest{}, false, err
+	}
+	return item, true, nil
+}
+
+func (s *Store) GetRuntimeBundleManifestByTemplateID(ctx context.Context, templateID string) (model.RuntimeBundleManifest, bool, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, template_id, manifest_version, template_type, runtime_kind,
+		       supported_model_types_json, supported_formats_json, capabilities_json,
+		       mount_points_json, required_env_json, optional_env_json,
+		       command_override_allowed, script_mount_allowed, model_injection_mode,
+		       healthcheck_json, exposed_ports_json, notes, metadata_json
+		FROM runtime_bundle_manifests
+		WHERE template_id = ? OR id = ?
+		ORDER BY CASE WHEN template_id = ? THEN 0 ELSE 1 END, id
+		LIMIT 1;
+	`, strings.TrimSpace(templateID), strings.TrimSpace(templateID), strings.TrimSpace(templateID))
+	item, err := scanRuntimeBundleManifest(row)
+	if err == sql.ErrNoRows {
+		return model.RuntimeBundleManifest{}, false, nil
+	}
+	if err != nil {
+		return model.RuntimeBundleManifest{}, false, err
+	}
 	return item, true, nil
 }
 
@@ -1016,6 +1528,53 @@ func scanTestRun(scanner agentScanner) (model.TestRun, error) {
 	return item, nil
 }
 
+func scanRuntimeBundleManifest(scanner agentScanner) (model.RuntimeBundleManifest, error) {
+	var (
+		item                   model.RuntimeBundleManifest
+		templateTypeRaw        string
+		runtimeKindRaw         string
+		supportedModelTypesRaw string
+		supportedFormatsRaw    string
+		capabilitiesRaw        string
+		mountPointsRaw         string
+		requiredEnvRaw         string
+		optionalEnvRaw         string
+		commandOverrideRaw     int
+		scriptMountRaw         int
+		modelInjectionModeRaw  string
+		healthcheckRaw         string
+		exposedPortsRaw        string
+		metadataRaw            string
+	)
+	if err := scanner.Scan(
+		&item.ID, &item.TemplateID, &item.ManifestVersion, &templateTypeRaw, &runtimeKindRaw,
+		&supportedModelTypesRaw, &supportedFormatsRaw, &capabilitiesRaw,
+		&mountPointsRaw, &requiredEnvRaw, &optionalEnvRaw,
+		&commandOverrideRaw, &scriptMountRaw, &modelInjectionModeRaw,
+		&healthcheckRaw, &exposedPortsRaw, &item.Notes, &metadataRaw,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return model.RuntimeBundleManifest{}, sql.ErrNoRows
+		}
+		return model.RuntimeBundleManifest{}, fmt.Errorf("scan runtime bundle manifest failed: %w", err)
+	}
+	item.TemplateType = model.RuntimeTemplateType(strings.TrimSpace(templateTypeRaw))
+	item.RuntimeKind = model.RuntimeKind(strings.TrimSpace(runtimeKindRaw))
+	item.SupportedModelTypes = parseModelKindSlice(supportedModelTypesRaw)
+	item.SupportedFormats = parseModelFormatSlice(supportedFormatsRaw)
+	item.Capabilities = parseModelKindSlice(capabilitiesRaw)
+	item.MountPoints = parseStringSlice(mountPointsRaw)
+	item.RequiredEnv = parseStringSlice(requiredEnvRaw)
+	item.OptionalEnv = parseStringSlice(optionalEnvRaw)
+	item.CommandOverrideAllowed = commandOverrideRaw == 1
+	item.ScriptMountAllowed = scriptMountRaw == 1
+	item.ModelInjectionMode = model.RuntimeBindingMode(strings.TrimSpace(modelInjectionModeRaw))
+	item.Healthcheck = parseRuntimeHealthcheck(healthcheckRaw)
+	item.ExposedPorts = parseStringSlice(exposedPortsRaw)
+	item.Metadata = parseStringMap(metadataRaw)
+	return item, nil
+}
+
 func mustJSON(v interface{}, fallback string) string {
 	raw, err := json.Marshal(v)
 	if err != nil {
@@ -1036,6 +1595,30 @@ func parseStringSlice(raw string) []string {
 	var out []string
 	if err := json.Unmarshal([]byte(raw), &out); err != nil {
 		return nil
+	}
+	return out
+}
+
+func parseModelKindSlice(raw string) []model.ModelKind {
+	values := parseStringSlice(raw)
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]model.ModelKind, 0, len(values))
+	for _, item := range values {
+		out = append(out, model.ModelKind(strings.TrimSpace(item)))
+	}
+	return out
+}
+
+func parseModelFormatSlice(raw string) []model.ModelFormat {
+	values := parseStringSlice(raw)
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]model.ModelFormat, 0, len(values))
+	for _, item := range values {
+		out = append(out, model.ModelFormat(strings.TrimSpace(item)))
 	}
 	return out
 }
@@ -1088,6 +1671,18 @@ func parseNodeMetadata(raw string) interface{} {
 	return out
 }
 
+func parseRuntimeHealthcheck(raw string) model.RuntimeHealthcheck {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return model.RuntimeHealthcheck{}
+	}
+	var out model.RuntimeHealthcheck
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return model.RuntimeHealthcheck{}
+	}
+	return out
+}
+
 func timeToText(ts time.Time) string {
 	if ts.IsZero() {
 		return ""
@@ -1133,4 +1728,11 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
