@@ -17,6 +17,9 @@ const runtimeInstancesEl = document.getElementById("runtime-instances");
 const tasksEl = document.getElementById("tasks");
 const testRunsEl = document.getElementById("test-runs");
 const runE5TestBtn = document.getElementById("run-e5-test-btn");
+const runStage0BSuiteBtn = document.getElementById("run-stage0b-suite-btn");
+const testScenarioSelectEl = document.getElementById("test-scenario-select");
+const runSelectedTestBtn = document.getElementById("run-selected-test-btn");
 const refreshRuntimeTaskBtn = document.getElementById("refresh-runtime-task-btn");
 
 const state = {
@@ -25,8 +28,10 @@ const state = {
   runtimeTemplates: [],
   runtimeBindings: [],
   runtimeInstances: [],
+  runtimeInstanceReconcile: {},
   tasks: [],
   testRuns: [],
+  testRunScenarios: [],
   activeNodeId: "",
   activePage: "runtime",
   activeRuntimeTab: "list",
@@ -546,6 +551,30 @@ function statusPill(status) {
   return `<span class="status-pill status-${escapeHTML(cls)}">${escapeHTML(value)}</span>`;
 }
 
+function deriveManifestBasicCheck(instance) {
+  if (!instance || typeof instance !== "object") {
+    return { status: "unknown", text: "unknown" };
+  }
+  const precheck = instance.precheck_result && typeof instance.precheck_result === "object" ? instance.precheck_result : null;
+  const checks = precheck && Array.isArray(precheck.checks) ? precheck.checks : [];
+  const manifestChecks = checks.filter((item) => {
+    const name = String(item && item.name ? item.name : "").trim();
+    return ["manifest_port_conflicts", "custom_bundle_manifest_minimal", "command_override_policy", "script_mount_policy"].includes(name);
+  });
+  if (manifestChecks.length === 0) {
+    return { status: "unknown", text: "unknown" };
+  }
+  const hasFailed = manifestChecks.some((item) => String(item && item.status ? item.status : "").trim() === "failed");
+  if (hasFailed) {
+    return { status: "failed", text: "failed" };
+  }
+  const hasWarning = manifestChecks.some((item) => String(item && item.status ? item.status : "").trim() === "warning");
+  if (hasWarning) {
+    return { status: "warning", text: "warning" };
+  }
+  return { status: "pass", text: "pass" };
+}
+
 function classifyAgentTask(type) {
   const taskType = String(type || "").trim();
   if (!taskType.startsWith("agent.")) {
@@ -575,6 +604,11 @@ function renderTasks() {
     const detailRaw = task.detail && typeof task.detail === "object" ? JSON.stringify(task.detail) : "";
     const detail = normalizeNodeText(detailRaw);
     const executionPath = task.detail && typeof task.detail === "object" ? String(task.detail.execution_path || "").trim() : "";
+    const overallStatus = task.detail && typeof task.detail === "object" ? String(task.detail.overall_status || "").trim() : "";
+    const manifestSummary = task.detail && typeof task.detail === "object" && task.detail.manifest_summary && typeof task.detail.manifest_summary === "object" ? task.detail.manifest_summary : null;
+    const manifestSummaryText = manifestSummary
+      ? `${manifestSummary.manifest_id || "-"}@${manifestSummary.manifest_version || "-"} ${manifestSummary.binding_mode || "-"}`
+      : "-";
     const runtimeInstanceID = String(task.runtime_instance_id || "").trim() || "-";
     const runtimeBindingID = String(task.runtime_binding_id || "").trim() || "-";
     const bindingMode = String(task.binding_mode || "").trim() || "-";
@@ -582,6 +616,7 @@ function renderTasks() {
     item.innerHTML = `
       <div class="item-title">${escapeHTML(task.type)} (${escapeHTML(task.id)})</div>
       <div class="meta">状态: ${statusPill(task.status)} | 分类: ${escapeHTML(taskClass)} | 进度: ${escapeHTML(String(task.progress || 0))}%</div>
+      <div class="meta">结果概览: ${escapeHTML(overallStatus || "-")} | Manifest: ${escapeHTML(manifestSummaryText)}</div>
       <div class="meta">目标: ${escapeHTML(task.target_type || "-")} / ${escapeHTML(task.target_id || "-")}</div>
       <div class="meta">RuntimeInstance: ${escapeHTML(runtimeInstanceID)} | Binding: ${escapeHTML(runtimeBindingID)} | Binding Mode: ${escapeHTML(bindingMode)}</div>
       <div class="meta">执行者: ${escapeHTML(task.worker_id || task.assigned_agent_id || "-")} | 执行路径: ${escapeHTML(executionPath || "controller-direct")} | 开始: ${escapeHTML(formatTime(task.started_at))} | 结束: ${escapeHTML(formatTime(task.finished_at))}</div>
@@ -625,13 +660,37 @@ function renderRuntimeInstances() {
   }
   runtimeInstancesEl.innerHTML = "";
   state.runtimeInstances.slice(0, 20).forEach((instance) => {
+    const reconcileSummary = state.runtimeInstanceReconcile[String(instance.id || "").trim()] || null;
     const binding = Array.isArray(state.runtimeBindings)
       ? state.runtimeBindings.find((item) => String(item.id || "").trim() === String(instance.binding_id || "").trim())
       : null;
+    const desiredState = String((reconcileSummary && reconcileSummary.desired_state) || instance.desired_state || "-").trim() || "-";
+    const observedState = String((reconcileSummary && reconcileSummary.observed_state) || instance.observed_state || "-").trim() || "-";
+    const readinessState = String((reconcileSummary && reconcileSummary.readiness) || instance.readiness || "unknown").trim() || "unknown";
+    const healthMessage = String((reconcileSummary && reconcileSummary.health_message) || instance.health_message || "-").trim() || "-";
+    const driftReason = String((reconcileSummary && reconcileSummary.drift_reason) || instance.drift_reason || "-").trim() || "-";
     const bindingMode = String(instance.binding_mode || (binding && binding.binding_mode) || "").trim() || "-";
     const precheckStatus = String(instance.precheck_status || "unknown").trim() || "unknown";
     const precheckGating = instance.precheck_gating === true;
     const precheckReasons = Array.isArray(instance.precheck_reasons) ? instance.precheck_reasons.filter(Boolean) : [];
+    const conflictStatus = String(instance.conflict_status || (reconcileSummary && reconcileSummary.conflict_status) || "unknown").trim() || "unknown";
+    const conflictBlocking = instance.conflict_blocking === true || (reconcileSummary && reconcileSummary.conflict_blocking === true);
+    const conflictReasons = Array.isArray(instance.conflict_reasons)
+      ? instance.conflict_reasons.filter(Boolean)
+      : reconcileSummary && Array.isArray(reconcileSummary.conflict_reasons)
+      ? reconcileSummary.conflict_reasons.filter(Boolean)
+      : [];
+    const gatingStatus = String(instance.gating_status || (reconcileSummary && reconcileSummary.gating_status) || "unknown").trim() || "unknown";
+    const gatingAllowed = instance.gating_allowed === true || (reconcileSummary && reconcileSummary.gating_allowed === true);
+    const gatingReasons = Array.isArray(instance.gating_reasons)
+      ? instance.gating_reasons.filter(Boolean)
+      : reconcileSummary && Array.isArray(reconcileSummary.gating_reasons)
+      ? reconcileSummary.gating_reasons.filter(Boolean)
+      : [];
+    const lastPlanAction = String(instance.last_plan_action || (instance.last_lifecycle_plan && instance.last_lifecycle_plan.action) || "-").trim() || "-";
+    const lastPlanStatus = String(instance.last_plan_status || (instance.last_lifecycle_plan && instance.last_lifecycle_plan.status) || "-").trim() || "-";
+    const lastPlanReason = String(instance.last_plan_reason || (instance.last_lifecycle_plan && instance.last_lifecycle_plan.message) || "-").trim() || "-";
+    const manifestBasicCheck = deriveManifestBasicCheck(instance);
     const resolvedMounts = Array.isArray(instance.resolved_mounts) ? instance.resolved_mounts.filter(Boolean) : [];
     const resolvedPorts = Array.isArray(instance.resolved_ports) ? instance.resolved_ports.filter(Boolean) : [];
     const resolvedScript = String(instance.resolved_script || "").trim();
@@ -651,14 +710,24 @@ function renderRuntimeInstances() {
           .map((task) => `[${classifyAgentTask(task.type)}] ${task.type || "-"}:${task.status || "-"}(${formatTime(task.finished_at || task.created_at)})`)
           .join(" | ")
       : "-";
+    const reconcileReasons = reconcileSummary && Array.isArray(reconcileSummary.reconcile_reasons) ? reconcileSummary.reconcile_reasons.filter(Boolean) : [];
+    const reconcileAgentStatus = reconcileSummary ? String(reconcileSummary.agent_status || "unknown").trim() || "unknown" : "unknown";
+    const reconcileStale = reconcileSummary ? reconcileSummary.observation_stale === true : false;
+    const lastReconciledAt = (reconcileSummary && reconcileSummary.last_reconciled_at) || instance.last_reconciled_at;
     const item = document.createElement("div");
     item.className = "list-item";
     item.innerHTML = `
       <div class="item-title">${escapeHTML(instance.id || "-")}</div>
+      <div class="meta">链路: ${escapeHTML(instance.model_id || "-")} → ${escapeHTML(instance.template_id || "-")} → ${escapeHTML(instance.binding_id || "-")} → ${escapeHTML(instance.id || "-")}</div>
       <div class="meta">model: ${escapeHTML(instance.model_id || "-")} | template: ${escapeHTML(instance.template_id || "-")} | binding: ${escapeHTML(instance.binding_id || "-")} | mode: ${escapeHTML(bindingMode)}</div>
-      <div class="meta">node: ${escapeHTML(instance.node_id || "-")} | desired/observed: ${escapeHTML(instance.desired_state || "-")} / ${escapeHTML(instance.observed_state || "-")} | readiness: ${escapeHTML(instance.readiness || "unknown")}</div>
+      <div class="meta">node: ${escapeHTML(instance.node_id || "-")} | desired/observed: ${escapeHTML(desiredState)} / ${escapeHTML(observedState)} | readiness: ${escapeHTML(readinessState)}</div>
       <div class="meta">precheck: ${statusPill(precheckStatus)} | gating: ${precheckGating ? "blocked" : "pass"} | reasons: ${escapeHTML(precheckReasons.join(",") || "-")}</div>
-      <div class="meta">endpoint: ${escapeHTML(instance.endpoint || "-")} | health: ${escapeHTML(instance.health_message || "-")} | drift: ${escapeHTML(instance.drift_reason || "-")}</div>
+      <div class="meta">conflict: ${statusPill(conflictStatus)} | blocking: ${conflictBlocking ? "yes" : "no"} | reasons: ${escapeHTML(conflictReasons.join(",") || "-")}</div>
+      <div class="meta">gating: ${statusPill(gatingStatus)} | allowed: ${gatingAllowed ? "yes" : "no"} | reasons: ${escapeHTML(gatingReasons.join(",") || "-")}</div>
+      <div class="meta">last plan: action=${escapeHTML(lastPlanAction)} | status=${escapeHTML(lastPlanStatus)} | reason=${escapeHTML(lastPlanReason)}</div>
+      <div class="meta">manifest basic check: ${statusPill(manifestBasicCheck.status)} (${escapeHTML(manifestBasicCheck.text)})</div>
+      <div class="meta">endpoint: ${escapeHTML(instance.endpoint || "-")} | health: ${escapeHTML(healthMessage)} | drift: ${escapeHTML(driftReason)}</div>
+      <div class="meta">reconcile: ${escapeHTML(formatTime(lastReconciledAt))} | agent: ${escapeHTML(reconcileAgentStatus)} | observation: ${reconcileStale ? "stale" : "fresh"} | reasons: ${escapeHTML(reconcileReasons.join(",") || "-")}</div>
       <div class="meta">resolved mounts: ${escapeHTML(resolvedMounts.join(",") || "-")} | resolved ports: ${escapeHTML(resolvedPorts.join(",") || "-")} | resolved script: ${escapeHTML(resolvedScript || "-")}</div>
       <div class="meta">最近 instance agent 摘要: ${escapeHTML(lastAgentTaskSummary)}</div>
       <div class="meta">最近 Agent Tasks: ${escapeHTML(taskSummary)}</div>
@@ -1211,6 +1280,35 @@ async function loadRuntimeBindings() {
 async function loadRuntimeInstances() {
   const instances = await requestJSON("/api/v1/runtime-instances");
   state.runtimeInstances = Array.isArray(instances) ? instances : [];
+  await loadRuntimeInstanceReconcileSummaries();
+}
+
+async function loadRuntimeInstanceReconcileSummaries() {
+  const ids = Array.isArray(state.runtimeInstances)
+    ? state.runtimeInstances.map((item) => String(item.id || "").trim()).filter(Boolean).slice(0, 20)
+    : [];
+  if (ids.length === 0) {
+    state.runtimeInstanceReconcile = {};
+    return;
+  }
+  const entries = await Promise.allSettled(
+    ids.map(async (id) => {
+      const data = await requestJSON(`/api/v1/runtime-instances/${encodeURIComponent(id)}/reconcile-summary`);
+      return [id, data];
+    })
+  );
+  const merged = {};
+  entries.forEach((item) => {
+    if (item.status !== "fulfilled") {
+      return;
+    }
+    const [id, summary] = item.value;
+    if (!id || !summary || typeof summary !== "object") {
+      return;
+    }
+    merged[id] = summary;
+  });
+  state.runtimeInstanceReconcile = merged;
 }
 
 async function loadTasks() {
@@ -1229,17 +1327,123 @@ async function loadTestRuns() {
     : [];
 }
 
+function defaultTestRunScenarios() {
+  return [
+    {
+      name: "stage0_to_b_full_smoke",
+      summary: "阶段0~B全链路：对象链路 + local-agent 执行 + embedding + gating 阻塞",
+      coverage: ["stage0", "stageA", "stageB"],
+      recommended: true,
+    },
+    {
+      name: "stage0_runtime_object_smoke",
+      summary: "阶段0对象链路校验",
+      coverage: ["stage0"],
+    },
+    {
+      name: "local_agent_execution_smoke",
+      summary: "阶段A/B：local-agent-first 执行与 RuntimeInstance 状态沉淀",
+      coverage: ["stageA", "stageB"],
+    },
+    {
+      name: "e5_embedding_smoke",
+      summary: "E5 embedding 端到端就绪与向量校验",
+      coverage: ["stage0", "stageA"],
+    },
+    {
+      name: "e5_gating_blocked_smoke",
+      summary: "阶段B：gating 阻塞与 runtime.start fail-fast",
+      coverage: ["stageB"],
+    },
+  ];
+}
+
+async function loadTestRunScenarios() {
+  try {
+    const scenarios = await requestJSON("/api/v1/test-runs/scenarios");
+    state.testRunScenarios = Array.isArray(scenarios) && scenarios.length > 0 ? scenarios : defaultTestRunScenarios();
+  } catch (err) {
+    state.testRunScenarios = defaultTestRunScenarios();
+  }
+}
+
+function renderTestScenarioOptions() {
+  if (!testScenarioSelectEl) {
+    return;
+  }
+  const scenarios = Array.isArray(state.testRunScenarios) && state.testRunScenarios.length > 0 ? state.testRunScenarios : defaultTestRunScenarios();
+  testScenarioSelectEl.innerHTML = "";
+  scenarios.forEach((item) => {
+    const opt = document.createElement("option");
+    const name = String(item.name || "").trim();
+    const summary = String(item.summary || "").trim();
+    const coverage = Array.isArray(item.coverage) ? item.coverage.filter(Boolean).join("/") : "";
+    opt.value = name;
+    opt.textContent = coverage ? `${name} (${coverage})` : name;
+    if (summary) {
+      opt.title = summary;
+    }
+    if (item.recommended === true) {
+      opt.dataset.recommended = "true";
+    }
+    testScenarioSelectEl.appendChild(opt);
+  });
+  const recommended = scenarios.find((item) => item && item.recommended === true);
+  if (recommended && String(recommended.name || "").trim()) {
+    testScenarioSelectEl.value = String(recommended.name).trim();
+  } else if (scenarios.length > 0) {
+    testScenarioSelectEl.value = String(scenarios[0].name || "").trim();
+  }
+}
+
+async function startTestRunScenario(scenario, triggeredBy = "web-console") {
+  const scenarioName = String(scenario || "").trim();
+  if (!scenarioName) {
+    throw new Error("测试场景不能为空");
+  }
+  const run = await requestJSON("/api/v1/test-runs", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      scenario: scenarioName,
+      triggered_by: triggeredBy,
+    }),
+  });
+  return run;
+}
+
 function bindTestActions() {
   runE5TestBtn?.addEventListener("click", async () => {
     try {
-      const run = await requestJSON("/api/v1/test-runs", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          scenario: "e5_embedding_smoke",
-          triggered_by: "web-console",
-        }),
-      });
+      const run = await startTestRunScenario("e5_embedding_smoke", "web-console.e5");
+      showToast(`已创建测试运行: ${run.test_run_id}`);
+      await Promise.all([loadTasks(), loadTestRuns()]);
+      renderTasks();
+      renderTestRuns();
+    } catch (err) {
+      showToast(`创建测试运行失败: ${err.message}`);
+    }
+  });
+
+  runStage0BSuiteBtn?.addEventListener("click", async () => {
+    try {
+      const run = await startTestRunScenario("stage0_to_b_full_smoke", "web-console.stage0-b-suite");
+      showToast(`已创建阶段0~B测试运行: ${run.test_run_id}`);
+      await Promise.all([loadTasks(), loadTestRuns()]);
+      renderTasks();
+      renderTestRuns();
+    } catch (err) {
+      showToast(`创建阶段0~B测试失败: ${err.message}`);
+    }
+  });
+
+  runSelectedTestBtn?.addEventListener("click", async () => {
+    try {
+      const selected = String(testScenarioSelectEl?.value || "").trim();
+      if (!selected) {
+        throw new Error("请选择测试场景");
+      }
+      const run = await startTestRunScenario(selected, "web-console.selected-scenario");
       showToast(`已创建测试运行: ${run.test_run_id}`);
       await Promise.all([loadTasks(), loadTestRuns()]);
       renderTasks();
@@ -1282,7 +1486,7 @@ function bindTestActions() {
 
     let runtimeTemplatesLoadFailed = false;
     await loadNodes();
-    const loadResults = await Promise.allSettled([loadModels(), loadTasks(), loadTestRuns(), loadRuntimeBindings(), loadRuntimeInstances()]);
+    const loadResults = await Promise.allSettled([loadModels(), loadTasks(), loadTestRuns(), loadRuntimeBindings(), loadRuntimeInstances(), loadTestRunScenarios()]);
     const loadErrors = loadResults
       .map((result, idx) => {
         if (result.status === "fulfilled") {
@@ -1299,6 +1503,8 @@ function bindTestActions() {
             return `runtime binding 加载失败: ${result.reason?.message || "unknown"}`;
           case 4:
             return `runtime instance 加载失败: ${result.reason?.message || "unknown"}`;
+          case 5:
+            return `测试场景加载失败: ${result.reason?.message || "unknown"}`;
           default:
             return "";
         }
@@ -1328,6 +1534,7 @@ function bindTestActions() {
     renderRuntimeInstances();
     renderTasks();
     renderTestRuns();
+    renderTestScenarioOptions();
     if (!runtimeTemplatesLoadFailed) {
       renderRuntimeTemplates();
     }

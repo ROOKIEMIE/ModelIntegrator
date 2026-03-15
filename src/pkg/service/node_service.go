@@ -136,6 +136,7 @@ func (s *NodeService) ApplyAgentTaskObservation(ctx context.Context, nodeID stri
 	if nodeID == "" {
 		return nil
 	}
+	detailView := flattenAgentTaskDetail(detail)
 	node, ok := s.GetNode(ctx, nodeID)
 	if !ok {
 		return nil
@@ -151,11 +152,11 @@ func (s *NodeService) ApplyAgentTaskObservation(ctx context.Context, nodeID stri
 	metadata["last_agent_task_success"] = fmt.Sprintf("%t", success)
 	metadata["last_agent_task_message"] = strings.TrimSpace(message)
 	metadata["last_agent_task_at"] = now.Format(time.RFC3339)
-	if detail != nil {
-		if raw, ok := detail["resource_snapshot_collected_at"]; ok {
+	if detailView != nil {
+		if raw, ok := detailView["resource_snapshot_collected_at"]; ok {
 			metadata["resource_snapshot_collected_at"] = strings.TrimSpace(fmt.Sprint(raw))
 		}
-		if snapshotRaw, ok := detail["resource_snapshot"].(map[string]interface{}); ok {
+		if snapshotRaw, ok := detailView["resource_snapshot"].(map[string]interface{}); ok {
 			if cpu := strings.TrimSpace(fmt.Sprint(snapshotRaw["cpu_count"])); cpu != "" && cpu != "<nil>" {
 				metadata["resource_snapshot_cpu_count"] = cpu
 			}
@@ -186,14 +187,14 @@ func (s *NodeService) ApplyAgentTaskObservation(ctx context.Context, nodeID stri
 	node.Metadata = metadata
 
 	runtimeID := ""
-	if detail != nil {
-		runtimeID = strings.TrimSpace(fmt.Sprint(detail["runtime_id"]))
+	if detailView != nil {
+		runtimeID = strings.TrimSpace(fmt.Sprint(detailView["runtime_id"]))
 	}
 	for i := range node.Runtimes {
 		if runtimeID != "" && strings.TrimSpace(node.Runtimes[i].ID) != runtimeID {
 			continue
 		}
-		if running, ok := boolFromTaskDetail(detail, "runtime_running"); ok {
+		if running, ok := boolFromTaskDetail(detailView, "runtime_running"); ok {
 			if running {
 				node.Runtimes[i].Status = model.RuntimeStatusOnline
 			} else {
@@ -202,7 +203,7 @@ func (s *NodeService) ApplyAgentTaskObservation(ctx context.Context, nodeID stri
 			node.Runtimes[i].LastSeenAt = now
 			continue
 		}
-		if exists, ok := boolFromTaskDetail(detail, "runtime_exists"); ok {
+		if exists, ok := boolFromTaskDetail(detailView, "runtime_exists"); ok {
 			if exists {
 				node.Runtimes[i].Status = model.RuntimeStatusOnline
 			} else {

@@ -149,6 +149,7 @@ curl -sS http://127.0.0.1:59081/api/v1/nodes
 - `GET /api/v1/runtime-instances/{id}`
 - `GET /api/v1/runtime-instances/{id}/tasks`
 - `GET /api/v1/runtime-instances/{id}/summary`
+- `GET /api/v1/runtime-instances/{id}/reconcile-summary`
 
 agent 与任务：
 
@@ -177,6 +178,7 @@ agent 与任务：
 
 测试运行：
 
+- `GET /api/v1/test-runs/scenarios`
 - `GET /api/v1/test-runs`
 - `GET /api/v1/test-runs/{id}`
 - `POST /api/v1/test-runs`
@@ -184,10 +186,24 @@ agent 与任务：
 脚本化 smoke（local-agent 路径）：
 
 - `scripts/controller_api_smoke.sh <base_url> [token] [agent_id] [model_id]`
+- `testsystem/scenarios/stage0_to_b_full_smoke.sh`
+- `testsystem/scenarios/stage0_runtime_object_smoke.sh`
 - `testsystem/scenarios/local_agent_execution_smoke.sh`
+- `testsystem/scenarios/e5_embedding_smoke.sh`
+- `testsystem/scenarios/e5_gating_blocked_smoke.sh`
 
 阶段 A 收口（当前状态）：
 
+- `agent.runtime_precheck` 已升级为 manifest 驱动 preflight（包含 mount/env/script/port/compatibility/policy/custom_bundle 最小校验）。
+- agent 检查类与执行类任务 detail 已统一为结构化 envelope（`overall_status + structured_result + manifest_summary`）。
 - agent 结果先回写 `RuntimeInstance`（precheck/readiness/drift/resolved 状态与最近 task 摘要）。
 - `Node` 主要保留节点资源与 agent 在线事实，`Model` 主要消费 instance 投影。
-- 阶段 B 将继续推进：instance-first reconcile、precheck/conflict/drift 深化、进一步收缩 direct fallback。
+- `testsystem/scenarios/local_agent_execution_smoke.sh` 已覆盖 E5 默认样板的阶段 A 收口验证链路。
+- 阶段 B 起步已落地：controller 后台 `instance-first reconcile` loop 持续协调 `desired/observed/readiness/health/drift` 并回写 `last_reconciled_at`。
+- `precheck_*` 现在正式作为 reconcile 输入，`agent_offline/observation_stale` 也会进入实例级解释结论。
+- 阶段 B 深化已起效：`RuntimeInstance` 新增 `conflict/gating/last_plan_*` 结构化状态，controller reconcile 会生成最小 `load/unload/deferred/blocked` 规划。
+- `runtime.start/restart` 已接入 gating fail-fast（阻塞时直接拒绝，不入队），并在 task payload/detail 中写入 planner 元信息。
+- 新增 `testsystem/scenarios/e5_gating_blocked_smoke.sh` 覆盖“binding/script 冲突 -> gating 阻塞 -> runtime.start fail-fast”链路。
+- testsystem 新增 `stage0_runtime_object_smoke` 与 `stage0_to_b_full_smoke`，可覆盖阶段0到阶段B的核心链路。
+- 前端“任务与测试”已支持场景下拉手动触发（含“一键测试阶段0~B”快捷入口）。
+- 详见 `doc/Schema.md`（阶段 B 语义）与 `doc/LOG.md`（本轮变更）。

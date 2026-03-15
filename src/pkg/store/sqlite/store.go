@@ -109,6 +109,15 @@ func (s *Store) initSchema(ctx context.Context) error {
 		{table: "runtime_instances", column: "last_precheck_task_id", definition: "TEXT NOT NULL DEFAULT ''"},
 		{table: "runtime_instances", column: "last_precheck_at", definition: "TEXT NOT NULL DEFAULT ''"},
 		{table: "runtime_instances", column: "precheck_result_json", definition: "TEXT NOT NULL DEFAULT '{}'"},
+		{table: "runtime_instances", column: "precheck_summary_json", definition: "TEXT NOT NULL DEFAULT '{}'"},
+		{table: "runtime_instances", column: "conflict_status", definition: "TEXT NOT NULL DEFAULT 'unknown'"},
+		{table: "runtime_instances", column: "conflict_reasons_json", definition: "TEXT NOT NULL DEFAULT '[]'"},
+		{table: "runtime_instances", column: "conflict_summary_json", definition: "TEXT NOT NULL DEFAULT '{}'"},
+		{table: "runtime_instances", column: "gating_status", definition: "TEXT NOT NULL DEFAULT 'unknown'"},
+		{table: "runtime_instances", column: "gating_allowed", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{table: "runtime_instances", column: "gating_reasons_json", definition: "TEXT NOT NULL DEFAULT '[]'"},
+		{table: "runtime_instances", column: "gating_summary_json", definition: "TEXT NOT NULL DEFAULT '{}'"},
+		{table: "runtime_instances", column: "last_lifecycle_plan_json", definition: "TEXT NOT NULL DEFAULT '{}'"},
 		{table: "tasks", column: "assigned_agent_id", definition: "TEXT NOT NULL DEFAULT ''"},
 		{table: "tasks", column: "worker_id", definition: "TEXT NOT NULL DEFAULT ''"},
 		{table: "tasks", column: "detail_json", definition: "TEXT NOT NULL DEFAULT '{}'"},
@@ -843,6 +852,7 @@ func (s *Store) UpsertRuntimeInstance(ctx context.Context, item model.RuntimeIns
 	if strings.TrimSpace(item.ID) == "" {
 		return fmt.Errorf("runtime instance id is empty")
 	}
+	normalizeRuntimeInstanceForPersistence(&item)
 	now := time.Now().UTC()
 	createdAt := item.CreatedAt
 	if createdAt.IsZero() {
@@ -855,8 +865,12 @@ func (s *Store) UpsertRuntimeInstance(ctx context.Context, item model.RuntimeIns
 			launched_command_json, mounted_paths_json, injected_env_json, script_used,
 			last_reconciled_at, metadata_json,
 			precheck_status, precheck_gating, precheck_reasons_json, last_precheck_task_id, last_precheck_at, precheck_result_json,
+			precheck_summary_json,
+			conflict_status, conflict_reasons_json, conflict_summary_json,
+			gating_status, gating_allowed, gating_reasons_json, gating_summary_json,
+			last_lifecycle_plan_json,
 			created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			model_id = excluded.model_id,
 			template_id = excluded.template_id,
@@ -880,6 +894,15 @@ func (s *Store) UpsertRuntimeInstance(ctx context.Context, item model.RuntimeIns
 			last_precheck_task_id = excluded.last_precheck_task_id,
 			last_precheck_at = excluded.last_precheck_at,
 			precheck_result_json = excluded.precheck_result_json,
+			precheck_summary_json = excluded.precheck_summary_json,
+			conflict_status = excluded.conflict_status,
+			conflict_reasons_json = excluded.conflict_reasons_json,
+			conflict_summary_json = excluded.conflict_summary_json,
+			gating_status = excluded.gating_status,
+			gating_allowed = excluded.gating_allowed,
+			gating_reasons_json = excluded.gating_reasons_json,
+			gating_summary_json = excluded.gating_summary_json,
+			last_lifecycle_plan_json = excluded.last_lifecycle_plan_json,
 			created_at = CASE WHEN runtime_instances.created_at = '' THEN excluded.created_at ELSE runtime_instances.created_at END,
 			updated_at = excluded.updated_at;
 	`,
@@ -906,6 +929,15 @@ func (s *Store) UpsertRuntimeInstance(ctx context.Context, item model.RuntimeIns
 		strings.TrimSpace(item.LastPrecheckTaskID),
 		timeToText(item.LastPrecheckAt),
 		mustJSON(item.PrecheckResult, "{}"),
+		mustJSON(item.PrecheckSummary, "{}"),
+		firstNonEmpty(strings.TrimSpace(string(item.ConflictStatus)), string(model.RuntimeConflictStatusUnknown)),
+		mustJSON(item.ConflictReasons, "[]"),
+		mustJSON(item.ConflictSummary, "{}"),
+		firstNonEmpty(strings.TrimSpace(string(item.GatingStatus)), string(model.RuntimeGatingStatusUnknown)),
+		boolToInt(item.GatingAllowed),
+		mustJSON(item.GatingReasons, "[]"),
+		mustJSON(item.GatingSummary, "{}"),
+		mustJSON(item.LastLifecyclePlan, "{}"),
 		timeToText(createdAt),
 		timeToText(now),
 	)
@@ -922,6 +954,10 @@ func (s *Store) ListRuntimeInstances(ctx context.Context) ([]model.RuntimeInstan
 		       launched_command_json, mounted_paths_json, injected_env_json, script_used,
 		       last_reconciled_at, metadata_json,
 		       precheck_status, precheck_gating, precheck_reasons_json, last_precheck_task_id, last_precheck_at, precheck_result_json,
+		       precheck_summary_json,
+		       conflict_status, conflict_reasons_json, conflict_summary_json,
+		       gating_status, gating_allowed, gating_reasons_json, gating_summary_json,
+		       last_lifecycle_plan_json,
 		       created_at, updated_at
 		FROM runtime_instances
 		ORDER BY id;
@@ -947,6 +983,15 @@ func (s *Store) ListRuntimeInstances(ctx context.Context) ([]model.RuntimeInstan
 			lastPrecheckTaskID string
 			lastPrecheckAtRaw  string
 			precheckResultRaw  string
+			precheckSummaryRaw string
+			conflictStatusRaw  string
+			conflictReasonsRaw string
+			conflictSummaryRaw string
+			gatingStatusRaw    string
+			gatingAllowedRaw   int
+			gatingReasonsRaw   string
+			gatingSummaryRaw   string
+			lastPlanRaw        string
 			createdAtRaw       string
 			updatedAtRaw       string
 		)
@@ -956,6 +1001,10 @@ func (s *Store) ListRuntimeInstances(ctx context.Context) ([]model.RuntimeInstan
 			&launchedCommandRaw, &mountedPathsRaw, &injectedEnvRaw, &item.ScriptUsed,
 			&lastReconciledRaw, &metadataRaw,
 			&precheckStatusRaw, &precheckGatingRaw, &precheckReasonsRaw, &lastPrecheckTaskID, &lastPrecheckAtRaw, &precheckResultRaw,
+			&precheckSummaryRaw,
+			&conflictStatusRaw, &conflictReasonsRaw, &conflictSummaryRaw,
+			&gatingStatusRaw, &gatingAllowedRaw, &gatingReasonsRaw, &gatingSummaryRaw,
+			&lastPlanRaw,
 			&createdAtRaw, &updatedAtRaw,
 		); err != nil {
 			return nil, fmt.Errorf("scan runtime instance failed: %w", err)
@@ -972,8 +1021,18 @@ func (s *Store) ListRuntimeInstances(ctx context.Context) ([]model.RuntimeInstan
 		item.LastPrecheckTaskID = strings.TrimSpace(lastPrecheckTaskID)
 		item.LastPrecheckAt = textToTime(lastPrecheckAtRaw)
 		item.PrecheckResult = parseRuntimePrecheckResult(precheckResultRaw)
+		item.PrecheckSummary = parseRuntimePrecheckSummary(precheckSummaryRaw)
+		item.ConflictStatus = model.RuntimeConflictStatus(strings.TrimSpace(conflictStatusRaw))
+		item.ConflictReasons = parseStringSlice(conflictReasonsRaw)
+		item.ConflictSummary = parseRuntimeConflictSummary(conflictSummaryRaw)
+		item.GatingStatus = model.RuntimeGatingStatus(strings.TrimSpace(gatingStatusRaw))
+		item.GatingAllowed = gatingAllowedRaw == 1
+		item.GatingReasons = parseStringSlice(gatingReasonsRaw)
+		item.GatingSummary = parseRuntimeGatingSummary(gatingSummaryRaw)
+		item.LastLifecyclePlan = parseRuntimeLifecyclePlanSummary(lastPlanRaw)
 		item.CreatedAt = textToTime(createdAtRaw)
 		item.UpdatedAt = textToTime(updatedAtRaw)
+		normalizeRuntimeInstanceAfterRead(&item)
 		out = append(out, item)
 	}
 	if err := rows.Err(); err != nil {
@@ -989,6 +1048,10 @@ func (s *Store) GetRuntimeInstanceByID(ctx context.Context, id string) (model.Ru
 		       launched_command_json, mounted_paths_json, injected_env_json, script_used,
 		       last_reconciled_at, metadata_json,
 		       precheck_status, precheck_gating, precheck_reasons_json, last_precheck_task_id, last_precheck_at, precheck_result_json,
+		       precheck_summary_json,
+		       conflict_status, conflict_reasons_json, conflict_summary_json,
+		       gating_status, gating_allowed, gating_reasons_json, gating_summary_json,
+		       last_lifecycle_plan_json,
 		       created_at, updated_at
 		FROM runtime_instances
 		WHERE id = ? LIMIT 1;
@@ -1008,6 +1071,15 @@ func (s *Store) GetRuntimeInstanceByID(ctx context.Context, id string) (model.Ru
 		lastPrecheckTaskID string
 		lastPrecheckAtRaw  string
 		precheckResultRaw  string
+		precheckSummaryRaw string
+		conflictStatusRaw  string
+		conflictReasonsRaw string
+		conflictSummaryRaw string
+		gatingStatusRaw    string
+		gatingAllowedRaw   int
+		gatingReasonsRaw   string
+		gatingSummaryRaw   string
+		lastPlanRaw        string
 		createdAtRaw       string
 		updatedAtRaw       string
 	)
@@ -1017,6 +1089,10 @@ func (s *Store) GetRuntimeInstanceByID(ctx context.Context, id string) (model.Ru
 		&launchedCommandRaw, &mountedPathsRaw, &injectedEnvRaw, &item.ScriptUsed,
 		&lastReconciledRaw, &metadataRaw,
 		&precheckStatusRaw, &precheckGatingRaw, &precheckReasonsRaw, &lastPrecheckTaskID, &lastPrecheckAtRaw, &precheckResultRaw,
+		&precheckSummaryRaw,
+		&conflictStatusRaw, &conflictReasonsRaw, &conflictSummaryRaw,
+		&gatingStatusRaw, &gatingAllowedRaw, &gatingReasonsRaw, &gatingSummaryRaw,
+		&lastPlanRaw,
 		&createdAtRaw, &updatedAtRaw,
 	)
 	if err == sql.ErrNoRows {
@@ -1037,8 +1113,18 @@ func (s *Store) GetRuntimeInstanceByID(ctx context.Context, id string) (model.Ru
 	item.LastPrecheckTaskID = strings.TrimSpace(lastPrecheckTaskID)
 	item.LastPrecheckAt = textToTime(lastPrecheckAtRaw)
 	item.PrecheckResult = parseRuntimePrecheckResult(precheckResultRaw)
+	item.PrecheckSummary = parseRuntimePrecheckSummary(precheckSummaryRaw)
+	item.ConflictStatus = model.RuntimeConflictStatus(strings.TrimSpace(conflictStatusRaw))
+	item.ConflictReasons = parseStringSlice(conflictReasonsRaw)
+	item.ConflictSummary = parseRuntimeConflictSummary(conflictSummaryRaw)
+	item.GatingStatus = model.RuntimeGatingStatus(strings.TrimSpace(gatingStatusRaw))
+	item.GatingAllowed = gatingAllowedRaw == 1
+	item.GatingReasons = parseStringSlice(gatingReasonsRaw)
+	item.GatingSummary = parseRuntimeGatingSummary(gatingSummaryRaw)
+	item.LastLifecyclePlan = parseRuntimeLifecyclePlanSummary(lastPlanRaw)
 	item.CreatedAt = textToTime(createdAtRaw)
 	item.UpdatedAt = textToTime(updatedAtRaw)
+	normalizeRuntimeInstanceAfterRead(&item)
 	return item, true, nil
 }
 
@@ -1850,6 +1936,170 @@ func parseRuntimePrecheckResult(raw string) *model.RuntimePrecheckResult {
 		return nil
 	}
 	return &out
+}
+
+func parseRuntimePrecheckSummary(raw string) *model.RuntimePrecheckSummary {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "{}" || raw == "null" {
+		return nil
+	}
+	var out model.RuntimePrecheckSummary
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil
+	}
+	if strings.TrimSpace(string(out.Status)) == "" && len(out.Reasons) == 0 && out.GeneratedAt.IsZero() {
+		return nil
+	}
+	return &out
+}
+
+func parseRuntimeConflictSummary(raw string) *model.RuntimeConflictSummary {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "{}" || raw == "null" {
+		return nil
+	}
+	var out model.RuntimeConflictSummary
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil
+	}
+	if strings.TrimSpace(string(out.Status)) == "" && len(out.Reasons) == 0 && out.GeneratedAt.IsZero() {
+		return nil
+	}
+	return &out
+}
+
+func parseRuntimeGatingSummary(raw string) *model.RuntimeGatingSummary {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "{}" || raw == "null" {
+		return nil
+	}
+	var out model.RuntimeGatingSummary
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil
+	}
+	if strings.TrimSpace(string(out.Status)) == "" && len(out.Reasons) == 0 && out.GeneratedAt.IsZero() {
+		return nil
+	}
+	return &out
+}
+
+func parseRuntimeLifecyclePlanSummary(raw string) *model.RuntimeLifecyclePlanSummary {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "{}" || raw == "null" {
+		return nil
+	}
+	var out model.RuntimeLifecyclePlanSummary
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil
+	}
+	if strings.TrimSpace(out.PlanID) == "" &&
+		strings.TrimSpace(string(out.Action)) == "" &&
+		strings.TrimSpace(string(out.Status)) == "" &&
+		out.GeneratedAt.IsZero() {
+		return nil
+	}
+	return &out
+}
+
+func normalizeRuntimeInstanceForPersistence(item *model.RuntimeInstance) {
+	if item == nil {
+		return
+	}
+	normalizeRuntimeInstanceAfterRead(item)
+	if item.ConflictSummary == nil {
+		item.ConflictSummary = &model.RuntimeConflictSummary{
+			Status:      item.ConflictStatus,
+			Blocking:    item.ConflictBlocking,
+			GeneratedAt: item.ConflictGeneratedAt,
+			Source:      item.ConflictSource,
+		}
+	}
+	if item.GatingSummary == nil {
+		item.GatingSummary = &model.RuntimeGatingSummary{
+			Status:      item.GatingStatus,
+			Allowed:     item.GatingAllowed,
+			GeneratedAt: item.GatingGeneratedAt,
+			Source:      item.GatingSource,
+		}
+	}
+	if item.LastLifecyclePlan == nil && (strings.TrimSpace(string(item.LastPlanAction)) != "" || strings.TrimSpace(string(item.LastPlanStatus)) != "" || strings.TrimSpace(item.LastPlanReason) != "" || !item.LastPlanGeneratedAt.IsZero()) {
+		item.LastLifecyclePlan = &model.RuntimeLifecyclePlanSummary{
+			Action:      item.LastPlanAction,
+			Status:      item.LastPlanStatus,
+			Message:     strings.TrimSpace(item.LastPlanReason),
+			GeneratedAt: item.LastPlanGeneratedAt,
+			UpdatedAt:   item.LastPlanGeneratedAt,
+		}
+	}
+}
+
+func normalizeRuntimeInstanceAfterRead(item *model.RuntimeInstance) {
+	if item == nil {
+		return
+	}
+	if item.PrecheckSummary != nil {
+		if strings.TrimSpace(string(item.PrecheckStatus)) == "" {
+			item.PrecheckStatus = item.PrecheckSummary.Status
+		}
+		if !item.PrecheckGating {
+			item.PrecheckGating = item.PrecheckSummary.Gating
+		}
+	}
+	if item.ConflictSummary != nil {
+		item.ConflictStatus = model.RuntimeConflictStatus(firstNonEmpty(strings.TrimSpace(string(item.ConflictStatus)), strings.TrimSpace(string(item.ConflictSummary.Status))))
+		item.ConflictBlocking = item.ConflictBlocking || item.ConflictSummary.Blocking
+		item.ConflictGeneratedAt = newerTime(item.ConflictGeneratedAt, item.ConflictSummary.GeneratedAt)
+		if strings.TrimSpace(string(item.ConflictSource)) == "" {
+			item.ConflictSource = item.ConflictSummary.Source
+		}
+	}
+	if item.GatingSummary != nil {
+		item.GatingStatus = model.RuntimeGatingStatus(firstNonEmpty(strings.TrimSpace(string(item.GatingStatus)), strings.TrimSpace(string(item.GatingSummary.Status))))
+		if !item.GatingAllowed {
+			item.GatingAllowed = item.GatingSummary.Allowed
+		}
+		item.GatingGeneratedAt = newerTime(item.GatingGeneratedAt, item.GatingSummary.GeneratedAt)
+		if strings.TrimSpace(string(item.GatingSource)) == "" {
+			item.GatingSource = item.GatingSummary.Source
+		}
+	}
+	if item.LastLifecyclePlan != nil {
+		item.LastPlanAction = model.RuntimeLifecycleAction(firstNonEmpty(strings.TrimSpace(string(item.LastPlanAction)), strings.TrimSpace(string(item.LastLifecyclePlan.Action))))
+		item.LastPlanStatus = model.RuntimeLifecyclePlanStatus(firstNonEmpty(strings.TrimSpace(string(item.LastPlanStatus)), strings.TrimSpace(string(item.LastLifecyclePlan.Status))))
+		item.LastPlanReason = firstNonEmpty(strings.TrimSpace(item.LastPlanReason), strings.TrimSpace(item.LastLifecyclePlan.Message))
+		item.LastPlanGeneratedAt = newerTime(item.LastPlanGeneratedAt, item.LastLifecyclePlan.GeneratedAt)
+		if item.LastPlanGeneratedAt.IsZero() {
+			item.LastPlanGeneratedAt = item.LastLifecyclePlan.UpdatedAt
+		}
+		if item.LastPlanDetail == nil {
+			item.LastPlanDetail = map[string]interface{}{}
+		}
+		if len(item.LastLifecyclePlan.ReasonCodes) > 0 {
+			item.LastPlanDetail["reason_codes"] = item.LastLifecyclePlan.ReasonCodes
+		}
+		if len(item.LastLifecyclePlan.BlockedReasonCodes) > 0 {
+			item.LastPlanDetail["blocked_reason_codes"] = item.LastLifecyclePlan.BlockedReasonCodes
+		}
+		if len(item.LastLifecyclePlan.ReleaseTargets) > 0 {
+			item.LastPlanDetail["release_targets"] = item.LastLifecyclePlan.ReleaseTargets
+		}
+		if strings.TrimSpace(item.LastLifecyclePlan.PlanID) != "" {
+			item.LastPlanDetail["plan_id"] = strings.TrimSpace(item.LastLifecyclePlan.PlanID)
+		}
+	}
+}
+
+func newerTime(a, b time.Time) time.Time {
+	if a.IsZero() {
+		return b
+	}
+	if b.IsZero() {
+		return a
+	}
+	if b.After(a) {
+		return b
+	}
+	return a
 }
 
 func timeToText(ts time.Time) string {

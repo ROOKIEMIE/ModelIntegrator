@@ -45,6 +45,10 @@ wait_task_terminal() {
 
 step "discover runtime instance"
 instance_id="$(json_get "$CONTROLLER_BASE_URL/api/v1/runtime-instances" | jq -r --arg model "$MODEL_ID" '.data[] | select(.model_id==$model) | .id' | head -n1)"
+instance_last_reconciled_before=""
+if [[ -n "$instance_id" ]]; then
+  instance_last_reconciled_before="$(json_get "$CONTROLLER_BASE_URL/api/v1/runtime-instances/$instance_id" | jq -r '.data.last_reconciled_at // ""')"
+fi
 container_id="$(json_get "$CONTROLLER_BASE_URL/api/v1/models/$MODEL_ID" | jq -r '.data.metadata.runtime_container_id // ""')"
 
 build_payload() {
@@ -108,11 +112,38 @@ if [[ -n "$AGENT_ID" && "$precheck_worker" != "$AGENT_ID" ]]; then
   echo "runtime precheck not executed by expected local-agent: worker=$precheck_worker expected=$AGENT_ID"
   exit 1
 fi
+precheck_overall="$(printf '%s' "$precheck_task" | jq -r '.data.detail.overall_status // ""')"
+precheck_has_structured="$(printf '%s' "$precheck_task" | jq -r 'if (.data.detail.structured_result | type)=="object" then "yes" else "no" end')"
+precheck_has_envelope="$(printf '%s' "$precheck_task" | jq -r 'if (.data.detail.detail | type)=="object" then "yes" else "no" end')"
+precheck_resolved_instance="$(printf '%s' "$precheck_task" | jq -r '.data.detail.runtime_instance_id // .data.payload.runtime_instance_id // ""')"
+if [[ "$precheck_has_structured" != "yes" || "$precheck_has_envelope" != "yes" ]]; then
+  echo "runtime precheck result not normalized/enveloped: $precheck_task"
+  exit 1
+fi
+if [[ -n "$instance_id" && "$precheck_resolved_instance" != "$instance_id" ]]; then
+  echo "runtime precheck detail.runtime_instance_id mismatch: got=$precheck_resolved_instance expected=$instance_id"
+  exit 1
+fi
+if [[ -z "$precheck_overall" ]]; then
+  echo "runtime precheck overall_status missing: $precheck_task"
+  exit 1
+fi
 
 instance_summary_status=""
 instance_summary_readiness=""
 instance_summary_precheck=""
 instance_summary_last_task_type=""
+instance_summary_manifest=""
+reconcile_summary_status=""
+reconcile_summary_desired=""
+reconcile_summary_observed=""
+reconcile_summary_readiness=""
+reconcile_summary_drift=""
+reconcile_summary_last_reconciled=""
+reconcile_summary_conflict=""
+reconcile_summary_gating=""
+reconcile_summary_planned_action=""
+reconcile_summary_updated="no"
 if [[ -n "$instance_id" ]]; then
   step "verify runtime instance summary updated"
   instance_summary="$(json_get "$CONTROLLER_BASE_URL/api/v1/runtime-instances/$instance_id/summary?limit=5")"
@@ -121,6 +152,7 @@ if [[ -n "$instance_id" ]]; then
   instance_summary_readiness="$(printf '%s' "$instance_summary" | jq -r '.data.readiness // ""')"
   instance_summary_precheck="$(printf '%s' "$instance_summary" | jq -r '.data.precheck_status // ""')"
   instance_summary_last_task_type="$(printf '%s' "$instance_summary" | jq -r '.data.last_agent_task.task_type // ""')"
+  instance_summary_manifest="$(printf '%s' "$instance_summary" | jq -r '.data.runtime_instance.manifest_id // ""')"
   if [[ "$instance_summary_status" != "true" || "$summary_instance_id" != "$instance_id" ]]; then
     echo "runtime instance summary query failed: $instance_summary"
     exit 1
@@ -131,6 +163,45 @@ if [[ -n "$instance_id" ]]; then
   fi
   if [[ -z "$instance_summary_last_task_type" ]]; then
     echo "runtime instance last agent task summary missing: $instance_summary"
+    exit 1
+  fi
+
+  step "verify runtime instance detail api visibility"
+  instance_detail="$(json_get "$CONTROLLER_BASE_URL/api/v1/runtime-instances/$instance_id")"
+  detail_has_precheck="$(printf '%s' "$instance_detail" | jq -r 'if (.data.precheck_result | type)=="object" then "yes" else "no" end')"
+  detail_last_task="$(printf '%s' "$instance_detail" | jq -r '.data.last_agent_task.task_type // ""')"
+  if [[ "$detail_has_precheck" != "yes" ]]; then
+    echo "runtime instance detail missing precheck_result: $instance_detail"
+    exit 1
+  fi
+  if [[ -z "$detail_last_task" ]]; then
+    echo "runtime instance detail missing last_agent_task: $instance_detail"
+    exit 1
+  fi
+
+  step "verify runtime instance reconcile summary api"
+  for i in $(seq 1 30); do
+    reconcile_summary="$(json_get "$CONTROLLER_BASE_URL/api/v1/runtime-instances/$instance_id/reconcile-summary")"
+    reconcile_summary_status="$(printf '%s' "$reconcile_summary" | jq -r '.success // false')"
+    reconcile_summary_instance_id="$(printf '%s' "$reconcile_summary" | jq -r '.data.runtime_instance_id // ""')"
+    reconcile_summary_desired="$(printf '%s' "$reconcile_summary" | jq -r '.data.desired_state // ""')"
+    reconcile_summary_observed="$(printf '%s' "$reconcile_summary" | jq -r '.data.observed_state // ""')"
+    reconcile_summary_readiness="$(printf '%s' "$reconcile_summary" | jq -r '.data.readiness // ""')"
+    reconcile_summary_drift="$(printf '%s' "$reconcile_summary" | jq -r '.data.drift_reason // ""')"
+    reconcile_summary_last_reconciled="$(printf '%s' "$reconcile_summary" | jq -r '.data.last_reconciled_at // ""')"
+    reconcile_summary_conflict="$(printf '%s' "$reconcile_summary" | jq -r '.data.conflict_status // ""')"
+    reconcile_summary_gating="$(printf '%s' "$reconcile_summary" | jq -r '.data.gating_status // ""')"
+    reconcile_summary_planned_action="$(printf '%s' "$reconcile_summary" | jq -r '.data.planned_action // ""')"
+    if [[ "$reconcile_summary_status" == "true" && "$reconcile_summary_instance_id" == "$instance_id" && -n "$reconcile_summary_last_reconciled" ]]; then
+      if [[ -z "$instance_last_reconciled_before" || "$reconcile_summary_last_reconciled" != "$instance_last_reconciled_before" ]]; then
+        reconcile_summary_updated="yes"
+        break
+      fi
+    fi
+    sleep 1
+  done
+  if [[ "$reconcile_summary_status" != "true" || "$reconcile_summary_updated" != "yes" ]]; then
+    echo "runtime instance reconcile summary not updated: $reconcile_summary"
     exit 1
   fi
 fi
@@ -144,9 +215,22 @@ cat >"$REPORT_FILE" <<JSON
   "resource_snapshot_status": "$snapshot_status",
   "docker_inspect_status": "$inspect_status",
   "runtime_precheck_status": "$precheck_status",
+  "runtime_precheck_overall_status": "$precheck_overall",
+  "runtime_precheck_structured": "$precheck_has_structured",
+  "runtime_precheck_enveloped": "$precheck_has_envelope",
   "instance_summary_readiness": "$instance_summary_readiness",
   "instance_summary_precheck_status": "$instance_summary_precheck",
   "instance_summary_last_task_type": "$instance_summary_last_task_type",
+  "instance_summary_manifest_id": "$instance_summary_manifest",
+  "reconcile_summary_desired_state": "$reconcile_summary_desired",
+  "reconcile_summary_observed_state": "$reconcile_summary_observed",
+  "reconcile_summary_readiness": "$reconcile_summary_readiness",
+  "reconcile_summary_drift_reason": "$reconcile_summary_drift",
+  "reconcile_summary_conflict_status": "$reconcile_summary_conflict",
+  "reconcile_summary_gating_status": "$reconcile_summary_gating",
+  "reconcile_summary_planned_action": "$reconcile_summary_planned_action",
+  "reconcile_summary_last_reconciled_at": "$reconcile_summary_last_reconciled",
+  "reconcile_summary_updated": "$reconcile_summary_updated",
   "status": "success",
   "finished_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }

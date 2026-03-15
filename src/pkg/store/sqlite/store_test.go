@@ -252,15 +252,35 @@ func TestRuntimeBindingInstanceManifestRoundTrip(t *testing.T) {
 	}
 
 	instance := model.RuntimeInstance{
-		ID:            "ri-local-multilingual-e5-base",
-		ModelID:       "local-multilingual-e5-base",
-		TemplateID:    "tei-embedding-e5-local",
-		BindingID:     binding.ID,
-		NodeID:        "node-controller",
-		DesiredState:  "running",
-		ObservedState: "stopped",
-		Readiness:     model.ReadinessNotReady,
-		Endpoint:      "http://127.0.0.1:58001",
+		ID:             "ri-local-multilingual-e5-base",
+		ModelID:        "local-multilingual-e5-base",
+		TemplateID:     "tei-embedding-e5-local",
+		BindingID:      binding.ID,
+		NodeID:         "node-controller",
+		DesiredState:   "running",
+		ObservedState:  "stopped",
+		Readiness:      model.ReadinessNotReady,
+		Endpoint:       "http://127.0.0.1:58001",
+		ConflictStatus: model.RuntimeConflictStatusBlocked,
+		ConflictReasons: []string{
+			"runtime_kind_mutex_conflict",
+		},
+		GatingStatus:  model.RuntimeGatingStatusDeferred,
+		GatingAllowed: false,
+		GatingReasons: []string{
+			"runtime_kind_mutex_conflict",
+		},
+		LastLifecyclePlan: &model.RuntimeLifecyclePlanSummary{
+			PlanID:         "plan-test-1",
+			Action:         model.RuntimeLifecycleActionLoad,
+			Status:         model.RuntimeLifecyclePlanStatusDeferred,
+			Message:        "deferred waiting for slot release",
+			ReasonCodes:    []string{"runtime_kind_mutex_conflict"},
+			ReleaseTargets: []string{"ri-another"},
+			Source:         model.RuntimeSignalSourceController,
+			GeneratedAt:    time.Now().UTC(),
+			UpdatedAt:      time.Now().UTC(),
+		},
 	}
 	if err := store.UpsertRuntimeInstance(ctx, instance); err != nil {
 		t.Fatalf("upsert runtime instance failed: %v", err)
@@ -280,6 +300,15 @@ func TestRuntimeBindingInstanceManifestRoundTrip(t *testing.T) {
 	}
 	if !ok || gotInstance.BindingID != binding.ID {
 		t.Fatalf("unexpected runtime instance snapshot: %+v", gotInstance)
+	}
+	if gotInstance.ConflictStatus != model.RuntimeConflictStatusBlocked {
+		t.Fatalf("unexpected conflict_status: %s", gotInstance.ConflictStatus)
+	}
+	if gotInstance.GatingStatus != model.RuntimeGatingStatusDeferred {
+		t.Fatalf("unexpected gating_status: %s", gotInstance.GatingStatus)
+	}
+	if gotInstance.LastLifecyclePlan == nil || gotInstance.LastLifecyclePlan.Action != model.RuntimeLifecycleActionLoad {
+		t.Fatalf("unexpected last_lifecycle_plan: %+v", gotInstance.LastLifecyclePlan)
 	}
 
 	gotManifest, ok, err := store.GetRuntimeBundleManifestByTemplateID(ctx, "tei-embedding-e5-local")

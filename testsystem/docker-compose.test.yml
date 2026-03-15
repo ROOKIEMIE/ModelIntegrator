@@ -8,7 +8,7 @@ services:
     environment:
       CONTROLLER_BASE_URL: ${CONTROLLER_BASE_URL:-http://controller:8080}
       CONTROLLER_AUTH_TOKEN: ${CONTROLLER_AUTH_TOKEN:-}
-      TEST_SCENARIO: ${TEST_SCENARIO:-e5_embedding_smoke}
+      TEST_SCENARIO: ${TEST_SCENARIO:-stage0_to_b_full_smoke}
       TEST_LOG_ROOT: /workspace/test-logs
       E5_MODEL_ID: ${E5_MODEL_ID:-local-multilingual-e5-base}
       E5_EXPECTED_DIM: ${E5_EXPECTED_DIM:-768}

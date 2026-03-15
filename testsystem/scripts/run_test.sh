@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCENARIO="${TEST_SCENARIO:-e5_embedding_smoke}"
+SCENARIO="${TEST_SCENARIO:-stage0_to_b_full_smoke}"
 LOG_ROOT="${TEST_LOG_ROOT:-/workspace/test-logs}"
 RUN_ID="${TEST_RUN_ID:-manual-$(date -u +%Y%m%dT%H%M%SZ)-$RANDOM}"
 RUN_DIR="${LOG_ROOT%/}/${RUN_ID}"

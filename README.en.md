@@ -152,6 +152,7 @@ Runtime objects (instance-first):
 - `GET /api/v1/runtime-instances/{id}`
 - `GET /api/v1/runtime-instances/{id}/tasks`
 - `GET /api/v1/runtime-instances/{id}/summary`
+- `GET /api/v1/runtime-instances/{id}/reconcile-summary`
 
 Agents and tasks:
 
@@ -180,6 +181,7 @@ Node execution task types (submitted via `POST /api/v1/tasks/agent/node-local`):
 
 Test runs:
 
+- `GET /api/v1/test-runs/scenarios`
 - `GET /api/v1/test-runs`
 - `GET /api/v1/test-runs/{id}`
 - `POST /api/v1/test-runs`
@@ -187,10 +189,24 @@ Test runs:
 Scripted smoke checks (local-agent path):
 
 - `scripts/controller_api_smoke.sh <base_url> [token] [agent_id] [model_id]`
+- `testsystem/scenarios/stage0_to_b_full_smoke.sh`
+- `testsystem/scenarios/stage0_runtime_object_smoke.sh`
 - `testsystem/scenarios/local_agent_execution_smoke.sh`
+- `testsystem/scenarios/e5_embedding_smoke.sh`
+- `testsystem/scenarios/e5_gating_blocked_smoke.sh`
 
 Stage A closure (current):
 
+- `agent.runtime_precheck` is now manifest-driven preflight (mount/env/script/port/compatibility/policy/custom_bundle-min checks).
+- Agent check/execution task details now use a unified structured envelope (`overall_status + structured_result + manifest_summary`).
 - Agent outcomes now land on `RuntimeInstance` first (precheck/readiness/drift/resolved state + latest task summary).
 - `Node` keeps node-level resource/agent liveness facts; `Model` primarily consumes instance projection.
-- Stage B focus: instance-first reconcile, deeper precheck/conflict/drift, and less direct fallback.
+- `testsystem/scenarios/local_agent_execution_smoke.sh` now covers the Stage A closure chain on the default E5 sample model.
+- Stage B kickoff is now in place: a controller-side `instance-first reconcile` loop continuously updates `desired/observed/readiness/health/drift` and `last_reconciled_at`.
+- `precheck_*` is now a formal reconcile input, and `agent_offline/observation_stale` are surfaced in instance-level reconcile conclusions.
+- Stage B deepening is now active: `RuntimeInstance` now carries structured `conflict/gating/last_plan_*` state, and reconcile emits minimal `load/unload/deferred/blocked` lifecycle plans.
+- `runtime.start/restart` now uses gating fail-fast (blocked requests are rejected before enqueue), and planner metadata is attached to runtime task payload/detail.
+- Added `testsystem/scenarios/e5_gating_blocked_smoke.sh` to validate the chain: binding/script conflict -> gating blocked -> runtime.start fail-fast.
+- Added `stage0_runtime_object_smoke` and `stage0_to_b_full_smoke` to cover Stage 0 through Stage B in one test matrix.
+- The web console now supports manual scenario triggering via a scenario selector, including a quick "Stage 0~B" run entry.
+- See `doc/Schema.md` (Stage B semantics) and `doc/LOG.md` (this round changes).

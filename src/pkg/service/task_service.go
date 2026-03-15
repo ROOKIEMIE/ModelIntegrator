@@ -13,9 +13,36 @@ import (
 )
 
 var (
-	ErrTaskNotFound      = errors.New("task not found")
-	ErrTaskStoreNotReady = errors.New("task store is not ready")
+	ErrTaskNotFound       = errors.New("task not found")
+	ErrTaskStoreNotReady  = errors.New("task store is not ready")
+	ErrRuntimeActionGated = errors.New("runtime action gated")
 )
+
+type RuntimeActionGatedError struct {
+	ModelID           string
+	RuntimeInstanceID string
+	TaskType          model.TaskType
+	GatingStatus      model.RuntimeGatingStatus
+	GatingReasons     []string
+}
+
+func (e *RuntimeActionGatedError) Error() string {
+	if e == nil {
+		return ErrRuntimeActionGated.Error()
+	}
+	reasons := strings.Join(cloneStringSlice(e.GatingReasons), ",")
+	if reasons == "" {
+		reasons = "unknown"
+	}
+	return fmt.Sprintf("%s: model_id=%s runtime_instance_id=%s task_type=%s gating_status=%s reasons=%s",
+		ErrRuntimeActionGated.Error(),
+		strings.TrimSpace(e.ModelID),
+		strings.TrimSpace(e.RuntimeInstanceID),
+		strings.TrimSpace(string(e.TaskType)),
+		strings.TrimSpace(string(e.GatingStatus)),
+		reasons,
+	)
+}
 
 type AgentRuntimeReadinessTaskRequest struct {
 	RuntimeInstanceID string
@@ -101,7 +128,57 @@ func (s *TaskService) CreateRuntimeTask(ctx context.Context, taskType model.Task
 		return model.Task{}, fmt.Errorf("unsupported runtime task type: %s", taskType)
 	}
 
+	planCtx, err := s.prepareRuntimeTaskPlanContext(ctx, taskType, modelID)
+	if err != nil {
+		return model.Task{}, err
+	}
+
 	now := time.Now().UTC()
+	payload := map[string]interface{}{
+		"model_id":     modelID,
+		"triggered_by": strings.TrimSpace(triggeredBy),
+	}
+	detail := map[string]interface{}{
+		"execution_path": "controller",
+	}
+	if planCtx != nil {
+		payload["runtime_instance_id"] = strings.TrimSpace(planCtx.instance.ID)
+		payload["runtime_binding_id"] = strings.TrimSpace(planCtx.instance.BindingID)
+		payload["runtime_template_id"] = strings.TrimSpace(planCtx.instance.TemplateID)
+		payload["manifest_id"] = strings.TrimSpace(planCtx.instance.ManifestID)
+		payload["node_id"] = strings.TrimSpace(planCtx.instance.NodeID)
+		payload["gating_status"] = strings.TrimSpace(string(planCtx.summary.GatingStatus))
+		payload["gating_allowed"] = planCtx.summary.GatingAllowed
+		payload["gating_reasons"] = cloneStringSlice(planCtx.summary.GatingReasons)
+		payload["planned_action"] = strings.TrimSpace(string(planCtx.instance.LastPlanAction))
+		payload["plan_status"] = strings.TrimSpace(string(planCtx.instance.LastPlanStatus))
+		payload["plan_reason"] = strings.TrimSpace(planCtx.instance.LastPlanReason)
+		payload["plan_source"] = "controller.reconcile"
+
+		detail["runtime_instance_id"] = strings.TrimSpace(planCtx.instance.ID)
+		detail["runtime_binding_id"] = strings.TrimSpace(planCtx.instance.BindingID)
+		detail["runtime_template_id"] = strings.TrimSpace(planCtx.instance.TemplateID)
+		detail["manifest_id"] = strings.TrimSpace(planCtx.instance.ManifestID)
+		detail["gating_status"] = strings.TrimSpace(string(planCtx.summary.GatingStatus))
+		detail["gating_allowed"] = planCtx.summary.GatingAllowed
+		detail["gating_reasons"] = cloneStringSlice(planCtx.summary.GatingReasons)
+		detail["plan_action"] = strings.TrimSpace(string(planCtx.instance.LastPlanAction))
+		detail["plan_status"] = strings.TrimSpace(string(planCtx.instance.LastPlanStatus))
+		detail["plan_reason"] = strings.TrimSpace(planCtx.instance.LastPlanReason)
+		detail["plan_source"] = "controller.reconcile"
+		if planCtx.instance.LastLifecyclePlan != nil {
+			detail["lifecycle_plan"] = map[string]interface{}{
+				"plan_id":              strings.TrimSpace(planCtx.instance.LastLifecyclePlan.PlanID),
+				"action":               strings.TrimSpace(string(planCtx.instance.LastLifecyclePlan.Action)),
+				"status":               strings.TrimSpace(string(planCtx.instance.LastLifecyclePlan.Status)),
+				"message":              strings.TrimSpace(planCtx.instance.LastLifecyclePlan.Message),
+				"reason_codes":         cloneStringSlice(planCtx.instance.LastLifecyclePlan.ReasonCodes),
+				"blocked_reason_codes": cloneStringSlice(planCtx.instance.LastLifecyclePlan.BlockedReasonCodes),
+				"release_targets":      cloneStringSlice(planCtx.instance.LastLifecyclePlan.ReleaseTargets),
+				"source":               strings.TrimSpace(string(planCtx.instance.LastLifecyclePlan.Source)),
+			}
+		}
+	}
 	task := model.Task{
 		ID:         newTaskID("task"),
 		Type:       taskType,
@@ -110,17 +187,64 @@ func (s *TaskService) CreateRuntimeTask(ctx context.Context, taskType model.Task
 		Status:     model.TaskStatusPending,
 		Progress:   0,
 		Message:    "任务已创建",
-		Payload: map[string]interface{}{
-			"model_id":     modelID,
-			"triggered_by": strings.TrimSpace(triggeredBy),
-		},
-		CreatedAt: now,
+		Payload:    payload,
+		Detail:     detail,
+		CreatedAt:  now,
 	}
 	if err := s.store.UpsertTask(ctx, task); err != nil {
 		return model.Task{}, err
 	}
 	go s.executeRuntimeTask(task.ID, taskType, modelID)
 	return task, nil
+}
+
+type runtimeTaskPlanContext struct {
+	instance model.RuntimeInstance
+	summary  model.RuntimeInstanceReconcileSummary
+}
+
+func (s *TaskService) prepareRuntimeTaskPlanContext(ctx context.Context, taskType model.TaskType, modelID string) (*runtimeTaskPlanContext, error) {
+	if s.runtimeObjectSvc == nil {
+		return nil, nil
+	}
+	instance, err := s.runtimeObjectSvc.GetRuntimeInstanceByModelID(ctx, modelID)
+	if err != nil {
+		return nil, nil
+	}
+
+	trigger := "controller.runtime_task.plan"
+	switch taskType {
+	case model.TaskTypeRuntimeStart:
+		trigger = "controller.runtime_task_start"
+	case model.TaskTypeRuntimeRestart:
+		trigger = "controller.runtime_task_restart"
+	case model.TaskTypeRuntimeStop:
+		trigger = "controller.runtime_task_stop"
+	case model.TaskTypeRuntimeRefresh:
+		trigger = "controller.runtime_task_refresh"
+	}
+
+	summary, recErr := s.runtimeObjectSvc.ReconcileRuntimeInstance(ctx, instance.ID, trigger)
+	if recErr != nil {
+		if taskType == model.TaskTypeRuntimeStart || taskType == model.TaskTypeRuntimeRestart {
+			return nil, recErr
+		}
+		return nil, nil
+	}
+	updated, getErr := s.runtimeObjectSvc.GetRuntimeInstance(ctx, instance.ID)
+	if getErr == nil {
+		instance = updated
+	}
+	if (taskType == model.TaskTypeRuntimeStart || taskType == model.TaskTypeRuntimeRestart) && !summary.GatingAllowed {
+		return nil, &RuntimeActionGatedError{
+			ModelID:           modelID,
+			RuntimeInstanceID: strings.TrimSpace(instance.ID),
+			TaskType:          taskType,
+			GatingStatus:      summary.GatingStatus,
+			GatingReasons:     cloneStringSlice(summary.GatingReasons),
+		}
+	}
+	return &runtimeTaskPlanContext{instance: instance, summary: summary}, nil
 }
 
 func (s *TaskService) executeRuntimeTask(taskID string, taskType model.TaskType, modelID string) {
@@ -160,6 +284,9 @@ func (s *TaskService) executeRuntimeTask(taskID string, taskType model.TaskType,
 					task.Detail = map[string]interface{}{}
 				}
 				task.Detail["local_agent_first"] = "fallback_to_controller_direct"
+				task.Detail["fallback"] = "controller_direct"
+				task.Detail["self_check"] = "controller_runtime_action"
+				task.Detail["compatibility_path"] = "controller_direct_fallback"
 				task.Detail["local_agent_fallback_error"] = viaAgentErr.Error()
 				task.Message = "agent 优先路径失败，回退 controller direct"
 			})
@@ -214,7 +341,7 @@ func (s *TaskService) executeRuntimeTask(taskID string, taskType model.TaskType,
 		task.Status = model.TaskStatusSuccess
 		task.Progress = 100
 		task.Message = firstNonEmpty(result.Message, "任务执行成功")
-		task.Detail = result.Detail
+		task.Detail = mergeObjectMaps(task.Detail, result.Detail)
 		task.Error = ""
 		if task.StartedAt.IsZero() {
 			task.StartedAt = now
@@ -448,6 +575,8 @@ func (s *TaskService) CreateAgentNodeTask(ctx context.Context, req AgentNodeLoca
 	}
 	if strings.HasPrefix(resolved.Context.TaskScope, "legacy") {
 		detail["compatibility_path"] = "legacy_model_or_node"
+		detail["fallback"] = "compatibility_path"
+		detail["self_check"] = "legacy_model_or_node"
 	}
 	task := model.Task{
 		ID:              newTaskID("task"),
@@ -525,6 +654,16 @@ func (s *TaskService) resolveAgentTaskCreationInput(ctx context.Context, req Age
 		contextInfo.RequiredEnv = cloneStringSlice(resolved.Manifest.RequiredEnv)
 		contextInfo.OptionalEnv = cloneStringSlice(resolved.Manifest.OptionalEnv)
 		contextInfo.MountPoints = cloneStringSlice(resolved.Manifest.MountPoints)
+		contextInfo.ManifestVersion = strings.TrimSpace(resolved.Manifest.ManifestVersion)
+		contextInfo.CommandOverride = cloneStringSlice(resolved.Binding.CommandOverride)
+		contextInfo.BindingMountRules = cloneStringSlice(resolved.Binding.MountRules)
+		contextInfo.BindingEnvOverrides = cloneStringMap(resolved.Binding.EnvOverrides)
+		contextInfo.SupportedModelTypes = modelKindListToStringList(resolved.Manifest.SupportedModelTypes)
+		contextInfo.SupportedFormats = modelFormatListToStringList(resolved.Manifest.SupportedFormats)
+		commandOverrideAllowed := resolved.Manifest.CommandOverrideAllowed
+		scriptMountAllowed := resolved.Manifest.ScriptMountAllowed
+		contextInfo.CommandOverrideAllowed = &commandOverrideAllowed
+		contextInfo.ScriptMountAllowed = &scriptMountAllowed
 		if contextInfo.TaskScope == "" {
 			contextInfo.TaskScope = "runtime_instance"
 		}
@@ -556,6 +695,12 @@ func (s *TaskService) resolveAgentTaskCreationInput(ctx context.Context, req Age
 			}
 			if strings.TrimSpace(string(item.BackendType)) != "" {
 				contextInfo.Metadata["backend_type"] = strings.TrimSpace(string(item.BackendType))
+			}
+			if strings.TrimSpace(string(item.ModelType)) != "" {
+				contextInfo.ModelType = strings.TrimSpace(string(item.ModelType))
+			}
+			if strings.TrimSpace(string(item.Format)) != "" {
+				contextInfo.ModelFormat = strings.TrimSpace(string(item.Format))
 			}
 		}
 	}
@@ -747,8 +892,68 @@ func agentTaskResolvedContextToMap(ctx model.AgentTaskResolvedContext) map[strin
 	if len(ctx.MountPoints) > 0 {
 		out["mount_points"] = cloneStringSlice(ctx.MountPoints)
 	}
+	if ctx.CommandOverrideAllowed != nil {
+		out["command_override_allowed"] = *ctx.CommandOverrideAllowed
+	}
+	if ctx.ScriptMountAllowed != nil {
+		out["script_mount_allowed"] = *ctx.ScriptMountAllowed
+	}
+	if len(ctx.CommandOverride) > 0 {
+		out["command_override"] = cloneStringSlice(ctx.CommandOverride)
+	}
+	if len(ctx.BindingMountRules) > 0 {
+		out["binding_mount_rules"] = cloneStringSlice(ctx.BindingMountRules)
+	}
+	if len(ctx.BindingEnvOverrides) > 0 {
+		out["binding_env_overrides"] = cloneStringMap(ctx.BindingEnvOverrides)
+	}
+	if len(ctx.SupportedModelTypes) > 0 {
+		out["supported_model_types"] = cloneStringSlice(ctx.SupportedModelTypes)
+	}
+	if len(ctx.SupportedFormats) > 0 {
+		out["supported_formats"] = cloneStringSlice(ctx.SupportedFormats)
+	}
+	appendString("model_type", ctx.ModelType)
+	appendString("model_format", ctx.ModelFormat)
+	appendString("manifest_version", ctx.ManifestVersion)
 	if len(ctx.Metadata) > 0 {
 		out["metadata"] = cloneStringMap(ctx.Metadata)
+	}
+	return out
+}
+
+func modelKindListToStringList(in []model.ModelKind) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	for _, item := range in {
+		text := strings.TrimSpace(string(item))
+		if text == "" {
+			continue
+		}
+		out = append(out, text)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func modelFormatListToStringList(in []model.ModelFormat) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	for _, item := range in {
+		text := strings.TrimSpace(string(item))
+		if text == "" {
+			continue
+		}
+		out = append(out, text)
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }
@@ -781,6 +986,196 @@ func mergeObjectMaps(base map[string]interface{}, extra map[string]interface{}) 
 		out[key] = v
 	}
 	return out
+}
+
+func normalizeAgentTaskDetail(task model.Task, incoming map[string]interface{}, report AgentTaskReport, now time.Time) map[string]interface{} {
+	detail := cloneObjectMap(incoming)
+	if detail == nil {
+		detail = map[string]interface{}{}
+	}
+	rawSnapshot := cloneObjectMap(detail)
+	for _, key := range []string{
+		"task_type", "overall_status", "message", "detail", "structured_result",
+		"started_at", "finished_at", "node_id", "runtime_instance_id", "runtime_binding_id",
+		"manifest_summary", "execution_path",
+	} {
+		delete(rawSnapshot, key)
+	}
+
+	structuredResult, _ := detail["structured_result"].(map[string]interface{})
+	if len(structuredResult) == 0 {
+		structuredResult = cloneObjectMap(rawSnapshot)
+	}
+	if len(structuredResult) == 0 {
+		structuredResult = map[string]interface{}{}
+	}
+
+	startedAt := report.StartedAt
+	if startedAt.IsZero() {
+		startedAt = task.StartedAt
+	}
+	if startedAt.IsZero() {
+		startedAt = now
+	}
+	finishedAt := report.FinishedAt
+	if finishedAt.IsZero() {
+		finishedAt = task.FinishedAt
+	}
+	if finishedAt.IsZero() && isTaskTerminal(report.Status) {
+		finishedAt = now
+	}
+
+	overallStatus := strings.TrimSpace(readStringFromObjectMap(detail, "overall_status"))
+	if overallStatus == "" {
+		overallStatus = inferOverallStatusFromTaskStatus(firstNonEmpty(string(report.Status), string(task.Status)))
+	}
+	if strings.EqualFold(overallStatus, "ok") && (report.Status == model.TaskStatusFailed || report.Status == model.TaskStatusTimeout || report.Status == model.TaskStatusCanceled) {
+		overallStatus = "failed"
+	}
+
+	message := firstNonEmpty(
+		strings.TrimSpace(report.Message),
+		strings.TrimSpace(task.Message),
+		strings.TrimSpace(readStringFromObjectMap(detail, "message")),
+	)
+	nodeID := firstNonEmpty(
+		readStringFromObjectMap(detail, "node_id"),
+		readStringFromObjectMap(task.Payload, "node_id"),
+		readStringFromNestedObjectMap(task.Payload, "resolved_context", "node_id"),
+	)
+	runtimeInstanceID := firstNonEmpty(
+		readStringFromObjectMap(detail, "runtime_instance_id"),
+		readStringFromObjectMap(task.Payload, "runtime_instance_id"),
+		readStringFromNestedObjectMap(task.Payload, "resolved_context", "runtime_instance_id"),
+	)
+	runtimeBindingID := firstNonEmpty(
+		readStringFromObjectMap(detail, "runtime_binding_id"),
+		readStringFromObjectMap(task.Payload, "runtime_binding_id"),
+		readStringFromNestedObjectMap(task.Payload, "resolved_context", "runtime_binding_id"),
+	)
+
+	detail["task_type"] = string(task.Type)
+	detail["overall_status"] = overallStatus
+	detail["message"] = message
+	detail["detail"] = rawSnapshot
+	detail["structured_result"] = structuredResult
+	detail["started_at"] = startedAt.UTC().Format(time.RFC3339Nano)
+	if !finishedAt.IsZero() {
+		detail["finished_at"] = finishedAt.UTC().Format(time.RFC3339Nano)
+	}
+	if nodeID != "" {
+		detail["node_id"] = nodeID
+	}
+	if runtimeInstanceID != "" {
+		detail["runtime_instance_id"] = runtimeInstanceID
+	}
+	if runtimeBindingID != "" {
+		detail["runtime_binding_id"] = runtimeBindingID
+	}
+	if manifestSummary := buildAgentManifestSummary(detail, task.Payload); len(manifestSummary) > 0 {
+		detail["manifest_summary"] = manifestSummary
+	}
+	if _, ok := detail["execution_path"]; !ok {
+		detail["execution_path"] = "agent"
+	}
+	return detail
+}
+
+func inferOverallStatusFromTaskStatus(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case string(model.TaskStatusSuccess):
+		return "ok"
+	case string(model.TaskStatusPending), string(model.TaskStatusDispatched), string(model.TaskStatusRunning):
+		return "running"
+	case string(model.TaskStatusFailed), string(model.TaskStatusTimeout), string(model.TaskStatusCanceled):
+		return "failed"
+	default:
+		return "unknown"
+	}
+}
+
+func buildAgentManifestSummary(detail map[string]interface{}, payload map[string]interface{}) map[string]interface{} {
+	out := map[string]interface{}{}
+	appendString := func(key string, values ...string) {
+		for _, value := range values {
+			value = strings.TrimSpace(value)
+			if value == "" {
+				continue
+			}
+			out[key] = value
+			return
+		}
+	}
+	appendString("manifest_id",
+		readStringFromObjectMap(detail, "manifest_id"),
+		readStringFromObjectMap(payload, "manifest_id"),
+		readStringFromNestedObjectMap(payload, "resolved_context", "manifest_id"),
+	)
+	appendString("manifest_version",
+		readStringFromObjectMap(detail, "manifest_version"),
+		readStringFromObjectMap(payload, "manifest_version"),
+		readStringFromNestedObjectMap(payload, "resolved_context", "manifest_version"),
+	)
+	appendString("runtime_kind",
+		readStringFromObjectMap(detail, "runtime_kind"),
+		readStringFromObjectMap(payload, "runtime_kind"),
+		readStringFromNestedObjectMap(payload, "resolved_context", "runtime_kind"),
+	)
+	appendString("template_type",
+		readStringFromObjectMap(detail, "template_type"),
+		readStringFromObjectMap(payload, "template_type"),
+		readStringFromNestedObjectMap(payload, "resolved_context", "template_type"),
+		readStringFromObjectMap(detail, "runtime_template_type"),
+		readStringFromObjectMap(payload, "runtime_template_type"),
+		readStringFromNestedObjectMap(payload, "resolved_context", "runtime_template_type"),
+	)
+	appendString("binding_mode",
+		readStringFromObjectMap(detail, "binding_mode"),
+		readStringFromObjectMap(payload, "binding_mode"),
+		readStringFromNestedObjectMap(payload, "resolved_context", "binding_mode"),
+	)
+
+	if value, ok := readBoolLike(detail["command_override_allowed"]); ok {
+		out["command_override_allowed"] = value
+	} else if value, ok := readBoolLike(payload["command_override_allowed"]); ok {
+		out["command_override_allowed"] = value
+	}
+	if value, ok := readBoolLike(detail["script_mount_allowed"]); ok {
+		out["script_mount_allowed"] = value
+	} else if value, ok := readBoolLike(payload["script_mount_allowed"]); ok {
+		out["script_mount_allowed"] = value
+	}
+
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func readBoolLike(raw interface{}) (bool, bool) {
+	switch value := raw.(type) {
+	case bool:
+		return value, true
+	case string:
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "1", "true", "yes", "on":
+			return true, true
+		case "0", "false", "no", "off":
+			return false, true
+		default:
+			return false, false
+		}
+	default:
+		text := strings.TrimSpace(fmt.Sprint(raw))
+		switch strings.ToLower(text) {
+		case "1", "true", "yes", "on":
+			return true, true
+		case "0", "false", "no", "off":
+			return false, true
+		default:
+			return false, false
+		}
+	}
 }
 
 func (s *TaskService) PullNextAgentTask(ctx context.Context, agentID string) (model.Task, bool, error) {
@@ -830,13 +1225,11 @@ func (s *TaskService) ReportAgentTask(ctx context.Context, agentID, taskID strin
 	if msg := strings.TrimSpace(report.Message); msg != "" {
 		task.Message = msg
 	}
+	incomingDetail := cloneObjectMap(task.Detail)
 	if report.Detail != nil {
-		task.Detail = report.Detail
+		incomingDetail = cloneObjectMap(report.Detail)
 	}
-	if task.Detail == nil {
-		task.Detail = map[string]interface{}{}
-	}
-	task.Detail["execution_path"] = "agent"
+	task.Detail = normalizeAgentTaskDetail(task, incomingDetail, report, now)
 	if errText := strings.TrimSpace(report.Error); errText != "" {
 		task.Error = errText
 	}
@@ -900,8 +1293,11 @@ func (s *TaskService) ReportAgentTask(ctx context.Context, agentID, taskID strin
 	}
 
 	if isSupportedAgentTaskType(task.Type) && s.modelSvc != nil {
-		if applyErr := s.modelSvc.ApplyAgentTaskObservation(ctx, task); applyErr != nil {
-			s.logger.Warn("apply model observation failed", "task_id", task.ID, "task_type", task.Type, "target_id", task.TargetID, "error", applyErr)
+		shouldApplyModelDirect := s.runtimeObjectSvc == nil || strings.TrimSpace(readTaskRuntimeInstanceID(task)) == ""
+		if shouldApplyModelDirect {
+			if applyErr := s.modelSvc.ApplyAgentTaskObservation(ctx, task); applyErr != nil {
+				s.logger.Warn("apply model observation failed", "task_id", task.ID, "task_type", task.Type, "target_id", task.TargetID, "error", applyErr)
+			}
 		}
 	}
 
@@ -1085,7 +1481,7 @@ func (s *TaskService) failTask(taskID string, status model.TaskStatus, message, 
 		task.Progress = 100
 		task.Message = firstNonEmpty(message, "任务执行失败")
 		task.Error = strings.TrimSpace(errText)
-		task.Detail = detail
+		task.Detail = mergeObjectMaps(task.Detail, detail)
 		if task.StartedAt.IsZero() {
 			task.StartedAt = now
 		}

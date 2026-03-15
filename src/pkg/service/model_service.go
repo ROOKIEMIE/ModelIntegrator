@@ -244,6 +244,7 @@ func (s *ModelService) ApplyAgentTaskObservation(ctx context.Context, task model
 	if task.Detail == nil {
 		task.Detail = map[string]interface{}{}
 	}
+	detailView := flattenAgentTaskDetail(task.Detail)
 	task.Detail["task_type"] = string(task.Type)
 	task.Detail["execution_path"] = "agent"
 	if s.runtimeSyncer != nil {
@@ -286,7 +287,7 @@ func (s *ModelService) ApplyAgentTaskObservation(ctx context.Context, task model
 		m.HealthMessage = firstNonEmpty(message, m.HealthMessage)
 	}
 
-	if observed := strings.TrimSpace(fmt.Sprint(task.Detail["observed_state"])); observed != "" && observed != "<nil>" {
+	if observed := strings.TrimSpace(fmt.Sprint(detailView["observed_state"])); observed != "" && observed != "<nil>" {
 		m.ObservedState = observed
 	}
 	if strings.TrimSpace(m.DesiredState) == "" {
@@ -296,6 +297,38 @@ func (s *ModelService) ApplyAgentTaskObservation(ctx context.Context, task model
 	applyDrift(&m)
 	s.modelRegistry.Upsert(m)
 	return s.persistModel(ctx, m)
+}
+
+// ApplyRuntimeInstanceProjection projects instance-first runtime state into Model view.
+// This keeps Model as asset-facing status, while RuntimeInstance remains runtime-truth.
+func (s *ModelService) ApplyRuntimeInstanceProjection(ctx context.Context, instance model.RuntimeInstance) error {
+	modelID := strings.TrimSpace(instance.ModelID)
+	if modelID == "" {
+		return nil
+	}
+	m, ok := s.modelRegistry.Get(modelID)
+	if !ok {
+		return ErrModelNotFound
+	}
+	now := time.Now().UTC()
+	applyModelRuntimeProjectionFromInstance(&m, instance, model.Task{Message: instance.HealthMessage}, now, s.scheduler)
+	if strings.TrimSpace(instance.DesiredState) != "" {
+		m.DesiredState = strings.TrimSpace(instance.DesiredState)
+	}
+	if m.Metadata == nil {
+		m.Metadata = map[string]string{}
+	}
+	if strings.TrimSpace(instance.DriftReason) != "" {
+		m.Metadata["runtime_instance_drift_reason"] = strings.TrimSpace(instance.DriftReason)
+	}
+	if !instance.LastReconciledAt.IsZero() {
+		m.LastReconciledAt = instance.LastReconciledAt.UTC()
+	}
+	s.modelRegistry.Upsert(m)
+	if s.store != nil {
+		return s.store.UpsertModel(ctx, m)
+	}
+	return nil
 }
 
 func applyModelRuntimeProjectionFromInstance(
@@ -1097,7 +1130,13 @@ func (s *ModelService) checkRuntimeReadiness(ctx context.Context, item model.Mod
 		ready, msg, detail, used, err := s.taskSvc.TryRunRuntimePrecheckViaAgent(ctx, item)
 		if used {
 			if err != nil {
-				s.logger.Warn("agent runtime precheck 失败，回退 controller 本地检查", "model_id", item.ID, "node_id", item.HostNodeID, "error", err)
+				s.logger.Warn("agent runtime precheck 失败，回退 controller 本地检查",
+					"model_id", item.ID,
+					"node_id", item.HostNodeID,
+					"error", err,
+					"fallback", "controller_self_check",
+					"self_check", true,
+					"compatibility_path", "controller_direct_fallback")
 			} else {
 				if resolved := strings.TrimSpace(fmt.Sprint(detail["runtime_service_endpoint"])); resolved != "" && resolved != "<nil>" {
 					endpoint = resolved

@@ -247,13 +247,15 @@ func pollAndExecuteTask(ctx context.Context, client *http.Client, cfg agentConfi
 	}
 
 	success, message, detail, errText := executeAgentTask(ctx, client, cfg, task)
+	finishedAt := time.Now().UTC()
+	detail = normalizeTaskResultEnvelope(task, detail, success, message, startedAt, finishedAt)
 	report := agentTaskReport{
 		Progress:   100,
 		Message:    message,
 		Detail:     detail,
 		Error:      errText,
 		StartedAt:  startedAt,
-		FinishedAt: time.Now().UTC(),
+		FinishedAt: finishedAt,
 	}
 	if success {
 		report.Status = model.TaskStatusSuccess
@@ -274,11 +276,14 @@ type resolvedAgentTaskContext struct {
 	RuntimeBindingID   string
 	RuntimeTemplateID  string
 	ManifestID         string
+	ManifestVersion    string
 	NodeID             string
 	ModelID            string
 	BindingMode        string
 	RuntimeKind        string
 	TemplateType       string
+	ModelType          string
+	ModelFormat        string
 	Endpoint           string
 	HealthPath         string
 	ModelPath          string
@@ -288,6 +293,13 @@ type resolvedAgentTaskContext struct {
 	RequiredEnv        []string
 	OptionalEnv        []string
 	MountPoints        []string
+	CommandOverride    []string
+	BindingMountRules  []string
+	BindingEnvOverride map[string]string
+	SupportedModelType []string
+	SupportedFormats   []string
+	CommandOverrideOK  *bool
+	ScriptMountOK      *bool
 	Metadata           map[string]string
 }
 
@@ -304,11 +316,14 @@ func (c resolvedAgentTaskContext) toPayloadMap() map[string]interface{} {
 	appendString("runtime_binding_id", c.RuntimeBindingID)
 	appendString("runtime_template_id", c.RuntimeTemplateID)
 	appendString("manifest_id", c.ManifestID)
+	appendString("manifest_version", c.ManifestVersion)
 	appendString("node_id", c.NodeID)
 	appendString("model_id", c.ModelID)
 	appendString("binding_mode", c.BindingMode)
 	appendString("runtime_kind", c.RuntimeKind)
 	appendString("template_type", c.TemplateType)
+	appendString("model_type", c.ModelType)
+	appendString("model_format", c.ModelFormat)
 	appendString("endpoint", c.Endpoint)
 	appendString("health_path", c.HealthPath)
 	appendString("model_path", c.ModelPath)
@@ -325,6 +340,37 @@ func (c resolvedAgentTaskContext) toPayloadMap() map[string]interface{} {
 	}
 	if len(c.MountPoints) > 0 {
 		out["mount_points"] = append([]string(nil), c.MountPoints...)
+	}
+	if len(c.CommandOverride) > 0 {
+		out["command_override"] = append([]string(nil), c.CommandOverride...)
+	}
+	if len(c.BindingMountRules) > 0 {
+		out["binding_mount_rules"] = append([]string(nil), c.BindingMountRules...)
+	}
+	if len(c.BindingEnvOverride) > 0 {
+		bindingEnv := map[string]string{}
+		for k, v := range c.BindingEnvOverride {
+			key := strings.TrimSpace(k)
+			if key == "" {
+				continue
+			}
+			bindingEnv[key] = strings.TrimSpace(v)
+		}
+		if len(bindingEnv) > 0 {
+			out["binding_env_overrides"] = bindingEnv
+		}
+	}
+	if len(c.SupportedModelType) > 0 {
+		out["supported_model_types"] = append([]string(nil), c.SupportedModelType...)
+	}
+	if len(c.SupportedFormats) > 0 {
+		out["supported_formats"] = append([]string(nil), c.SupportedFormats...)
+	}
+	if c.CommandOverrideOK != nil {
+		out["command_override_allowed"] = *c.CommandOverrideOK
+	}
+	if c.ScriptMountOK != nil {
+		out["script_mount_allowed"] = *c.ScriptMountOK
 	}
 	if len(c.Metadata) > 0 {
 		meta := map[string]string{}
@@ -359,11 +405,14 @@ func resolveAgentTaskContext(task model.Task) (resolvedAgentTaskContext, *model.
 	ctx.RuntimeBindingID = get("runtime_binding_id")
 	ctx.RuntimeTemplateID = get("runtime_template_id")
 	ctx.ManifestID = get("manifest_id")
+	ctx.ManifestVersion = get("manifest_version")
 	ctx.NodeID = get("node_id")
 	ctx.ModelID = get("model_id")
 	ctx.BindingMode = get("binding_mode")
 	ctx.RuntimeKind = get("runtime_kind")
 	ctx.TemplateType = firstNonEmpty(get("template_type"), get("runtime_template_type"))
+	ctx.ModelType = get("model_type")
+	ctx.ModelFormat = get("model_format")
 	ctx.Endpoint = get("endpoint")
 	ctx.HealthPath = get("health_path")
 	ctx.ModelPath = firstNonEmpty(get("model_path"), get("path"))
@@ -385,6 +434,38 @@ func resolveAgentTaskContext(task model.Task) (resolvedAgentTaskContext, *model.
 		stringSliceValue(task.Payload, "mount_points"),
 		stringSliceValueFromNested(task.Payload, "resolved_context", "mount_points"),
 	)
+	ctx.CommandOverride = firstNonEmptyStringSlice(
+		stringSliceValue(task.Payload, "command_override"),
+		stringSliceValueFromNested(task.Payload, "resolved_context", "command_override"),
+	)
+	ctx.BindingMountRules = firstNonEmptyStringSlice(
+		stringSliceValue(task.Payload, "binding_mount_rules"),
+		stringSliceValueFromNested(task.Payload, "resolved_context", "binding_mount_rules"),
+	)
+	ctx.BindingEnvOverride = firstNonEmptyStringMap(
+		stringMapFromValue(task.Payload["binding_env_overrides"]),
+		stringMapFromValue(nestedMapValue(task.Payload, "resolved_context")["binding_env_overrides"]),
+	)
+	ctx.SupportedModelType = firstNonEmptyStringSlice(
+		stringSliceValue(task.Payload, "supported_model_types"),
+		stringSliceValueFromNested(task.Payload, "resolved_context", "supported_model_types"),
+	)
+	ctx.SupportedFormats = firstNonEmptyStringSlice(
+		stringSliceValue(task.Payload, "supported_formats"),
+		stringSliceValueFromNested(task.Payload, "resolved_context", "supported_formats"),
+	)
+	if value, ok := boolValueFromPayload(task.Payload, "command_override_allowed"); ok {
+		ctx.CommandOverrideOK = &value
+	}
+	if value, ok := boolValueFromNested(task.Payload, "resolved_context", "command_override_allowed"); ok {
+		ctx.CommandOverrideOK = &value
+	}
+	if value, ok := boolValueFromPayload(task.Payload, "script_mount_allowed"); ok {
+		ctx.ScriptMountOK = &value
+	}
+	if value, ok := boolValueFromNested(task.Payload, "resolved_context", "script_mount_allowed"); ok {
+		ctx.ScriptMountOK = &value
+	}
 	ctx.Metadata = stringMapFromValue(task.Payload["metadata"])
 	if len(ctx.Metadata) == 0 {
 		if nested := nestedMapValue(task.Payload, "resolved_context"); nested != nil {
@@ -450,6 +531,105 @@ func ensureContextDetail(detail map[string]interface{}, ctx resolvedAgentTaskCon
 	}
 	detail["task_context"] = ctx.toPayloadMap()
 	return detail
+}
+
+func normalizeTaskResultEnvelope(task model.Task, rawDetail map[string]interface{}, success bool, message string, startedAt, finishedAt time.Time) map[string]interface{} {
+	detail := cloneInterfaceMap(rawDetail)
+	if detail == nil {
+		detail = map[string]interface{}{}
+	}
+	rawSnapshot := cloneInterfaceMap(detail)
+	for _, key := range []string{
+		"task_type", "overall_status", "message", "detail", "structured_result",
+		"started_at", "finished_at", "node_id", "runtime_instance_id", "runtime_binding_id",
+		"manifest_summary", "execution_path",
+	} {
+		delete(rawSnapshot, key)
+	}
+
+	overall := strings.TrimSpace(stringValue(detail, "overall_status"))
+	if overall == "" {
+		if success {
+			overall = "ok"
+		} else {
+			overall = "failed"
+		}
+	}
+	if !success && overall == "ok" {
+		overall = "failed"
+	}
+
+	structuredResult := mapFromAny(detail["structured_result"])
+	if len(structuredResult) == 0 {
+		structuredResult = cloneInterfaceMap(rawSnapshot)
+	}
+	if len(structuredResult) == 0 {
+		structuredResult = map[string]interface{}{"success": success}
+	}
+
+	nodeID := resolveTaskContextField(task, detail, "node_id")
+	runtimeInstanceID := resolveTaskContextField(task, detail, "runtime_instance_id")
+	runtimeBindingID := resolveTaskContextField(task, detail, "runtime_binding_id")
+	manifestSummary := buildTaskManifestSummary(task, detail)
+
+	detail["task_type"] = string(task.Type)
+	detail["overall_status"] = overall
+	detail["message"] = firstNonEmpty(strings.TrimSpace(message), strings.TrimSpace(stringValue(detail, "message")))
+	detail["detail"] = rawSnapshot
+	detail["structured_result"] = structuredResult
+	detail["started_at"] = startedAt.UTC().Format(time.RFC3339Nano)
+	detail["finished_at"] = finishedAt.UTC().Format(time.RFC3339Nano)
+	if nodeID != "" {
+		detail["node_id"] = nodeID
+	}
+	if runtimeInstanceID != "" {
+		detail["runtime_instance_id"] = runtimeInstanceID
+	}
+	if runtimeBindingID != "" {
+		detail["runtime_binding_id"] = runtimeBindingID
+	}
+	if len(manifestSummary) > 0 {
+		detail["manifest_summary"] = manifestSummary
+	}
+	detail["execution_path"] = "agent"
+	return detail
+}
+
+func resolveTaskContextField(task model.Task, detail map[string]interface{}, key string) string {
+	return strings.TrimSpace(firstNonEmpty(
+		stringValue(detail, key),
+		stringValue(task.Payload, key),
+		stringValueFromNestedMap(task.Payload, "resolved_context", key),
+	))
+}
+
+func buildTaskManifestSummary(task model.Task, detail map[string]interface{}) map[string]interface{} {
+	summary := map[string]interface{}{}
+	appendString := func(key, value string) {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			summary[key] = value
+		}
+	}
+	appendString("manifest_id", resolveTaskContextField(task, detail, "manifest_id"))
+	appendString("manifest_version", resolveTaskContextField(task, detail, "manifest_version"))
+	appendString("runtime_kind", resolveTaskContextField(task, detail, "runtime_kind"))
+	appendString("template_type", firstNonEmpty(
+		resolveTaskContextField(task, detail, "template_type"),
+		resolveTaskContextField(task, detail, "runtime_template_type"),
+	))
+	appendString("binding_mode", resolveTaskContextField(task, detail, "binding_mode"))
+
+	if value, ok := boolValueFromDetailOrPayload(detail, task.Payload, "command_override_allowed"); ok {
+		summary["command_override_allowed"] = value
+	}
+	if value, ok := boolValueFromDetailOrPayload(detail, task.Payload, "script_mount_allowed"); ok {
+		summary["script_mount_allowed"] = value
+	}
+	if len(summary) == 0 {
+		return nil
+	}
+	return summary
 }
 
 func executeAgentTask(ctx context.Context, client *http.Client, cfg agentConfig, task model.Task) (bool, string, map[string]interface{}, string) {
@@ -761,91 +941,418 @@ func executeDockerStopContainerTask(ctx context.Context, task model.Task) (bool,
 }
 
 func executeRuntimePrecheckTask(ctx context.Context, client *http.Client, cfg agentConfig, task model.Task) (bool, string, map[string]interface{}, string) {
+	resolvedCtx, _ := resolveAgentTaskContext(task)
+	startedAt := time.Now().UTC()
 	detail := map[string]interface{}{
 		"task_type":           string(task.Type),
 		"execution_path":      "agent",
 		"precheck_target":     "runtime",
-		"runtime_instance_id": strings.TrimSpace(stringValue(task.Payload, "runtime_instance_id")),
-		"runtime_binding_id":  strings.TrimSpace(stringValue(task.Payload, "runtime_binding_id")),
-		"runtime_template_id": strings.TrimSpace(stringValue(task.Payload, "runtime_template_id")),
-		"manifest_id":         strings.TrimSpace(stringValue(task.Payload, "manifest_id")),
-		"binding_mode":        strings.TrimSpace(stringValue(task.Payload, "binding_mode")),
-		"runtime_kind":        strings.TrimSpace(stringValue(task.Payload, "runtime_kind")),
-		"template_type":       strings.TrimSpace(firstNonEmpty(stringValue(task.Payload, "template_type"), stringValue(task.Payload, "runtime_template_type"))),
-	}
-	failures := make([]string, 0, 4)
-	requiredEnv := stringSliceValue(task.Payload, "required_env")
-	optionalEnv := stringSliceValue(task.Payload, "optional_env")
-	exposedPorts := stringSliceValue(task.Payload, "exposed_ports")
-	if len(requiredEnv) > 0 {
-		detail["required_env"] = requiredEnv
-	}
-	if len(optionalEnv) > 0 {
-		detail["optional_env"] = optionalEnv
-	}
-	if len(exposedPorts) > 0 {
-		detail["exposed_ports"] = exposedPorts
+		"runtime_instance_id": strings.TrimSpace(resolvedCtx.RuntimeInstanceID),
+		"runtime_binding_id":  strings.TrimSpace(resolvedCtx.RuntimeBindingID),
+		"runtime_template_id": strings.TrimSpace(resolvedCtx.RuntimeTemplateID),
+		"manifest_id":         strings.TrimSpace(resolvedCtx.ManifestID),
+		"binding_mode":        strings.TrimSpace(resolvedCtx.BindingMode),
+		"runtime_kind":        strings.TrimSpace(resolvedCtx.RuntimeKind),
+		"template_type":       strings.TrimSpace(resolvedCtx.TemplateType),
+		"manifest_version":    strings.TrimSpace(resolvedCtx.ManifestVersion),
 	}
 
-	endpoint := strings.TrimSpace(stringValue(task.Payload, "endpoint"))
-	modelID := strings.TrimSpace(stringValue(task.Payload, "model_id"))
-	if endpoint == "" && modelID != "" {
-		if resolved, err := fetchModelEndpoint(ctx, client, cfg, modelID); err == nil {
-			endpoint = resolved
-		}
+	precheck := model.RuntimePrecheckResult{
+		OverallStatus: model.PrecheckStatusOK,
+		Gating:        false,
+		StartedAt:     startedAt,
+		ResolvedEnv:   map[string]string{},
+		CompatibilityResult: model.RuntimePrecheckCompatibilityResult{
+			ModelType:           strings.TrimSpace(resolvedCtx.ModelType),
+			ModelFormat:         strings.TrimSpace(resolvedCtx.ModelFormat),
+			SupportedModelTypes: normalizeStringSlice(resolvedCtx.SupportedModelType),
+			SupportedFormats:    normalizeStringSlice(resolvedCtx.SupportedFormats),
+			ModelTypeMatched:    true,
+			ModelFormatMatched:  true,
+		},
 	}
-	timeout := time.Duration(intValue(task.Payload, "timeout_seconds", 3)) * time.Second
-	healthPath := strings.TrimSpace(stringValue(task.Payload, "health_path"))
-	if healthPath == "" {
-		healthPath = "/health"
+	if resolvedCtx.CommandOverrideOK != nil {
+		allowed := *resolvedCtx.CommandOverrideOK
+		precheck.CompatibilityResult.CommandOverrideAllowed = &allowed
+	}
+	if resolvedCtx.ScriptMountOK != nil {
+		allowed := *resolvedCtx.ScriptMountOK
+		precheck.CompatibilityResult.ScriptMountAllowed = &allowed
 	}
 
-	if endpoint != "" {
-		portOpen, portDetail, err := checkEndpointPort(endpoint, timeout)
-		detail["port_check"] = portDetail
-		if err != nil || !portOpen {
-			failures = append(failures, "port_check_failed")
+	updateStatus := func(status model.PrecheckCheckStatus, blocking bool) {
+		switch status {
+		case model.PrecheckCheckFailed:
+			if blocking {
+				precheck.Gating = true
+				precheck.OverallStatus = model.PrecheckStatusFailed
+			} else if precheck.OverallStatus != model.PrecheckStatusFailed {
+				precheck.OverallStatus = model.PrecheckStatusWarning
+			}
+		case model.PrecheckCheckWarning:
+			if precheck.OverallStatus == model.PrecheckStatusOK {
+				precheck.OverallStatus = model.PrecheckStatusWarning
+			}
 		}
-		ready, readyDetail, err := checkEndpointReadiness(endpoint, healthPath, timeout)
-		detail["runtime_readiness"] = readyDetail
-		detail["runtime_ready"] = ready
-		if err != nil || !ready {
-			failures = append(failures, "runtime_readiness_failed")
+	}
+	addCheck := func(name string, status model.PrecheckCheckStatus, blocking bool, message string, checkDetail map[string]interface{}) {
+		precheck.Checks = append(precheck.Checks, model.RuntimePrecheckCheckResult{
+			Name:     strings.TrimSpace(name),
+			Status:   status,
+			Blocking: blocking,
+			Message:  strings.TrimSpace(message),
+			Detail:   cloneInterfaceMap(checkDetail),
+		})
+		updateStatus(status, blocking)
+	}
+	addReason := func(code model.PrecheckReasonCode, blocking bool, message string, reasonDetail map[string]interface{}) {
+		precheck.Reasons = append(precheck.Reasons, model.RuntimePrecheckReason{
+			Code:     code,
+			Message:  strings.TrimSpace(message),
+			Blocking: blocking,
+			Detail:   cloneInterfaceMap(reasonDetail),
+		})
+		if blocking {
+			precheck.Gating = true
+			precheck.OverallStatus = model.PrecheckStatusFailed
+		} else if precheck.OverallStatus == model.PrecheckStatusOK {
+			precheck.OverallStatus = model.PrecheckStatusWarning
+		}
+	}
+
+	modelPathTask := task
+	modelPathTask.Payload = cloneInterfaceMap(task.Payload)
+	if strings.TrimSpace(stringValue(modelPathTask.Payload, "model_path")) == "" && strings.TrimSpace(resolvedCtx.ModelPath) != "" {
+		modelPathTask.Payload["model_path"] = strings.TrimSpace(resolvedCtx.ModelPath)
+	}
+	pathOK, _, pathDetail, pathErrText := executeModelPathCheckTask(modelPathTask)
+	detail["model_path_check"] = cloneInterfaceMap(pathDetail)
+	if pathOK {
+		addCheck("model_path_exists", model.PrecheckCheckPass, true, "model path exists", pathDetail)
+		if absPath := strings.TrimSpace(stringValue(pathDetail, "abs_path")); absPath != "" {
+			precheck.ResolvedMounts = appendUniqueNormalized(precheck.ResolvedMounts, absPath)
 		}
 	} else {
-		detail["runtime_ready"] = false
-		failures = append(failures, "endpoint_missing")
+		addCheck("model_path_exists", model.PrecheckCheckFailed, true, firstNonEmpty(pathErrText, "model path missing"), pathDetail)
+		addReason(model.PrecheckReasonModelPathMissing, true, firstNonEmpty(pathErrText, "model path missing"), pathDetail)
 	}
 
-	modelPath := strings.TrimSpace(firstNonEmpty(
-		stringValue(task.Payload, "model_path"),
-		stringValue(task.Payload, "path"),
-	))
-	if modelPath != "" {
-		exists, pathDetail, err := checkModelPathExists(modelPath)
-		detail["model_path_check"] = pathDetail
-		if err != nil || !exists {
-			failures = append(failures, "model_path_check_failed")
+	bindingMountRules := normalizeStringSlice(resolvedCtx.BindingMountRules)
+	if len(bindingMountRules) == 0 {
+		bindingMountRules = normalizeStringSlice(stringSliceValue(task.Payload, "binding_mount_rules"))
+	}
+	manifestMounts := normalizeStringSlice(resolvedCtx.MountPoints)
+	if len(manifestMounts) == 0 {
+		manifestMounts = normalizeStringSlice(stringSliceValue(task.Payload, "mount_points"))
+	}
+	mountDetail := map[string]interface{}{
+		"binding_mount_rules": bindingMountRules,
+		"manifest_mounts":     manifestMounts,
+	}
+	missingMountHosts := make([]string, 0)
+	invalidMountRules := make([]string, 0)
+	for _, rule := range bindingMountRules {
+		hostPath, containerPath := parseMountRule(rule)
+		precheck.ResolvedMounts = appendUniqueNormalized(precheck.ResolvedMounts, rule)
+		if hostPath != "" {
+			if _, err := os.Stat(hostPath); err != nil {
+				if os.IsNotExist(err) {
+					missingMountHosts = append(missingMountHosts, hostPath)
+				} else {
+					missingMountHosts = append(missingMountHosts, hostPath+" ("+err.Error()+")")
+				}
+			}
 		}
+		if len(manifestMounts) > 0 && containerPath != "" && !isPathAllowedByMountPoints(containerPath, manifestMounts) {
+			invalidMountRules = append(invalidMountRules, rule)
+		}
+	}
+	if len(bindingMountRules) == 0 {
+		if len(manifestMounts) > 0 {
+			addCheck("binding_mount_rules", model.PrecheckCheckWarning, false, "binding mount rules empty; using template/manifest defaults", mountDetail)
+		} else {
+			addCheck("binding_mount_rules", model.PrecheckCheckPass, false, "no mount rules required", mountDetail)
+		}
+	} else if len(missingMountHosts) == 0 && len(invalidMountRules) == 0 {
+		addCheck("binding_mount_rules", model.PrecheckCheckPass, true, "binding mount rules verified", mountDetail)
+	} else {
+		mountDetail["missing_host_paths"] = missingMountHosts
+		mountDetail["invalid_mount_rules"] = invalidMountRules
+		addCheck("binding_mount_rules", model.PrecheckCheckFailed, true, "binding mount rules invalid", mountDetail)
+		addReason(model.PrecheckReasonBindingInvalid, true, "binding mount rules invalid", mountDetail)
+	}
+
+	requiredEnv := normalizeStringSlice(resolvedCtx.RequiredEnv)
+	if len(requiredEnv) == 0 {
+		requiredEnv = normalizeStringSlice(stringSliceValue(task.Payload, "required_env"))
+	}
+	optionalEnv := normalizeStringSlice(resolvedCtx.OptionalEnv)
+	if len(optionalEnv) == 0 {
+		optionalEnv = normalizeStringSlice(stringSliceValue(task.Payload, "optional_env"))
+	}
+	envOverride := firstNonEmptyStringMap(
+		resolvedCtx.BindingEnvOverride,
+		stringMapFromValue(task.Payload["binding_env_overrides"]),
+		stringMapFromValue(stringValueMapFromNested(task.Payload, "resolved_context", "binding_env_overrides")),
+	)
+	missingRequiredEnv := make([]string, 0)
+	for _, key := range requiredEnv {
+		if value := strings.TrimSpace(envOverride[key]); value != "" {
+			precheck.ResolvedEnv[key] = value
+			continue
+		}
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			precheck.ResolvedEnv[key] = value
+			continue
+		}
+		missingRequiredEnv = append(missingRequiredEnv, key)
+	}
+	for _, key := range optionalEnv {
+		if value := strings.TrimSpace(envOverride[key]); value != "" {
+			precheck.ResolvedEnv[key] = value
+			continue
+		}
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			precheck.ResolvedEnv[key] = value
+		}
+	}
+	envDetail := map[string]interface{}{
+		"required_env":          requiredEnv,
+		"optional_env":          optionalEnv,
+		"binding_env_overrides": envOverride,
+		"missing_required_env":  missingRequiredEnv,
+	}
+	if len(missingRequiredEnv) > 0 {
+		addCheck("required_env", model.PrecheckCheckFailed, true, "required env missing", envDetail)
+		addReason(model.PrecheckReasonRequiredEnvMissing, true, "required env missing", envDetail)
+	} else {
+		addCheck("required_env", model.PrecheckCheckPass, true, "required env satisfied", envDetail)
+	}
+
+	scriptRef := strings.TrimSpace(firstNonEmpty(resolvedCtx.ScriptRef, stringValue(task.Payload, "script_ref")))
+	scriptRequired := strings.EqualFold(strings.TrimSpace(resolvedCtx.BindingMode), string(model.RuntimeBindingModeGenericWithScript)) || scriptRef != ""
+	scriptDetail := map[string]interface{}{
+		"binding_mode":    strings.TrimSpace(resolvedCtx.BindingMode),
+		"script_ref":      scriptRef,
+		"script_required": scriptRequired,
+	}
+	if scriptRequired {
+		if scriptRef == "" {
+			addCheck("script_ref", model.PrecheckCheckFailed, true, "script_ref is required", scriptDetail)
+			addReason(model.PrecheckReasonScriptMissing, true, "script_ref is required", scriptDetail)
+		} else if info, err := os.Stat(scriptRef); err != nil {
+			scriptDetail["error"] = err.Error()
+			addCheck("script_ref", model.PrecheckCheckFailed, true, "script file missing", scriptDetail)
+			addReason(model.PrecheckReasonScriptMissing, true, "script file missing", scriptDetail)
+		} else {
+			scriptDetail["size"] = info.Size()
+			precheck.ResolvedScript = scriptRef
+			addCheck("script_ref", model.PrecheckCheckPass, true, "script file exists", scriptDetail)
+		}
+	} else {
+		addCheck("script_ref", model.PrecheckCheckSkipped, false, "script not required", scriptDetail)
+	}
+
+	commandOverride := normalizeStringSlice(resolvedCtx.CommandOverride)
+	if len(commandOverride) == 0 {
+		commandOverride = normalizeStringSlice(stringSliceValue(task.Payload, "command_override"))
+	}
+	commandOverrideAllowed := true
+	hasCommandOverrideAllowed := false
+	if resolvedCtx.CommandOverrideOK != nil {
+		commandOverrideAllowed = *resolvedCtx.CommandOverrideOK
+		hasCommandOverrideAllowed = true
+	} else if value, ok := boolValueFromPayload(task.Payload, "command_override_allowed"); ok {
+		commandOverrideAllowed = value
+		hasCommandOverrideAllowed = true
+	}
+	commandOverrideDetail := map[string]interface{}{
+		"command_override":         commandOverride,
+		"command_override_allowed": commandOverrideAllowed,
+	}
+	if hasCommandOverrideAllowed && !commandOverrideAllowed && len(commandOverride) > 0 {
+		addCheck("command_override_policy", model.PrecheckCheckFailed, true, "command override not allowed by manifest", commandOverrideDetail)
+		addReason(model.PrecheckReasonCommandOverrideNotAllowed, true, "command override not allowed by manifest", commandOverrideDetail)
+	} else {
+		addCheck("command_override_policy", model.PrecheckCheckPass, true, "command override policy satisfied", commandOverrideDetail)
+	}
+
+	scriptMountAllowed := true
+	hasScriptMountAllowed := false
+	if resolvedCtx.ScriptMountOK != nil {
+		scriptMountAllowed = *resolvedCtx.ScriptMountOK
+		hasScriptMountAllowed = true
+	} else if value, ok := boolValueFromPayload(task.Payload, "script_mount_allowed"); ok {
+		scriptMountAllowed = value
+		hasScriptMountAllowed = true
+	}
+	scriptMountDetail := map[string]interface{}{
+		"script_mount_allowed": scriptMountAllowed,
+		"script_required":      scriptRequired,
+		"script_ref":           scriptRef,
+	}
+	if hasScriptMountAllowed && !scriptMountAllowed && scriptRequired {
+		addCheck("script_mount_policy", model.PrecheckCheckFailed, true, "script mount not allowed by manifest", scriptMountDetail)
+		addReason(model.PrecheckReasonScriptMountNotAllowed, true, "script mount not allowed by manifest", scriptMountDetail)
+	} else {
+		addCheck("script_mount_policy", model.PrecheckCheckPass, true, "script mount policy satisfied", scriptMountDetail)
+	}
+
+	modelType := strings.TrimSpace(resolvedCtx.ModelType)
+	modelFormat := strings.TrimSpace(resolvedCtx.ModelFormat)
+	supportedModelTypes := normalizeStringSlice(resolvedCtx.SupportedModelType)
+	supportedFormats := normalizeStringSlice(resolvedCtx.SupportedFormats)
+	precheck.CompatibilityResult.ModelType = modelType
+	precheck.CompatibilityResult.ModelFormat = modelFormat
+	precheck.CompatibilityResult.SupportedModelTypes = supportedModelTypes
+	precheck.CompatibilityResult.SupportedFormats = supportedFormats
+
+	typeCompatible := true
+	formatCompatible := true
+	if len(supportedModelTypes) > 0 {
+		typeCompatible = containsFolded(supportedModelTypes, modelType) || containsFolded(supportedModelTypes, string(model.ModelKindUnknown))
+		if modelType == "" {
+			typeCompatible = false
+		}
+	}
+	if len(supportedFormats) > 0 {
+		formatCompatible = containsFolded(supportedFormats, modelFormat) || containsFolded(supportedFormats, string(model.ModelFormatUnknown))
+		if modelFormat == "" {
+			formatCompatible = false
+		}
+	}
+	precheck.CompatibilityResult.ModelTypeMatched = typeCompatible
+	precheck.CompatibilityResult.ModelFormatMatched = formatCompatible
+	compatDetail := map[string]interface{}{
+		"model_type":            modelType,
+		"model_format":          modelFormat,
+		"supported_model_types": supportedModelTypes,
+		"supported_formats":     supportedFormats,
+	}
+	if !typeCompatible {
+		addCheck("model_type_compatibility", model.PrecheckCheckFailed, true, "model type incompatible with manifest", compatDetail)
+		addReason(model.PrecheckReasonModelTypeMismatch, true, "model type incompatible with manifest", compatDetail)
+	} else {
+		addCheck("model_type_compatibility", model.PrecheckCheckPass, true, "model type compatible", compatDetail)
+	}
+	if !formatCompatible {
+		addCheck("model_format_compatibility", model.PrecheckCheckFailed, true, "model format incompatible with manifest", compatDetail)
+		addReason(model.PrecheckReasonModelFormatMismatch, true, "model format incompatible with manifest", compatDetail)
+	} else {
+		addCheck("model_format_compatibility", model.PrecheckCheckPass, true, "model format compatible", compatDetail)
 	}
 
 	containerID := strings.TrimSpace(firstNonEmpty(
+		resolvedCtx.RuntimeContainerID,
 		stringValue(task.Payload, "runtime_container_id"),
 		stringValue(task.Payload, "container_id"),
 		stringValue(task.Payload, "container"),
 	))
+	runtimeRunning := false
 	if containerID != "" {
 		exists, running, inspectDetail, err := inspectDockerContainer(ctx, containerID)
-		detail["docker_inspect"] = inspectDetail
+		detail["docker_inspect"] = cloneInterfaceMap(inspectDetail)
 		detail["runtime_exists"] = exists
 		detail["runtime_running"] = running
+		runtimeRunning = exists && running
 		if err != nil {
-			failures = append(failures, "docker_inspect_failed")
-		} else if !exists {
-			failures = append(failures, "runtime_container_missing")
-		} else if !running {
-			failures = append(failures, "runtime_container_not_running")
+			addCheck("runtime_container_inspect", model.PrecheckCheckWarning, false, "docker inspect failed", inspectDetail)
+		} else if exists && running {
+			addCheck("runtime_container_inspect", model.PrecheckCheckPass, false, "runtime container is running", inspectDetail)
+		} else if exists {
+			addCheck("runtime_container_inspect", model.PrecheckCheckWarning, false, "runtime container exists but not running", inspectDetail)
+		} else {
+			addCheck("runtime_container_inspect", model.PrecheckCheckWarning, false, "runtime container missing", inspectDetail)
 		}
+	}
+
+	endpoint := strings.TrimSpace(firstNonEmpty(resolvedCtx.Endpoint, stringValue(task.Payload, "endpoint")))
+	modelID := strings.TrimSpace(firstNonEmpty(resolvedCtx.ModelID, stringValue(task.Payload, "model_id")))
+	if endpoint == "" && modelID != "" {
+		if resolved, err := fetchModelEndpoint(ctx, client, cfg, modelID); err == nil {
+			endpoint = strings.TrimSpace(resolved)
+		}
+	}
+	if endpoint != "" {
+		portTask := task
+		portTask.Payload = cloneInterfaceMap(task.Payload)
+		portTask.Payload["endpoint"] = endpoint
+		portOpen, _, portDetail, portErrText := executePortCheckTask(portTask)
+		detail["port_check"] = cloneInterfaceMap(portDetail)
+		if portOpen {
+			addCheck("runtime_endpoint_port_check", model.PrecheckCheckPass, false, "runtime endpoint tcp reachable", portDetail)
+		} else {
+			addCheck("runtime_endpoint_port_check", model.PrecheckCheckWarning, false, firstNonEmpty(portErrText, "runtime endpoint tcp unreachable"), portDetail)
+		}
+	}
+
+	exposedPorts := normalizeStringSlice(resolvedCtx.ExposedPorts)
+	if len(exposedPorts) == 0 {
+		exposedPorts = normalizeStringSlice(stringSliceValue(task.Payload, "exposed_ports"))
+	}
+	precheck.ResolvedPorts = normalizePortCandidates(resolveHostPorts(exposedPorts, endpoint))
+	conflictingPorts := make([]string, 0)
+	inUseByRuntime := make([]string, 0)
+	for _, hostPort := range precheck.ResolvedPorts {
+		inUse, checkDetail := checkLocalPortInUse(hostPort)
+		if !inUse {
+			continue
+		}
+		if runtimeRunning && endpointHostPort(endpoint) == hostPort {
+			inUseByRuntime = append(inUseByRuntime, hostPort)
+			continue
+		}
+		conflictingPorts = append(conflictingPorts, hostPort)
+		_ = checkDetail
+	}
+	portConflictDetail := map[string]interface{}{
+		"manifest_exposed_ports": exposedPorts,
+		"resolved_host_ports":    precheck.ResolvedPorts,
+		"conflicting_ports":      conflictingPorts,
+		"in_use_by_runtime":      inUseByRuntime,
+	}
+	if len(conflictingPorts) > 0 {
+		addCheck("manifest_port_conflicts", model.PrecheckCheckFailed, true, "manifest exposed ports conflict", portConflictDetail)
+		addReason(model.PrecheckReasonPortConflict, true, "manifest exposed ports conflict", portConflictDetail)
+	} else {
+		addCheck("manifest_port_conflicts", model.PrecheckCheckPass, true, "manifest exposed ports available", portConflictDetail)
+	}
+
+	if strings.EqualFold(strings.TrimSpace(resolvedCtx.BindingMode), string(model.RuntimeBindingModeCustomBundle)) {
+		customBundleDetail := map[string]interface{}{
+			"binding_mode":     resolvedCtx.BindingMode,
+			"manifest_id":      resolvedCtx.ManifestID,
+			"manifest_version": resolvedCtx.ManifestVersion,
+			"runtime_kind":     resolvedCtx.RuntimeKind,
+			"template_type":    resolvedCtx.TemplateType,
+			"required_env":     requiredEnv,
+			"manifest_mounts":  manifestMounts,
+			"manifest_ports":   exposedPorts,
+			"command_override": commandOverride,
+			"script_ref":       scriptRef,
+		}
+		missingManifestFields := make([]string, 0, 4)
+		if strings.TrimSpace(resolvedCtx.ManifestID) == "" {
+			missingManifestFields = append(missingManifestFields, "manifest_id")
+		}
+		if strings.TrimSpace(resolvedCtx.ManifestVersion) == "" {
+			missingManifestFields = append(missingManifestFields, "manifest_version")
+		}
+		if strings.TrimSpace(resolvedCtx.RuntimeKind) == "" {
+			missingManifestFields = append(missingManifestFields, "runtime_kind")
+		}
+		if strings.TrimSpace(resolvedCtx.TemplateType) == "" {
+			missingManifestFields = append(missingManifestFields, "template_type")
+		}
+		if len(missingManifestFields) > 0 {
+			customBundleDetail["missing_fields"] = missingManifestFields
+			addCheck("custom_bundle_manifest_minimal", model.PrecheckCheckFailed, true, "custom bundle manifest is invalid", customBundleDetail)
+			addReason(model.PrecheckReasonManifestInvalid, true, "custom bundle manifest is invalid", customBundleDetail)
+		} else {
+			addCheck("custom_bundle_manifest_minimal", model.PrecheckCheckPass, true, "custom bundle manifest minimal validation passed", customBundleDetail)
+		}
+	} else {
+		addCheck("custom_bundle_manifest_minimal", model.PrecheckCheckSkipped, false, "binding mode is not custom_bundle", map[string]interface{}{"binding_mode": resolvedCtx.BindingMode})
 	}
 
 	resourceSnapshot := collectResourceSnapshot(ctx, task.Payload)
@@ -862,12 +1369,180 @@ func executeRuntimePrecheckTask(ctx context.Context, client *http.Client, cfg ag
 		detail["observed_state"] = "stopped"
 	}
 
-	if len(failures) > 0 {
-		message := "runtime precheck failed: " + strings.Join(failures, ",")
-		detail["precheck_failures"] = failures
-		return false, message, detail, message
+	if precheck.Gating {
+		precheck.OverallStatus = model.PrecheckStatusFailed
+	}
+	precheck.FinishedAt = time.Now().UTC()
+	precheckMap := mustMap(precheck)
+	detail["precheck_result"] = precheckMap
+	detail["structured_result"] = precheckMap
+	detail["overall_status"] = string(precheck.OverallStatus)
+	detail["gating"] = precheck.Gating
+	detail["reasons"] = precheckMap["reasons"]
+	detail["checks"] = precheckMap["checks"]
+	detail["resolved_mounts"] = precheck.ResolvedMounts
+	detail["resolved_env"] = precheck.ResolvedEnv
+	detail["resolved_script"] = precheck.ResolvedScript
+	detail["resolved_ports"] = precheck.ResolvedPorts
+	detail["compatibility_result"] = precheckMap["compatibility_result"]
+	detail["runtime_ready"] = !precheck.Gating
+	detail["precheck_failures"] = extractPrecheckFailureCodes(precheck.Reasons)
+
+	if precheck.Gating {
+		msg := firstNonEmpty(buildPrecheckFailureMessage(precheck.Reasons), "runtime precheck failed")
+		return false, msg, detail, msg
+	}
+	if precheck.OverallStatus == model.PrecheckStatusWarning {
+		return true, "runtime precheck completed with warnings", detail, ""
 	}
 	return true, "runtime precheck passed", detail, ""
+}
+
+func parseMountRule(rule string) (hostPath string, containerPath string) {
+	trimmed := strings.TrimSpace(rule)
+	if trimmed == "" {
+		return "", ""
+	}
+	if idx := strings.Index(trimmed, ":"); idx < 0 {
+		return trimmed, ""
+	}
+	parts := strings.Split(trimmed, ":")
+	if len(parts) < 2 {
+		return strings.TrimSpace(parts[0]), ""
+	}
+	hostPath = strings.TrimSpace(parts[0])
+	containerPath = strings.TrimSpace(parts[1])
+	return hostPath, containerPath
+}
+
+func isPathAllowedByMountPoints(containerPath string, mountPoints []string) bool {
+	containerPath = strings.TrimSpace(containerPath)
+	if containerPath == "" {
+		return true
+	}
+	for _, mountPoint := range mountPoints {
+		candidate := strings.TrimSpace(mountPoint)
+		if candidate == "" {
+			continue
+		}
+		if containerPath == candidate || strings.HasPrefix(containerPath, strings.TrimRight(candidate, "/")+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveHostPorts(exposedPorts []string, endpoint string) []string {
+	out := make([]string, 0, len(exposedPorts)+1)
+	for _, raw := range exposedPorts {
+		if port := extractHostPort(raw); port != "" {
+			out = append(out, port)
+		}
+	}
+	if endpointPort := endpointHostPort(endpoint); endpointPort != "" {
+		out = append(out, endpointPort)
+	}
+	return out
+}
+
+func extractHostPort(raw string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return ""
+	}
+	if idx := strings.Index(value, "/"); idx > 0 {
+		value = value[:idx]
+	}
+	if strings.HasPrefix(value, "http://") || strings.HasPrefix(value, "https://") {
+		if parsed, err := url.Parse(value); err == nil {
+			return strings.TrimSpace(parsed.Port())
+		}
+	}
+	parts := strings.Split(value, ":")
+	switch len(parts) {
+	case 1:
+		if isDigits(parts[0]) {
+			return strings.TrimSpace(parts[0])
+		}
+	case 2:
+		if isDigits(strings.TrimSpace(parts[0])) {
+			return strings.TrimSpace(parts[0])
+		}
+		if isDigits(strings.TrimSpace(parts[1])) {
+			return strings.TrimSpace(parts[1])
+		}
+	default:
+		if isDigits(strings.TrimSpace(parts[1])) {
+			return strings.TrimSpace(parts[1])
+		}
+	}
+	return ""
+}
+
+func endpointHostPort(endpoint string) string {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return ""
+	}
+	if !strings.HasPrefix(endpoint, "http://") && !strings.HasPrefix(endpoint, "https://") {
+		endpoint = "http://" + endpoint
+	}
+	if parsed, err := url.Parse(endpoint); err == nil {
+		port := strings.TrimSpace(parsed.Port())
+		if port != "" {
+			return port
+		}
+		if strings.EqualFold(parsed.Scheme, "https") {
+			return "443"
+		}
+		return "80"
+	}
+	return ""
+}
+
+func checkLocalPortInUse(port string) (bool, map[string]interface{}) {
+	port = strings.TrimSpace(port)
+	detail := map[string]interface{}{"host_port": port}
+	if port == "" || !isDigits(port) {
+		detail["valid"] = false
+		return false, detail
+	}
+	addr := net.JoinHostPort("127.0.0.1", port)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		detail["in_use"] = true
+		detail["error"] = err.Error()
+		return true, detail
+	}
+	_ = ln.Close()
+	detail["in_use"] = false
+	return false, detail
+}
+
+func extractPrecheckFailureCodes(reasons []model.RuntimePrecheckReason) []string {
+	if len(reasons) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(reasons))
+	for _, reason := range reasons {
+		if !reason.Blocking {
+			continue
+		}
+		code := strings.TrimSpace(string(reason.Code))
+		if code == "" {
+			continue
+		}
+		out = appendUniqueNormalized(out, code)
+	}
+	return out
+}
+
+func buildPrecheckFailureMessage(reasons []model.RuntimePrecheckReason) string {
+	codes := extractPrecheckFailureCodes(reasons)
+	if len(codes) == 0 {
+		return ""
+	}
+	return "runtime precheck failed: " + strings.Join(codes, ",")
 }
 
 func checkEndpointPort(endpoint string, timeout time.Duration) (bool, map[string]interface{}, error) {
@@ -1866,4 +2541,203 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func isDigits(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func cloneInterfaceMap(in map[string]interface{}) map[string]interface{} {
+	if len(in) == 0 {
+		return map[string]interface{}{}
+	}
+	out := make(map[string]interface{}, len(in))
+	for k, v := range in {
+		key := strings.TrimSpace(k)
+		if key == "" {
+			continue
+		}
+		out[key] = v
+	}
+	return out
+}
+
+func mapFromAny(raw interface{}) map[string]interface{} {
+	value, ok := raw.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	return cloneInterfaceMap(value)
+}
+
+func mustMap(v interface{}) map[string]interface{} {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return map[string]interface{}{}
+	}
+	out := map[string]interface{}{}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return map[string]interface{}{}
+	}
+	return out
+}
+
+func normalizeStringSlice(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	seen := map[string]struct{}{}
+	for _, raw := range in {
+		item := strings.TrimSpace(raw)
+		if item == "" {
+			continue
+		}
+		lower := strings.ToLower(item)
+		if _, ok := seen[lower]; ok {
+			continue
+		}
+		seen[lower] = struct{}{}
+		out = append(out, item)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func appendUniqueNormalized(in []string, value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return normalizeStringSlice(in)
+	}
+	out := normalizeStringSlice(in)
+	for _, item := range out {
+		if strings.EqualFold(strings.TrimSpace(item), value) {
+			return out
+		}
+	}
+	return append(out, value)
+}
+
+func containsFolded(items []string, target string) bool {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return false
+	}
+	for _, item := range items {
+		if strings.EqualFold(strings.TrimSpace(item), target) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizePortCandidates(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	seen := map[string]struct{}{}
+	for _, raw := range in {
+		port := strings.TrimSpace(raw)
+		if port == "" || !isDigits(port) {
+			continue
+		}
+		if _, ok := seen[port]; ok {
+			continue
+		}
+		seen[port] = struct{}{}
+		out = append(out, port)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func firstNonEmptyStringMap(candidates ...map[string]string) map[string]string {
+	for _, candidate := range candidates {
+		normalized := stringMapFromValue(candidate)
+		if len(normalized) > 0 {
+			return normalized
+		}
+	}
+	return map[string]string{}
+}
+
+func stringValueMapFromNested(payload map[string]interface{}, nestedKey, key string) interface{} {
+	nested := nestedMapValue(payload, nestedKey)
+	if nested == nil {
+		return nil
+	}
+	return nested[key]
+}
+
+func parseBoolLike(raw interface{}) (bool, bool) {
+	switch value := raw.(type) {
+	case bool:
+		return value, true
+	case string:
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "1", "true", "yes", "on":
+			return true, true
+		case "0", "false", "no", "off":
+			return false, true
+		default:
+			return false, false
+		}
+	default:
+		text := strings.TrimSpace(fmt.Sprint(raw))
+		switch strings.ToLower(text) {
+		case "1", "true", "yes", "on":
+			return true, true
+		case "0", "false", "no", "off":
+			return false, true
+		default:
+			return false, false
+		}
+	}
+}
+
+func boolValueFromPayload(payload map[string]interface{}, key string) (bool, bool) {
+	if payload == nil {
+		return false, false
+	}
+	raw, ok := payload[key]
+	if !ok {
+		return false, false
+	}
+	return parseBoolLike(raw)
+}
+
+func boolValueFromNested(payload map[string]interface{}, nestedKey, key string) (bool, bool) {
+	nested := nestedMapValue(payload, nestedKey)
+	if nested == nil {
+		return false, false
+	}
+	raw, ok := nested[key]
+	if !ok {
+		return false, false
+	}
+	return parseBoolLike(raw)
+}
+
+func boolValueFromDetailOrPayload(detail map[string]interface{}, payload map[string]interface{}, key string) (bool, bool) {
+	if value, ok := boolValueFromPayload(detail, key); ok {
+		return value, true
+	}
+	if value, ok := boolValueFromPayload(payload, key); ok {
+		return value, true
+	}
+	return boolValueFromNested(payload, "resolved_context", key)
 }

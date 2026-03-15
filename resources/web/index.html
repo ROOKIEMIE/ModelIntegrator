@@ -40,9 +40,14 @@
           <h2>任务与测试</h2>
           <div class="actions">
             <button id="run-e5-test-btn" type="button">一键测试 E5</button>
+            <button id="run-stage0b-suite-btn" type="button">一键测试阶段0~B</button>
+          </div>
+          <div class="actions">
+            <select id="test-scenario-select"></select>
+            <button id="run-selected-test-btn" type="button">运行所选测试</button>
             <button id="refresh-runtime-task-btn" type="button">刷新 Runtime 状态</button>
           </div>
-          <div class="meta">仅支持预定义场景：<code>e5_embedding_smoke</code></div>
+          <div class="meta">支持场景：<code>stage0_to_b_full_smoke</code> / <code>stage0_runtime_object_smoke</code> / <code>local_agent_execution_smoke</code> / <code>e5_embedding_smoke</code> / <code>e5_gating_blocked_smoke</code></div>
           <h3>Runtime Bindings</h3>
           <div id="runtime-bindings">加载中...</div>
           <h3>Runtime Instances</h3>

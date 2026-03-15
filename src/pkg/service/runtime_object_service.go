@@ -31,17 +31,25 @@ type RuntimeInstanceResolvedContext struct {
 	Manifest model.RuntimeBundleManifest
 }
 
+type RuntimeInstanceProjectionSink interface {
+	ApplyRuntimeInstanceProjection(ctx context.Context, instance model.RuntimeInstance) error
+}
+
 type RuntimeObjectService struct {
 	modelRegistry *registry.ModelRegistry
 	nodeRegistry  *registry.NodeRegistry
 	templates     *RuntimeTemplateService
 	store         *sqlitestore.Store
 	logger        *slog.Logger
+	agentSvc      *AgentService
+	projection    RuntimeInstanceProjectionSink
 
-	mu        sync.RWMutex
-	bindings  map[string]model.RuntimeBinding
-	instances map[string]model.RuntimeInstance
-	manifests map[string]model.RuntimeBundleManifest
+	mu                    sync.RWMutex
+	bindings              map[string]model.RuntimeBinding
+	instances             map[string]model.RuntimeInstance
+	manifests             map[string]model.RuntimeBundleManifest
+	observationStaleAfter time.Duration
+	reconcileMu           sync.Mutex
 }
 
 func NewRuntimeObjectService(
@@ -54,14 +62,30 @@ func NewRuntimeObjectService(
 		logger = slog.Default()
 	}
 	return &RuntimeObjectService{
-		modelRegistry: modelRegistry,
-		nodeRegistry:  nodeRegistry,
-		templates:     templates,
-		logger:        logger,
-		bindings:      make(map[string]model.RuntimeBinding),
-		instances:     make(map[string]model.RuntimeInstance),
-		manifests:     make(map[string]model.RuntimeBundleManifest),
+		modelRegistry:         modelRegistry,
+		nodeRegistry:          nodeRegistry,
+		templates:             templates,
+		logger:                logger,
+		bindings:              make(map[string]model.RuntimeBinding),
+		instances:             make(map[string]model.RuntimeInstance),
+		manifests:             make(map[string]model.RuntimeBundleManifest),
+		observationStaleAfter: 2 * time.Minute,
 	}
+}
+
+func (s *RuntimeObjectService) SetAgentService(agentSvc *AgentService) {
+	s.agentSvc = agentSvc
+}
+
+func (s *RuntimeObjectService) SetRuntimeInstanceProjectionSink(sink RuntimeInstanceProjectionSink) {
+	s.projection = sink
+}
+
+func (s *RuntimeObjectService) SetObservationStaleAfter(window time.Duration) {
+	if window <= 0 {
+		return
+	}
+	s.observationStaleAfter = window
 }
 
 func (s *RuntimeObjectService) SetStore(ctx context.Context, store *sqlitestore.Store) error {
@@ -306,6 +330,1052 @@ func (s *RuntimeObjectService) ResolveRuntimeInstanceContext(ctx context.Context
 	}, nil
 }
 
+// StartInstanceReconcileLoop starts a lightweight instance-first reconcile loop.
+// It continuously explains desired/observed/readiness/precheck/drift on RuntimeInstance.
+func (s *RuntimeObjectService) StartInstanceReconcileLoop(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = 15 * time.Second
+	}
+	go func() {
+		_ = s.RunInstanceReconcileOnce(ctx, "bootstrap")
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_ = s.RunInstanceReconcileOnce(ctx, "periodic")
+			}
+		}
+	}()
+}
+
+func (s *RuntimeObjectService) RunInstanceReconcileOnce(ctx context.Context, trigger string) error {
+	s.reconcileMu.Lock()
+	defer s.reconcileMu.Unlock()
+
+	items, err := s.ListRuntimeInstances(ctx)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	var errs []error
+	for i := range items {
+		item := items[i]
+		updated, summary, recErr := s.reconcileRuntimeInstanceInternal(ctx, item, now, trigger)
+		if recErr != nil {
+			errs = append(errs, fmt.Errorf("runtime_instance=%s: %w", item.ID, recErr))
+			continue
+		}
+		if upsertErr := s.upsertRuntimeInstance(ctx, updated); upsertErr != nil {
+			errs = append(errs, fmt.Errorf("runtime_instance=%s upsert failed: %w", item.ID, upsertErr))
+			continue
+		}
+		if s.projection != nil {
+			if projErr := s.projection.ApplyRuntimeInstanceProjection(ctx, updated); projErr != nil {
+				s.logger.Warn("runtime instance projection to model failed", "runtime_instance_id", updated.ID, "model_id", updated.ModelID, "error", projErr)
+			}
+		}
+		s.logger.Debug("runtime instance reconciled",
+			"runtime_instance_id", updated.ID,
+			"model_id", updated.ModelID,
+			"desired_state", updated.DesiredState,
+			"observed_state", updated.ObservedState,
+			"readiness", updated.Readiness,
+			"drift_reason", updated.DriftReason,
+			"precheck_status", updated.PrecheckStatus,
+			"precheck_gating", updated.PrecheckGating,
+			"conflict_status", updated.ConflictStatus,
+			"conflict_blocking", updated.ConflictBlocking,
+			"gating_status", updated.GatingStatus,
+			"gating_allowed", updated.GatingAllowed,
+			"plan_action", updated.LastPlanAction,
+			"plan_status", updated.LastPlanStatus,
+			"agent_status", summary.AgentStatus,
+			"observation_stale", summary.ObservationStale,
+			"trigger", trigger,
+		)
+	}
+	return errors.Join(errs...)
+}
+
+func (s *RuntimeObjectService) ReconcileRuntimeInstance(ctx context.Context, runtimeInstanceID, trigger string) (model.RuntimeInstanceReconcileSummary, error) {
+	runtimeInstanceID = strings.TrimSpace(runtimeInstanceID)
+	if runtimeInstanceID == "" {
+		return model.RuntimeInstanceReconcileSummary{}, ErrRuntimeInstanceNotFound
+	}
+	s.reconcileMu.Lock()
+	defer s.reconcileMu.Unlock()
+
+	item, err := s.GetRuntimeInstance(ctx, runtimeInstanceID)
+	if err != nil {
+		return model.RuntimeInstanceReconcileSummary{}, err
+	}
+	updated, summary, err := s.reconcileRuntimeInstanceInternal(ctx, item, time.Now().UTC(), trigger)
+	if err != nil {
+		return model.RuntimeInstanceReconcileSummary{}, err
+	}
+	if err := s.upsertRuntimeInstance(ctx, updated); err != nil {
+		return model.RuntimeInstanceReconcileSummary{}, err
+	}
+	if s.projection != nil {
+		if projErr := s.projection.ApplyRuntimeInstanceProjection(ctx, updated); projErr != nil {
+			s.logger.Warn("runtime instance projection to model failed", "runtime_instance_id", updated.ID, "model_id", updated.ModelID, "error", projErr)
+		}
+	}
+	return summary, nil
+}
+
+func (s *RuntimeObjectService) GetRuntimeInstanceReconcileSummary(ctx context.Context, runtimeInstanceID string) (model.RuntimeInstanceReconcileSummary, error) {
+	item, err := s.GetRuntimeInstance(ctx, runtimeInstanceID)
+	if err != nil {
+		return model.RuntimeInstanceReconcileSummary{}, err
+	}
+	_, summary, err := s.reconcileRuntimeInstanceInternal(ctx, item, time.Now().UTC(), "summary_query")
+	if err != nil {
+		return model.RuntimeInstanceReconcileSummary{}, err
+	}
+	return summary, nil
+}
+
+func (s *RuntimeObjectService) reconcileRuntimeInstanceInternal(
+	ctx context.Context,
+	item model.RuntimeInstance,
+	now time.Time,
+	trigger string,
+) (model.RuntimeInstance, model.RuntimeInstanceReconcileSummary, error) {
+	s.hydrateRuntimeInstanceDerivedFields(&item)
+	if item.Metadata == nil {
+		item.Metadata = map[string]string{}
+	}
+	desired := strings.TrimSpace(item.DesiredState)
+	if desired == "" || strings.EqualFold(desired, string(model.ModelStateUnknown)) {
+		if m, ok := s.modelRegistry.Get(strings.TrimSpace(item.ModelID)); ok {
+			desired = firstNonEmpty(strings.TrimSpace(m.DesiredState), strings.TrimSpace(string(m.State)))
+		}
+	}
+	if desired == "" {
+		desired = string(model.ModelStateUnknown)
+	}
+	item.DesiredState = desired
+
+	observed := strings.TrimSpace(item.ObservedState)
+	if observed == "" {
+		observed = string(model.ModelStateUnknown)
+	}
+	item.ObservedState = observed
+	if strings.TrimSpace(string(item.Readiness)) == "" {
+		item.Readiness = model.ReadinessUnknown
+	}
+
+	reconcileReasons := make([]string, 0, 8)
+	appendReason := func(reason string) {
+		reason = strings.TrimSpace(reason)
+		if reason == "" {
+			return
+		}
+		for _, existing := range reconcileReasons {
+			if strings.EqualFold(existing, reason) {
+				return
+			}
+		}
+		reconcileReasons = append(reconcileReasons, reason)
+	}
+
+	var resolvedCtx *RuntimeInstanceResolvedContext
+	if item.BindingID != "" && (item.BindingMode == "" || item.ManifestID == "" || len(item.ResolvedPorts) == 0) {
+		if resolved, resolveErr := s.ResolveRuntimeInstanceContext(ctx, item.ID); resolveErr == nil {
+			resolvedCtx = &resolved
+			if item.BindingMode == "" {
+				item.BindingMode = resolved.Binding.BindingMode
+			}
+			if item.ManifestID == "" {
+				item.ManifestID = strings.TrimSpace(resolved.Manifest.ID)
+			}
+			if len(item.ResolvedPorts) == 0 {
+				item.ResolvedPorts = normalizeStringList(resolved.Manifest.ExposedPorts)
+			}
+			if item.ResolvedScript == "" {
+				item.ResolvedScript = strings.TrimSpace(resolved.Binding.ScriptRef)
+			}
+			if item.PrecheckResult != nil &&
+				(!item.PrecheckResult.CompatibilityResult.ModelTypeMatched || !item.PrecheckResult.CompatibilityResult.ModelFormatMatched) {
+				appendReason("manifest_model_compatibility_failed")
+			}
+		}
+	}
+	if resolvedCtx == nil && item.BindingID != "" {
+		if resolved, resolveErr := s.ResolveRuntimeInstanceContext(ctx, item.ID); resolveErr == nil {
+			resolvedCtx = &resolved
+		}
+	}
+
+	targetAction := determineRuntimeReconcileTargetAction(item.DesiredState, item.ObservedState, trigger)
+
+	agentStatus := "unknown"
+	agentOnline := false
+	agentSignalKnown := false
+	if s.agentSvc != nil && strings.TrimSpace(item.NodeID) != "" {
+		agentSignalKnown = true
+		if agent, ok := s.agentSvc.GetByNodeID(item.NodeID); ok {
+			agentStatus = strings.TrimSpace(string(agent.Status))
+			agentOnline = agent.Status == model.AgentStatusOnline
+		} else {
+			agentStatus = "missing"
+		}
+	}
+
+	lastObservationAt := time.Time{}
+	if item.LastAgentTask != nil && !item.LastAgentTask.FinishedAt.IsZero() {
+		lastObservationAt = item.LastAgentTask.FinishedAt.UTC()
+	}
+	if lastObservationAt.IsZero() && !item.LastPrecheckAt.IsZero() {
+		lastObservationAt = item.LastPrecheckAt.UTC()
+	}
+	staleWindow := s.observationStaleAfter
+	if staleWindow <= 0 {
+		staleWindow = 2 * time.Minute
+	}
+	observationStale := false
+	if agentSignalKnown {
+		if !lastObservationAt.IsZero() {
+			observationStale = now.Sub(lastObservationAt) > staleWindow
+		} else if strings.EqualFold(strings.TrimSpace(item.DesiredState), string(model.ModelStateRunning)) {
+			observationStale = true
+		}
+	}
+
+	precheckSummary := buildRuntimePrecheckSummaryFromInstance(item, now)
+	item.PrecheckSummary = precheckSummary
+	item.PrecheckStatus = precheckSummary.Status
+	item.PrecheckGating = precheckSummary.Gating
+	item.PrecheckReasons = normalizeReasonCodesFromConditionReasons(precheckSummary.Reasons, item.PrecheckReasons)
+	if precheckSummary.Gating {
+		appendReason("precheck_blocked")
+	}
+
+	allInstances, listErr := s.ListRuntimeInstances(ctx)
+	if listErr != nil {
+		s.logger.Warn("list runtime instances for conflict evaluation failed", "runtime_instance_id", item.ID, "error", listErr)
+	}
+	conflictSummary := s.evaluateRuntimeConflictSummary(
+		ctx,
+		item,
+		resolvedCtx,
+		allInstances,
+		now,
+		targetAction,
+		agentSignalKnown,
+		agentOnline,
+		observationStale,
+	)
+	item.ConflictSummary = &conflictSummary
+	item.ConflictStatus = conflictSummary.Status
+	item.ConflictBlocking = conflictSummary.Blocking
+	item.ConflictReasons = normalizeReasonCodesFromConditionReasons(conflictSummary.Reasons, nil)
+	item.ConflictSource = conflictSummary.Source
+	item.ConflictGeneratedAt = conflictSummary.GeneratedAt
+	if item.ConflictStatus == model.RuntimeConflictStatusBlocked || item.ConflictStatus == model.RuntimeConflictStatusWarning {
+		appendReason("runtime_conflict")
+	}
+
+	gatingSummary := buildRuntimeGatingSummary(precheckSummary, conflictSummary, targetAction, now)
+	item.GatingSummary = &gatingSummary
+	item.GatingStatus = gatingSummary.Status
+	item.GatingAllowed = gatingSummary.Allowed
+	item.GatingReasons = normalizeReasonCodesFromConditionReasons(gatingSummary.Reasons, nil)
+	item.GatingSource = gatingSummary.Source
+	item.GatingGeneratedAt = gatingSummary.GeneratedAt
+	if !item.GatingAllowed {
+		appendReason("gating_blocked")
+	}
+
+	planSummary := buildRuntimeLifecyclePlanSummary(item, gatingSummary, conflictSummary, targetAction, trigger, now)
+	item.LastLifecyclePlan = &planSummary
+	item.LastPlanAction = planSummary.Action
+	item.LastPlanStatus = planSummary.Status
+	item.LastPlanReason = strings.TrimSpace(planSummary.Message)
+	item.LastPlanGeneratedAt = chooseNewerTime(planSummary.GeneratedAt, planSummary.UpdatedAt)
+	item.LastPlanDetail = map[string]interface{}{
+		"plan_id":              strings.TrimSpace(planSummary.PlanID),
+		"reason_codes":         cloneStringSlice(planSummary.ReasonCodes),
+		"blocked_reason_codes": cloneStringSlice(planSummary.BlockedReasonCodes),
+		"release_targets":      cloneStringSlice(planSummary.ReleaseTargets),
+		"requested_task_type":  strings.TrimSpace(string(planSummary.RequestedTaskType)),
+		"triggered_by":         strings.TrimSpace(planSummary.TriggeredBy),
+		"source":               strings.TrimSpace(string(planSummary.Source)),
+		"target_action":        strings.TrimSpace(string(targetAction)),
+		"conflict_status":      strings.TrimSpace(string(conflictSummary.Status)),
+		"gating_status":        strings.TrimSpace(string(gatingSummary.Status)),
+		"gating_allowed":       gatingSummary.Allowed,
+	}
+	if planSummary.Action != model.RuntimeLifecycleActionNone {
+		appendReason("lifecycle_plan:" + strings.TrimSpace(string(planSummary.Action)))
+	}
+	if len(planSummary.ReleaseTargets) > 0 {
+		appendReason("release_targets_planned")
+		_ = s.applyReleasePlanToTargets(ctx, item.ID, planSummary.ReleaseTargets, trigger, now)
+	}
+
+	precheckBlocked := item.PrecheckGating || item.PrecheckStatus == model.PrecheckStatusFailed
+	if precheckBlocked && isRuntimeLoadLikeAction(targetAction) {
+		appendReason("precheck_blocked")
+		item.Readiness = model.ReadinessNotReady
+		item.DriftReason = firstNonEmpty(
+			strings.TrimSpace(item.DriftReason),
+			"precheck_blocked",
+		)
+		precheckText := strings.Join(item.PrecheckReasons, ",")
+		if precheckText == "" {
+			precheckText = string(item.PrecheckStatus)
+		}
+		item.HealthMessage = firstNonEmpty(
+			strings.TrimSpace(item.HealthMessage),
+			"precheck gating blocked: "+precheckText,
+		)
+	} else if !item.GatingAllowed && isRuntimeLoadLikeAction(targetAction) {
+		item.Readiness = model.ReadinessNotReady
+		item.DriftReason = firstNonEmpty(strings.TrimSpace(item.DriftReason), "gating_blocked")
+		item.HealthMessage = appendRuntimeMessage(item.HealthMessage, "lifecycle action gated by precheck/conflict")
+	} else if strings.EqualFold(strings.TrimSpace(item.DesiredState), string(model.ModelStateRunning)) {
+		if strings.EqualFold(strings.TrimSpace(item.ObservedState), string(model.ModelStateRunning)) {
+			if item.Readiness != model.ReadinessReady {
+				appendReason("runtime_running_not_ready")
+				item.Readiness = model.ReadinessNotReady
+				item.DriftReason = "runtime_running_not_ready"
+				item.HealthMessage = firstNonEmpty(
+					strings.TrimSpace(item.HealthMessage),
+					"precheck passed but runtime readiness check is not ready",
+				)
+			} else {
+				item.DriftReason = clearDesiredObservedDrift(item.DriftReason, item.DesiredState, item.ObservedState)
+			}
+		} else {
+			appendReason("desired_observed_drift")
+			item.Readiness = model.ReadinessNotReady
+			item.DriftReason = fmt.Sprintf("desired=%s observed=%s", item.DesiredState, item.ObservedState)
+			item.HealthMessage = firstNonEmpty(
+				strings.TrimSpace(item.HealthMessage),
+				fmt.Sprintf("runtime not in desired state: desired=%s observed=%s", item.DesiredState, item.ObservedState),
+			)
+		}
+	} else if strings.EqualFold(strings.TrimSpace(item.DesiredState), string(model.ModelStateStopped)) {
+		if strings.EqualFold(strings.TrimSpace(item.ObservedState), string(model.ModelStateRunning)) {
+			appendReason("desired_observed_drift")
+			item.DriftReason = fmt.Sprintf("desired=%s observed=%s", item.DesiredState, item.ObservedState)
+			item.HealthMessage = firstNonEmpty(
+				strings.TrimSpace(item.HealthMessage),
+				"instance expected stopped but still running",
+			)
+		}
+		if item.Readiness == model.ReadinessReady {
+			item.Readiness = model.ReadinessNotReady
+		}
+	}
+
+	if agentSignalKnown && !agentOnline && isRuntimeLoadLikeAction(targetAction) {
+		appendReason("agent_offline")
+		if strings.EqualFold(strings.TrimSpace(item.DesiredState), string(model.ModelStateRunning)) && strings.TrimSpace(item.DriftReason) == "" {
+			item.DriftReason = "agent_offline"
+		}
+		item.HealthMessage = appendRuntimeMessage(item.HealthMessage, "agent offline or unavailable")
+	}
+	if observationStale && strings.EqualFold(strings.TrimSpace(item.DesiredState), string(model.ModelStateRunning)) {
+		appendReason("agent_observation_stale")
+		if strings.EqualFold(strings.TrimSpace(item.DesiredState), string(model.ModelStateRunning)) && strings.TrimSpace(item.DriftReason) == "" {
+			item.DriftReason = "agent_observation_stale"
+		}
+		item.HealthMessage = appendRuntimeMessage(item.HealthMessage, "agent observation is stale")
+	}
+
+	item.LastReconciledAt = now
+	item.Metadata["phase"] = "stage-b"
+	item.Metadata["reconcile_reason_codes"] = strings.Join(reconcileReasons, ",")
+	item.Metadata["reconcile_agent_status"] = firstNonEmpty(agentStatus, "unknown")
+	item.Metadata["reconcile_observation_stale"] = fmt.Sprintf("%t", observationStale)
+	item.Metadata["conflict_status"] = strings.TrimSpace(string(item.ConflictStatus))
+	item.Metadata["gating_status"] = strings.TrimSpace(string(item.GatingStatus))
+	item.Metadata["gating_allowed"] = fmt.Sprintf("%t", item.GatingAllowed)
+	item.Metadata["last_plan_action"] = strings.TrimSpace(string(item.LastPlanAction))
+	item.Metadata["last_plan_status"] = strings.TrimSpace(string(item.LastPlanStatus))
+
+	summary := model.RuntimeInstanceReconcileSummary{
+		RuntimeInstanceID: item.ID,
+		ModelID:           item.ModelID,
+		NodeID:            item.NodeID,
+		DesiredState:      item.DesiredState,
+		ObservedState:     item.ObservedState,
+		Readiness:         item.Readiness,
+		HealthMessage:     strings.TrimSpace(item.HealthMessage),
+		DriftReason:       strings.TrimSpace(item.DriftReason),
+		PrecheckStatus:    item.PrecheckStatus,
+		PrecheckGating:    item.PrecheckGating,
+		PrecheckReasons:   cloneStringSlice(item.PrecheckReasons),
+		ConflictStatus:    item.ConflictStatus,
+		ConflictBlocking:  item.ConflictBlocking,
+		ConflictReasons:   cloneStringSlice(item.ConflictReasons),
+		GatingStatus:      item.GatingStatus,
+		GatingAllowed:     item.GatingAllowed,
+		GatingReasons:     cloneStringSlice(item.GatingReasons),
+		PlannedAction:     planSummary.Action,
+		AgentStatus:       firstNonEmpty(agentStatus, "unknown"),
+		AgentOnline:       agentOnline,
+		ObservationStale:  observationStale,
+		LastObservationAt: lastObservationAt,
+		LastReconciledAt:  now,
+		Trigger:           strings.TrimSpace(trigger),
+	}
+
+	summary.DesiredState = item.DesiredState
+	summary.ObservedState = item.ObservedState
+	summary.Readiness = item.Readiness
+	summary.HealthMessage = strings.TrimSpace(item.HealthMessage)
+	summary.DriftReason = strings.TrimSpace(item.DriftReason)
+	summary.ReconcileReasons = cloneStringSlice(reconcileReasons)
+	summary.PrecheckStatus = item.PrecheckStatus
+	summary.PrecheckGating = item.PrecheckGating
+	summary.PrecheckReasons = cloneStringSlice(item.PrecheckReasons)
+	summary.LastReconciledAt = item.LastReconciledAt
+	summary.BindingMode = item.BindingMode
+	summary.ManifestID = item.ManifestID
+	summary.RuntimeTemplateID = item.TemplateID
+	summary.LastAgentTask = item.LastAgentTask
+	summary.LastLifecyclePlan = item.LastLifecyclePlan
+
+	return item, summary, nil
+}
+
+func buildRuntimePrecheckSummaryFromInstance(item model.RuntimeInstance, now time.Time) *model.RuntimePrecheckSummary {
+	if item.PrecheckSummary != nil {
+		summary := *item.PrecheckSummary
+		summary.Status = model.PrecheckOverallStatus(firstNonEmpty(strings.TrimSpace(string(summary.Status)), strings.TrimSpace(string(item.PrecheckStatus)), string(model.PrecheckStatusUnknown)))
+		summary.Gating = summary.Gating || item.PrecheckGating
+		if summary.Source == "" {
+			if strings.TrimSpace(item.LastPrecheckTaskID) != "" {
+				summary.Source = model.RuntimeSignalSourceAgent
+			} else {
+				summary.Source = model.RuntimeSignalSourceController
+			}
+		}
+		if summary.GeneratedAt.IsZero() {
+			summary.GeneratedAt = chooseNewerTime(item.LastPrecheckAt, now)
+		}
+		if len(summary.Reasons) == 0 {
+			summary.Reasons = precheckReasonsToConditionReasons(item.PrecheckReasons, summary.Source, item.ID, item.NodeID, item.BindingID)
+		}
+		return &summary
+	}
+
+	source := model.RuntimeSignalSourceController
+	if strings.TrimSpace(item.LastPrecheckTaskID) != "" {
+		source = model.RuntimeSignalSourceAgent
+	}
+	reasons := precheckReasonsToConditionReasons(item.PrecheckReasons, source, item.ID, item.NodeID, item.BindingID)
+	if item.PrecheckResult != nil && len(item.PrecheckResult.Reasons) > 0 {
+		reasons = make([]model.RuntimeConditionReason, 0, len(item.PrecheckResult.Reasons))
+		for _, reason := range item.PrecheckResult.Reasons {
+			reasons = append(reasons, model.RuntimeConditionReason{
+				Code:              strings.TrimSpace(string(reason.Code)),
+				Message:           strings.TrimSpace(reason.Message),
+				Blocking:          reason.Blocking,
+				Source:            source,
+				RelatedInstanceID: strings.TrimSpace(item.ID),
+				RelatedNodeID:     strings.TrimSpace(item.NodeID),
+				RelatedBindingID:  strings.TrimSpace(item.BindingID),
+				Detail:            cloneObjectMap(reason.Detail),
+			})
+		}
+	}
+	status := model.PrecheckOverallStatus(firstNonEmpty(strings.TrimSpace(string(item.PrecheckStatus)), string(model.PrecheckStatusUnknown)))
+	gating := item.PrecheckGating || status == model.PrecheckStatusFailed
+	if status == model.PrecheckStatusUnknown && len(reasons) > 0 {
+		status = model.PrecheckStatusWarning
+	}
+	return &model.RuntimePrecheckSummary{
+		Status:      status,
+		Gating:      gating,
+		Reasons:     reasons,
+		GeneratedAt: chooseNewerTime(item.LastPrecheckAt, now),
+		Source:      source,
+	}
+}
+
+func precheckReasonsToConditionReasons(codes []string, source model.RuntimeSignalSource, instanceID, nodeID, bindingID string) []model.RuntimeConditionReason {
+	out := make([]model.RuntimeConditionReason, 0, len(codes))
+	for _, raw := range codes {
+		code := strings.TrimSpace(raw)
+		if code == "" {
+			continue
+		}
+		out = append(out, model.RuntimeConditionReason{
+			Code:              code,
+			Message:           code,
+			Blocking:          true,
+			Source:            source,
+			RelatedInstanceID: strings.TrimSpace(instanceID),
+			RelatedNodeID:     strings.TrimSpace(nodeID),
+			RelatedBindingID:  strings.TrimSpace(bindingID),
+		})
+	}
+	return out
+}
+
+func normalizeReasonCodesFromConditionReasons(reasons []model.RuntimeConditionReason, fallback []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(reasons))
+	for _, reason := range reasons {
+		code := strings.TrimSpace(reason.Code)
+		if code == "" {
+			continue
+		}
+		if _, ok := seen[code]; ok {
+			continue
+		}
+		seen[code] = struct{}{}
+		out = append(out, code)
+	}
+	for _, raw := range fallback {
+		code := strings.TrimSpace(raw)
+		if code == "" {
+			continue
+		}
+		if _, ok := seen[code]; ok {
+			continue
+		}
+		seen[code] = struct{}{}
+		out = append(out, code)
+	}
+	return out
+}
+
+func determineRuntimeReconcileTargetAction(desiredState, observedState, trigger string) model.RuntimeLifecycleAction {
+	trigger = strings.ToLower(strings.TrimSpace(trigger))
+	if strings.Contains(trigger, "runtime_task_start") || strings.Contains(trigger, "runtime_task_restart") {
+		return model.RuntimeLifecycleActionLoadStart
+	}
+	if strings.Contains(trigger, "runtime_task_stop") {
+		return model.RuntimeLifecycleActionUnload
+	}
+	desired := strings.ToLower(strings.TrimSpace(desiredState))
+	observed := strings.ToLower(strings.TrimSpace(observedState))
+	if desired == string(model.ModelStateRunning) && observed != string(model.ModelStateRunning) {
+		return model.RuntimeLifecycleActionLoad
+	}
+	if desired == string(model.ModelStateStopped) && observed == string(model.ModelStateRunning) {
+		return model.RuntimeLifecycleActionUnload
+	}
+	return model.RuntimeLifecycleActionNone
+}
+
+func isRuntimeLoadLikeAction(action model.RuntimeLifecycleAction) bool {
+	switch action {
+	case model.RuntimeLifecycleActionLoad, model.RuntimeLifecycleActionLoadStart, model.RuntimeLifecycleActionStart, model.RuntimeLifecycleActionRefresh:
+		return true
+	default:
+		return false
+	}
+}
+
+func isRuntimeReleaseLikeAction(action model.RuntimeLifecycleAction) bool {
+	switch action {
+	case model.RuntimeLifecycleActionUnload, model.RuntimeLifecycleActionStop, model.RuntimeLifecycleActionRelease:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *RuntimeObjectService) evaluateRuntimeConflictSummary(
+	ctx context.Context,
+	item model.RuntimeInstance,
+	resolvedCtx *RuntimeInstanceResolvedContext,
+	allInstances []model.RuntimeInstance,
+	now time.Time,
+	targetAction model.RuntimeLifecycleAction,
+	agentSignalKnown bool,
+	agentOnline bool,
+	observationStale bool,
+) model.RuntimeConflictSummary {
+	_ = ctx
+	reasons := make([]model.RuntimeConditionReason, 0, 8)
+	appendReason := func(reason model.RuntimeConditionReason) {
+		code := strings.TrimSpace(reason.Code)
+		if code == "" {
+			return
+		}
+		for _, existing := range reasons {
+			if strings.EqualFold(strings.TrimSpace(existing.Code), code) &&
+				strings.EqualFold(strings.TrimSpace(existing.RelatedInstanceID), strings.TrimSpace(reason.RelatedInstanceID)) {
+				return
+			}
+		}
+		reason.Code = code
+		if reason.Source == "" {
+			reason.Source = model.RuntimeSignalSourceController
+		}
+		if strings.TrimSpace(reason.RelatedInstanceID) == "" {
+			reason.RelatedInstanceID = strings.TrimSpace(item.ID)
+		}
+		if strings.TrimSpace(reason.RelatedNodeID) == "" {
+			reason.RelatedNodeID = strings.TrimSpace(item.NodeID)
+		}
+		if strings.TrimSpace(reason.RelatedBindingID) == "" {
+			reason.RelatedBindingID = strings.TrimSpace(item.BindingID)
+		}
+		reasons = append(reasons, reason)
+	}
+
+	loadLike := isRuntimeLoadLikeAction(targetAction)
+	desiredRunning := strings.EqualFold(strings.TrimSpace(item.DesiredState), string(model.ModelStateRunning))
+	observedRunning := strings.EqualFold(strings.TrimSpace(item.ObservedState), string(model.ModelStateRunning))
+	if !loadLike {
+		loadLike = desiredRunning && !observedRunning
+	}
+
+	if desired := strings.TrimSpace(strings.ToLower(item.DesiredState)); desired != "" {
+		observed := strings.TrimSpace(strings.ToLower(item.ObservedState))
+		if observed != "" && desired != observed {
+			appendReason(model.RuntimeConditionReason{
+				Code:     "desired_observed_conflict",
+				Message:  fmt.Sprintf("desired=%s observed=%s", item.DesiredState, item.ObservedState),
+				Blocking: false,
+				Detail: map[string]interface{}{
+					"desired_state":  strings.TrimSpace(item.DesiredState),
+					"observed_state": strings.TrimSpace(item.ObservedState),
+				},
+			})
+		}
+	}
+
+	ports := extractRuntimeHostPorts(item.ResolvedPorts)
+	if len(ports) == 0 && resolvedCtx != nil {
+		ports = extractRuntimeHostPorts(resolvedCtx.Manifest.ExposedPorts)
+	}
+	runtimeKind := strings.TrimSpace(string(resolveRuntimeKindForInstance(item, resolvedCtx)))
+	for _, other := range allInstances {
+		if strings.EqualFold(strings.TrimSpace(other.ID), strings.TrimSpace(item.ID)) {
+			continue
+		}
+		if strings.TrimSpace(other.NodeID) == "" || !strings.EqualFold(strings.TrimSpace(other.NodeID), strings.TrimSpace(item.NodeID)) {
+			continue
+		}
+		if !isRuntimeInstanceOccupyingSlots(other) {
+			continue
+		}
+		otherPorts := extractRuntimeHostPorts(other.ResolvedPorts)
+		if len(otherPorts) == 0 {
+			if resolvedOther, resolveErr := s.ResolveRuntimeInstanceContext(ctx, other.ID); resolveErr == nil {
+				otherPorts = extractRuntimeHostPorts(resolvedOther.Manifest.ExposedPorts)
+			}
+		}
+		if len(ports) > 0 && len(otherPorts) > 0 {
+			if conflictedPort := intersectFirstString(ports, otherPorts); conflictedPort != "" {
+				appendReason(model.RuntimeConditionReason{
+					Code:              "port_conflict",
+					Message:           "runtime instance port conflict",
+					Blocking:          loadLike,
+					RelatedInstanceID: strings.TrimSpace(other.ID),
+					Detail: map[string]interface{}{
+						"host_port": conflictedPort,
+					},
+				})
+			}
+		}
+
+		if runtimeKind != "" && runtimeKind != string(model.RuntimeKindUnknown) {
+			otherKind := strings.TrimSpace(string(resolveRuntimeKindForInstance(other, nil)))
+			if otherKind == "" || otherKind == string(model.RuntimeKindUnknown) {
+				if resolvedOther, resolveErr := s.ResolveRuntimeInstanceContext(ctx, other.ID); resolveErr == nil {
+					otherKind = strings.TrimSpace(string(resolvedOther.Manifest.RuntimeKind))
+				}
+			}
+			if strings.EqualFold(runtimeKind, otherKind) && loadLike && !observedRunning {
+				appendReason(model.RuntimeConditionReason{
+					Code:              "runtime_kind_mutex_conflict",
+					Message:           "runtime kind slot is occupied by another running instance",
+					Blocking:          true,
+					RelatedInstanceID: strings.TrimSpace(other.ID),
+					Detail: map[string]interface{}{
+						"runtime_kind": runtimeKind,
+					},
+				})
+			}
+		}
+
+		if strings.EqualFold(strings.TrimSpace(other.ModelID), strings.TrimSpace(item.ModelID)) && loadLike && !observedRunning {
+			appendReason(model.RuntimeConditionReason{
+				Code:              "duplicate_model_instance",
+				Message:           "same model has another active instance on this node",
+				Blocking:          true,
+				RelatedInstanceID: strings.TrimSpace(other.ID),
+			})
+		}
+	}
+
+	if resolvedCtx != nil {
+		if !resolvedCtx.Manifest.CommandOverrideAllowed && len(resolvedCtx.Binding.CommandOverride) > 0 {
+			appendReason(model.RuntimeConditionReason{
+				Code:     "command_override_not_allowed",
+				Message:  "binding command override is forbidden by manifest",
+				Blocking: true,
+			})
+		}
+		if !resolvedCtx.Manifest.ScriptMountAllowed &&
+			(strings.TrimSpace(resolvedCtx.Binding.ScriptRef) != "" || resolvedCtx.Binding.BindingMode == model.RuntimeBindingModeGenericWithScript) {
+			appendReason(model.RuntimeConditionReason{
+				Code:     "script_mount_not_allowed",
+				Message:  "binding script usage is forbidden by manifest",
+				Blocking: true,
+			})
+		}
+	}
+
+	for _, code := range item.PrecheckReasons {
+		normalized := strings.TrimSpace(strings.ToLower(code))
+		if normalized == string(model.PrecheckReasonCommandOverrideNotAllowed) || normalized == string(model.PrecheckReasonScriptMountNotAllowed) {
+			appendReason(model.RuntimeConditionReason{
+				Code:     normalized,
+				Message:  normalized,
+				Blocking: true,
+			})
+		}
+	}
+
+	if agentSignalKnown && !agentOnline && loadLike {
+		appendReason(model.RuntimeConditionReason{
+			Code:     "local_agent_offline",
+			Message:  "local-agent is offline or unavailable",
+			Blocking: true,
+		})
+	}
+	if observationStale && loadLike {
+		appendReason(model.RuntimeConditionReason{
+			Code:     "agent_observation_stale",
+			Message:  "agent observation is stale",
+			Blocking: true,
+		})
+	}
+
+	blocking := false
+	for _, reason := range reasons {
+		if reason.Blocking {
+			blocking = true
+			break
+		}
+	}
+	status := model.RuntimeConflictStatusClear
+	if len(reasons) > 0 {
+		if blocking {
+			status = model.RuntimeConflictStatusBlocked
+		} else {
+			status = model.RuntimeConflictStatusWarning
+		}
+	}
+	return model.RuntimeConflictSummary{
+		Status:      status,
+		Blocking:    blocking,
+		Reasons:     reasons,
+		GeneratedAt: now,
+		Source:      model.RuntimeSignalSourceController,
+	}
+}
+
+func buildRuntimeGatingSummary(
+	precheck *model.RuntimePrecheckSummary,
+	conflict model.RuntimeConflictSummary,
+	targetAction model.RuntimeLifecycleAction,
+	now time.Time,
+) model.RuntimeGatingSummary {
+	reasons := make([]model.RuntimeConditionReason, 0, 12)
+	allowed := true
+	status := model.RuntimeGatingStatusAllowed
+	loadLike := isRuntimeLoadLikeAction(targetAction)
+
+	appendReason := func(reason model.RuntimeConditionReason) {
+		code := strings.TrimSpace(reason.Code)
+		if code == "" {
+			return
+		}
+		for _, existing := range reasons {
+			if strings.EqualFold(strings.TrimSpace(existing.Code), code) &&
+				strings.EqualFold(strings.TrimSpace(existing.RelatedInstanceID), strings.TrimSpace(reason.RelatedInstanceID)) {
+				return
+			}
+		}
+		reasons = append(reasons, reason)
+		if reason.Blocking && loadLike {
+			allowed = false
+		}
+	}
+
+	if precheck != nil {
+		for _, reason := range precheck.Reasons {
+			appendReason(reason)
+		}
+		if precheck.Gating && loadLike {
+			allowed = false
+			status = model.RuntimeGatingStatusBlocked
+		}
+	}
+	for _, reason := range conflict.Reasons {
+		appendReason(reason)
+	}
+	if conflict.Blocking && loadLike {
+		allowed = false
+	}
+
+	if !allowed {
+		if hasReasonCode(reasons, "runtime_kind_mutex_conflict") {
+			status = model.RuntimeGatingStatusDeferred
+		} else {
+			status = model.RuntimeGatingStatusBlocked
+		}
+	} else if !loadLike && !isRuntimeReleaseLikeAction(targetAction) && targetAction == model.RuntimeLifecycleActionNone {
+		status = model.RuntimeGatingStatusAllowed
+	}
+
+	return model.RuntimeGatingSummary{
+		Status:       status,
+		Allowed:      allowed,
+		Reasons:      reasons,
+		GeneratedAt:  now,
+		Source:       model.RuntimeSignalSourceController,
+		TargetAction: targetAction,
+	}
+}
+
+func buildRuntimeLifecyclePlanSummary(
+	item model.RuntimeInstance,
+	gating model.RuntimeGatingSummary,
+	conflict model.RuntimeConflictSummary,
+	targetAction model.RuntimeLifecycleAction,
+	trigger string,
+	now time.Time,
+) model.RuntimeLifecyclePlanSummary {
+	plan := model.RuntimeLifecyclePlanSummary{
+		PlanID:      fmt.Sprintf("plan-%s-%d", safeIDSegment(item.ID), now.UnixNano()),
+		Action:      model.RuntimeLifecycleActionNone,
+		Status:      model.RuntimeLifecyclePlanStatusCompleted,
+		Message:     "no lifecycle transition required",
+		TriggeredBy: strings.TrimSpace(trigger),
+		Source:      model.RuntimeSignalSourceController,
+		GeneratedAt: now,
+		UpdatedAt:   now,
+	}
+	plan.ReasonCodes = normalizeReasonCodesFromConditionReasons(gating.Reasons, nil)
+
+	if targetAction == model.RuntimeLifecycleActionNone {
+		return plan
+	}
+
+	if !gating.Allowed {
+		plan.Action = normalizePlannedAction(targetAction)
+		plan.Status = model.RuntimeLifecyclePlanStatusBlocked
+		plan.Message = "lifecycle transition blocked by gating/conflict"
+		plan.BlockedReasonCodes = collectBlockingReasonCodes(gating.Reasons)
+		plan.ReleaseTargets = collectReleaseTargetsFromConflict(conflict.Reasons)
+		if gating.Status == model.RuntimeGatingStatusDeferred && len(plan.ReleaseTargets) > 0 {
+			plan.Status = model.RuntimeLifecyclePlanStatusDeferred
+			plan.Message = "lifecycle transition deferred until release targets stop"
+		}
+		return plan
+	}
+
+	plan.Action = normalizePlannedAction(targetAction)
+	plan.Status = model.RuntimeLifecyclePlanStatusPlanned
+	switch plan.Action {
+	case model.RuntimeLifecycleActionLoad, model.RuntimeLifecycleActionLoadStart, model.RuntimeLifecycleActionStart:
+		plan.RequestedTaskType = model.TaskTypeRuntimeStart
+		plan.Message = "instance planned to load/start"
+	case model.RuntimeLifecycleActionUnload, model.RuntimeLifecycleActionStop:
+		plan.RequestedTaskType = model.TaskTypeRuntimeStop
+		plan.Message = "instance planned to stop/unload"
+	default:
+		plan.Message = "instance lifecycle action planned"
+	}
+	return plan
+}
+
+func normalizePlannedAction(action model.RuntimeLifecycleAction) model.RuntimeLifecycleAction {
+	switch action {
+	case model.RuntimeLifecycleActionLoadStart:
+		return model.RuntimeLifecycleActionLoad
+	case model.RuntimeLifecycleActionRelease:
+		return model.RuntimeLifecycleActionUnload
+	default:
+		return action
+	}
+}
+
+func collectBlockingReasonCodes(reasons []model.RuntimeConditionReason) []string {
+	out := make([]string, 0, len(reasons))
+	for _, reason := range reasons {
+		if !reason.Blocking {
+			continue
+		}
+		code := strings.TrimSpace(reason.Code)
+		if code == "" {
+			continue
+		}
+		out = append(out, code)
+	}
+	return normalizeStringList(out)
+}
+
+func collectReleaseTargetsFromConflict(reasons []model.RuntimeConditionReason) []string {
+	targets := make([]string, 0, len(reasons))
+	for _, reason := range reasons {
+		if strings.TrimSpace(reason.Code) != "runtime_kind_mutex_conflict" {
+			continue
+		}
+		id := strings.TrimSpace(reason.RelatedInstanceID)
+		if id == "" {
+			continue
+		}
+		targets = append(targets, id)
+	}
+	return normalizeStringList(targets)
+}
+
+func hasReasonCode(reasons []model.RuntimeConditionReason, code string) bool {
+	code = strings.TrimSpace(strings.ToLower(code))
+	for _, reason := range reasons {
+		if strings.TrimSpace(strings.ToLower(reason.Code)) == code {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveRuntimeKindForInstance(item model.RuntimeInstance, resolvedCtx *RuntimeInstanceResolvedContext) model.RuntimeKind {
+	if resolvedCtx != nil {
+		return resolvedCtx.Manifest.RuntimeKind
+	}
+	if item.Metadata != nil {
+		if raw := strings.TrimSpace(item.Metadata["runtime_kind"]); raw != "" {
+			return model.RuntimeKind(raw)
+		}
+	}
+	return model.RuntimeKindUnknown
+}
+
+func extractRuntimeHostPorts(ports []string) []string {
+	out := make([]string, 0, len(ports))
+	for _, raw := range ports {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			continue
+		}
+		main := value
+		if idx := strings.Index(main, "/"); idx > 0 {
+			main = main[:idx]
+		}
+		parts := strings.Split(main, ":")
+		candidate := ""
+		switch len(parts) {
+		case 1:
+			candidate = strings.TrimSpace(parts[0])
+		case 2:
+			candidate = strings.TrimSpace(parts[0])
+		default:
+			candidate = strings.TrimSpace(parts[len(parts)-2])
+		}
+		if candidate != "" {
+			out = append(out, candidate)
+		}
+	}
+	return normalizeStringList(out)
+}
+
+func intersectFirstString(a, b []string) string {
+	if len(a) == 0 || len(b) == 0 {
+		return ""
+	}
+	lookup := map[string]struct{}{}
+	for _, item := range b {
+		lookup[strings.TrimSpace(strings.ToLower(item))] = struct{}{}
+	}
+	for _, item := range a {
+		key := strings.TrimSpace(strings.ToLower(item))
+		if key == "" {
+			continue
+		}
+		if _, ok := lookup[key]; ok {
+			return strings.TrimSpace(item)
+		}
+	}
+	return ""
+}
+
+func isRuntimeInstanceOccupyingSlots(item model.RuntimeInstance) bool {
+	observed := strings.TrimSpace(strings.ToLower(item.ObservedState))
+	desired := strings.TrimSpace(strings.ToLower(item.DesiredState))
+	if observed == string(model.ModelStateRunning) {
+		return true
+	}
+	if desired == string(model.ModelStateRunning) && observed != string(model.ModelStateStopped) {
+		return true
+	}
+	if item.LastLifecyclePlan != nil {
+		action := strings.TrimSpace(strings.ToLower(string(item.LastLifecyclePlan.Action)))
+		status := strings.TrimSpace(strings.ToLower(string(item.LastLifecyclePlan.Status)))
+		if (action == string(model.RuntimeLifecycleActionLoad) || action == string(model.RuntimeLifecycleActionLoadStart) || action == string(model.RuntimeLifecycleActionStart)) &&
+			(status == string(model.RuntimeLifecyclePlanStatusPlanned) || status == string(model.RuntimeLifecyclePlanStatusExecuting) || status == string(model.RuntimeLifecyclePlanStatusDeferred)) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *RuntimeObjectService) applyReleasePlanToTargets(ctx context.Context, ownerInstanceID string, targetIDs []string, trigger string, now time.Time) error {
+	targetIDs = normalizeStringList(targetIDs)
+	if len(targetIDs) == 0 {
+		return nil
+	}
+	var errs []error
+	for _, targetID := range targetIDs {
+		if strings.EqualFold(strings.TrimSpace(targetID), strings.TrimSpace(ownerInstanceID)) {
+			continue
+		}
+		target, err := s.GetRuntimeInstance(ctx, targetID)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		target.LastLifecyclePlan = &model.RuntimeLifecyclePlanSummary{
+			PlanID:            fmt.Sprintf("plan-release-%s-%d", safeIDSegment(target.ID), now.UnixNano()),
+			Action:            model.RuntimeLifecycleActionUnload,
+			Status:            model.RuntimeLifecyclePlanStatusPlanned,
+			Message:           fmt.Sprintf("planned unload to release runtime slot for %s", ownerInstanceID),
+			ReasonCodes:       []string{"runtime_kind_mutex_release"},
+			RequestedTaskType: model.TaskTypeRuntimeStop,
+			TriggeredBy:       strings.TrimSpace(trigger),
+			Source:            model.RuntimeSignalSourceController,
+			GeneratedAt:       now,
+			UpdatedAt:         now,
+		}
+		target.LastPlanAction = target.LastLifecyclePlan.Action
+		target.LastPlanStatus = target.LastLifecyclePlan.Status
+		target.LastPlanReason = strings.TrimSpace(target.LastLifecyclePlan.Message)
+		target.LastPlanGeneratedAt = now
+		target.LastPlanDetail = map[string]interface{}{
+			"release_for_instance": strings.TrimSpace(ownerInstanceID),
+			"reason_codes":         []string{"runtime_kind_mutex_release"},
+		}
+		if err := s.upsertRuntimeInstance(ctx, target); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if s.projection != nil {
+			if projErr := s.projection.ApplyRuntimeInstanceProjection(ctx, target); projErr != nil {
+				s.logger.Warn("runtime instance projection for release plan target failed", "runtime_instance_id", target.ID, "error", projErr)
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
 func (s *RuntimeObjectService) ApplyAgentTaskObservation(ctx context.Context, task model.Task) error {
 	if !isSupportedAgentTaskType(task.Type) {
 		return nil
@@ -344,6 +1414,7 @@ func (s *RuntimeObjectService) ApplyAgentTaskObservation(ctx context.Context, ta
 	if msg == "" {
 		msg = "agent task reported"
 	}
+	detailView := flattenAgentTaskDetail(task.Detail)
 	s.hydrateRuntimeInstanceDerivedFields(&item)
 	if item.Metadata == nil {
 		item.Metadata = map[string]string{}
@@ -378,22 +1449,22 @@ func (s *RuntimeObjectService) ApplyAgentTaskObservation(ctx context.Context, ta
 	)
 
 	if endpoint := firstNonEmpty(
-		strings.TrimSpace(fmt.Sprint(task.Detail["runtime_service_endpoint"])),
-		strings.TrimSpace(fmt.Sprint(task.Detail["endpoint"])),
+		strings.TrimSpace(fmt.Sprint(detailView["runtime_service_endpoint"])),
+		strings.TrimSpace(fmt.Sprint(detailView["endpoint"])),
 		strings.TrimSpace(readStringFromObjectMap(task.Payload, "endpoint")),
 		strings.TrimSpace(readStringFromNestedObjectMap(task.Payload, "resolved_context", "endpoint")),
 	); endpoint != "" && endpoint != "<nil>" {
 		item.Endpoint = endpoint
 	}
 	if containerID := firstNonEmpty(
-		strings.TrimSpace(fmt.Sprint(task.Detail["runtime_container_id"])),
+		strings.TrimSpace(fmt.Sprint(detailView["runtime_container_id"])),
 		strings.TrimSpace(readStringFromObjectMap(task.Payload, "runtime_container_id")),
 		strings.TrimSpace(readStringFromNestedObjectMap(task.Payload, "resolved_context", "runtime_container_id")),
 	); containerID != "" && containerID != "<nil>" {
 		item.Metadata["runtime_container_id"] = containerID
 	}
 	if mounts := firstNonEmptyStringSlice(
-		readStringSliceFromObjectMap(task.Detail, "resolved_mounts"),
+		readStringSliceFromObjectMap(detailView, "resolved_mounts"),
 		readStringSliceFromObjectMap(task.Payload, "binding_mount_rules"),
 		readStringSliceFromObjectMap(task.Payload, "mount_points"),
 	); len(mounts) > 0 {
@@ -401,14 +1472,14 @@ func (s *RuntimeObjectService) ApplyAgentTaskObservation(ctx context.Context, ta
 		item.MountedPaths = cloneStringSlice(mounts)
 	}
 	if ports := firstNonEmptyStringSlice(
-		readStringSliceFromObjectMap(task.Detail, "resolved_ports"),
+		readStringSliceFromObjectMap(detailView, "resolved_ports"),
 		readStringSliceFromObjectMap(task.Payload, "exposed_ports"),
 		readStringSliceFromObjectMap(task.Payload, "resolved_ports"),
 	); len(ports) > 0 {
 		item.ResolvedPorts = cloneStringSlice(ports)
 	}
 	if script := firstNonEmpty(
-		strings.TrimSpace(fmt.Sprint(task.Detail["resolved_script"])),
+		strings.TrimSpace(fmt.Sprint(detailView["resolved_script"])),
 		strings.TrimSpace(readStringFromObjectMap(task.Payload, "script_ref")),
 		strings.TrimSpace(readStringFromNestedObjectMap(task.Payload, "resolved_context", "script_ref")),
 	); script != "" && script != "<nil>" {
@@ -427,13 +1498,33 @@ func (s *RuntimeObjectService) ApplyAgentTaskObservation(ctx context.Context, ta
 		} else {
 			item.PrecheckStatus = model.PrecheckStatusFailed
 			item.PrecheckGating = true
-			item.PrecheckReasons = cloneStringSlice(readStringSliceFromObjectMap(task.Detail, "precheck_failures"))
+			item.PrecheckReasons = cloneStringSlice(readStringSliceFromObjectMap(detailView, "precheck_failures"))
 		}
-		if precheck := decodeRuntimePrecheckResult(task.Detail["precheck_result"]); precheck != nil {
+		if precheck := decodeRuntimePrecheckResult(firstNonNil(detailView["precheck_result"], detailView["structured_result"])); precheck != nil {
 			item.PrecheckResult = precheck
 			item.PrecheckStatus = precheck.OverallStatus
 			item.PrecheckGating = precheck.Gating
 			item.PrecheckReasons = extractPrecheckReasonCodes(precheck.Reasons)
+			reasons := make([]model.RuntimeConditionReason, 0, len(precheck.Reasons))
+			for _, reason := range precheck.Reasons {
+				reasons = append(reasons, model.RuntimeConditionReason{
+					Code:              strings.TrimSpace(string(reason.Code)),
+					Message:           strings.TrimSpace(reason.Message),
+					Blocking:          reason.Blocking,
+					Source:            model.RuntimeSignalSourceAgent,
+					RelatedInstanceID: strings.TrimSpace(item.ID),
+					RelatedNodeID:     strings.TrimSpace(item.NodeID),
+					RelatedBindingID:  strings.TrimSpace(item.BindingID),
+					Detail:            cloneObjectMap(reason.Detail),
+				})
+			}
+			item.PrecheckSummary = &model.RuntimePrecheckSummary{
+				Status:      precheck.OverallStatus,
+				Gating:      precheck.Gating,
+				Reasons:     reasons,
+				GeneratedAt: chooseTaskEventTime(task, now),
+				Source:      model.RuntimeSignalSourceAgent,
+			}
 			if len(precheck.ResolvedMounts) > 0 {
 				item.ResolvedMounts = cloneStringSlice(precheck.ResolvedMounts)
 				item.MountedPaths = cloneStringSlice(precheck.ResolvedMounts)
@@ -448,6 +1539,14 @@ func (s *RuntimeObjectService) ApplyAgentTaskObservation(ctx context.Context, ta
 			if len(precheck.ResolvedEnv) > 0 {
 				item.InjectedEnv = cloneStringMap(precheck.ResolvedEnv)
 			}
+		} else {
+			item.PrecheckSummary = &model.RuntimePrecheckSummary{
+				Status:      item.PrecheckStatus,
+				Gating:      item.PrecheckGating,
+				Reasons:     precheckReasonsToConditionReasons(item.PrecheckReasons, model.RuntimeSignalSourceAgent, item.ID, item.NodeID, item.BindingID),
+				GeneratedAt: chooseTaskEventTime(task, now),
+				Source:      model.RuntimeSignalSourceAgent,
+			}
 		}
 		if item.PrecheckGating {
 			item.Readiness = model.ReadinessNotReady
@@ -455,9 +1554,9 @@ func (s *RuntimeObjectService) ApplyAgentTaskObservation(ctx context.Context, ta
 		}
 		item.HealthMessage = firstNonEmpty(msg, item.HealthMessage)
 	case model.TaskTypeAgentRuntimeReadiness:
-		ready, hasReady := boolFromTaskDetail(task.Detail, "runtime_ready")
+		ready, hasReady := boolFromTaskDetail(detailView, "runtime_ready")
 		if !hasReady {
-			ready, hasReady = boolFromTaskDetail(task.Detail, "ready")
+			ready, hasReady = boolFromTaskDetail(detailView, "ready")
 		}
 		if hasReady {
 			if ready {
@@ -473,7 +1572,7 @@ func (s *RuntimeObjectService) ApplyAgentTaskObservation(ctx context.Context, ta
 		}
 		item.HealthMessage = firstNonEmpty(msg, item.HealthMessage)
 	case model.TaskTypeAgentPortCheck:
-		if hostPort := strings.TrimSpace(fmt.Sprint(task.Detail["host_port"])); hostPort != "" && hostPort != "<nil>" {
+		if hostPort := strings.TrimSpace(fmt.Sprint(detailView["host_port"])); hostPort != "" && hostPort != "<nil>" {
 			item.ResolvedPorts = appendUniqueString(item.ResolvedPorts, hostPort)
 		}
 		if !success {
@@ -481,11 +1580,11 @@ func (s *RuntimeObjectService) ApplyAgentTaskObservation(ctx context.Context, ta
 		}
 		item.HealthMessage = firstNonEmpty(msg, item.HealthMessage)
 	case model.TaskTypeAgentModelPathCheck:
-		if absPath := strings.TrimSpace(fmt.Sprint(task.Detail["abs_path"])); absPath != "" && absPath != "<nil>" {
+		if absPath := strings.TrimSpace(fmt.Sprint(detailView["abs_path"])); absPath != "" && absPath != "<nil>" {
 			item.ResolvedMounts = appendUniqueString(item.ResolvedMounts, absPath)
 			item.MountedPaths = appendUniqueString(item.MountedPaths, absPath)
 		}
-		if exists, ok := boolFromTaskDetail(task.Detail, "exists"); ok && !exists {
+		if exists, ok := boolFromTaskDetail(detailView, "exists"); ok && !exists {
 			item.Readiness = model.ReadinessNotReady
 		}
 		if !success {
@@ -493,14 +1592,14 @@ func (s *RuntimeObjectService) ApplyAgentTaskObservation(ctx context.Context, ta
 		}
 		item.HealthMessage = firstNonEmpty(msg, item.HealthMessage)
 	case model.TaskTypeAgentDockerInspect, model.TaskTypeAgentDockerStart, model.TaskTypeAgentDockerStop:
-		exists, hasExists := boolFromTaskDetail(task.Detail, "runtime_exists")
-		running, hasRunning := boolFromTaskDetail(task.Detail, "runtime_running")
+		exists, hasExists := boolFromTaskDetail(detailView, "runtime_exists")
+		running, hasRunning := boolFromTaskDetail(detailView, "runtime_running")
 		if hasExists && !exists {
 			item.ObservedState = "stopped"
 			item.Readiness = model.ReadinessNotReady
 		} else if hasRunning && running {
 			item.ObservedState = "running"
-			if ready, ok := boolFromTaskDetail(task.Detail, "runtime_ready"); ok && !ready {
+			if ready, ok := boolFromTaskDetail(detailView, "runtime_ready"); ok && !ready {
 				item.Readiness = model.ReadinessNotReady
 			} else {
 				item.Readiness = model.ReadinessReady
@@ -513,7 +1612,7 @@ func (s *RuntimeObjectService) ApplyAgentTaskObservation(ctx context.Context, ta
 	case model.TaskTypeAgentResourceSnapshot:
 		item.Metadata["last_resource_snapshot_task_id"] = task.ID
 		item.Metadata["last_resource_snapshot_at"] = now.Format(time.RFC3339)
-		if snapshot, ok := task.Detail["resource_snapshot"].(map[string]interface{}); ok {
+		if snapshot, ok := detailView["resource_snapshot"].(map[string]interface{}); ok {
 			if hostname := strings.TrimSpace(fmt.Sprint(snapshot["hostname"])); hostname != "" && hostname != "<nil>" {
 				item.Metadata["snapshot_hostname"] = hostname
 			}
@@ -524,7 +1623,7 @@ func (s *RuntimeObjectService) ApplyAgentTaskObservation(ctx context.Context, ta
 		item.HealthMessage = firstNonEmpty(msg, item.HealthMessage)
 	}
 
-	if observed := strings.TrimSpace(fmt.Sprint(task.Detail["observed_state"])); observed != "" && observed != "<nil>" {
+	if observed := strings.TrimSpace(fmt.Sprint(detailView["observed_state"])); observed != "" && observed != "<nil>" {
 		item.ObservedState = observed
 	}
 	if item.PrecheckGating && item.Readiness == model.ReadinessReady {
@@ -536,7 +1635,11 @@ func (s *RuntimeObjectService) ApplyAgentTaskObservation(ctx context.Context, ta
 		}
 	}
 	item.LastReconciledAt = now
-	return s.upsertRuntimeInstance(ctx, item)
+	if err := s.upsertRuntimeInstance(ctx, item); err != nil {
+		return err
+	}
+	_, err = s.ReconcileRuntimeInstance(ctx, item.ID, "agent_task_report")
+	return err
 }
 
 func decodeRuntimePrecheckResult(raw interface{}) *model.RuntimePrecheckResult {
@@ -555,6 +1658,45 @@ func decodeRuntimePrecheckResult(raw interface{}) *model.RuntimePrecheckResult {
 		return nil
 	}
 	return &out
+}
+
+func flattenAgentTaskDetail(detail map[string]interface{}) map[string]interface{} {
+	out := cloneObjectMap(detail)
+	if out == nil {
+		out = map[string]interface{}{}
+	}
+	if nestedDetail, ok := detail["detail"].(map[string]interface{}); ok {
+		for k, v := range nestedDetail {
+			key := strings.TrimSpace(k)
+			if key == "" {
+				continue
+			}
+			if _, exists := out[key]; !exists {
+				out[key] = v
+			}
+		}
+	}
+	if structured, ok := detail["structured_result"].(map[string]interface{}); ok {
+		for k, v := range structured {
+			key := strings.TrimSpace(k)
+			if key == "" {
+				continue
+			}
+			if _, exists := out[key]; !exists {
+				out[key] = v
+			}
+		}
+	}
+	return out
+}
+
+func firstNonNil(values ...interface{}) interface{} {
+	for _, value := range values {
+		if value != nil {
+			return value
+		}
+	}
+	return nil
 }
 
 func extractPrecheckReasonCodes(reasons []model.RuntimePrecheckReason) []string {
@@ -618,6 +1760,65 @@ func appendUniqueString(in []string, value string) []string {
 	return out
 }
 
+func appendRuntimeMessage(base, extra string) string {
+	base = strings.TrimSpace(base)
+	extra = strings.TrimSpace(extra)
+	if extra == "" {
+		return base
+	}
+	if base == "" {
+		return extra
+	}
+	if strings.Contains(strings.ToLower(base), strings.ToLower(extra)) {
+		return base
+	}
+	return base + "; " + extra
+}
+
+func clearDesiredObservedDrift(current, desired, observed string) string {
+	normalized := strings.ToLower(strings.TrimSpace(current))
+	if !strings.HasPrefix(normalized, "desired=") {
+		return strings.TrimSpace(current)
+	}
+	if strings.EqualFold(strings.TrimSpace(desired), strings.TrimSpace(observed)) {
+		return ""
+	}
+	return strings.TrimSpace(current)
+}
+
+func chooseReadinessState(primary, fallback model.ReadinessState) model.ReadinessState {
+	if strings.TrimSpace(string(primary)) != "" && primary != model.ReadinessUnknown {
+		return primary
+	}
+	if strings.TrimSpace(string(fallback)) != "" {
+		return fallback
+	}
+	return model.ReadinessUnknown
+}
+
+func chooseNewerTime(a, b time.Time) time.Time {
+	if a.IsZero() {
+		return b
+	}
+	if b.IsZero() {
+		return a
+	}
+	if a.After(b) {
+		return a.UTC()
+	}
+	return b.UTC()
+}
+
+func firstNonEmptySignalSource(primary, fallback model.RuntimeSignalSource) model.RuntimeSignalSource {
+	if strings.TrimSpace(string(primary)) != "" && primary != model.RuntimeSignalSourceUnknown {
+		return primary
+	}
+	if strings.TrimSpace(string(fallback)) != "" {
+		return fallback
+	}
+	return model.RuntimeSignalSourceUnknown
+}
+
 func (s *RuntimeObjectService) hydrateRuntimeInstanceDerivedFields(item *model.RuntimeInstance) {
 	if item == nil {
 		return
@@ -645,6 +1846,58 @@ func (s *RuntimeObjectService) hydrateRuntimeInstanceDerivedFields(item *model.R
 	}
 	if item.LastAgentTask == nil {
 		item.LastAgentTask = parseRuntimeInstanceAgentTaskSummary(item.Metadata["last_agent_task_json"])
+	}
+	if item.PrecheckSummary == nil {
+		item.PrecheckSummary = parseRuntimePrecheckSummary(item.Metadata["precheck_summary_json"])
+	}
+	if item.ConflictSummary == nil {
+		item.ConflictSummary = parseRuntimeConflictSummary(item.Metadata["conflict_summary_json"])
+	}
+	if item.GatingSummary == nil {
+		item.GatingSummary = parseRuntimeGatingSummary(item.Metadata["gating_summary_json"])
+	}
+	if item.LastLifecyclePlan == nil {
+		item.LastLifecyclePlan = parseRuntimeLifecyclePlanSummary(item.Metadata["last_lifecycle_plan_json"])
+	}
+	if item.PrecheckSummary != nil {
+		item.PrecheckStatus = model.PrecheckOverallStatus(firstNonEmpty(strings.TrimSpace(string(item.PrecheckStatus)), strings.TrimSpace(string(item.PrecheckSummary.Status))))
+		item.PrecheckGating = item.PrecheckGating || item.PrecheckSummary.Gating
+		item.PrecheckReasons = normalizeReasonCodesFromConditionReasons(item.PrecheckSummary.Reasons, item.PrecheckReasons)
+	}
+	if item.ConflictSummary != nil {
+		item.ConflictStatus = model.RuntimeConflictStatus(firstNonEmpty(strings.TrimSpace(string(item.ConflictStatus)), strings.TrimSpace(string(item.ConflictSummary.Status))))
+		item.ConflictBlocking = item.ConflictBlocking || item.ConflictSummary.Blocking
+		item.ConflictSource = model.RuntimeSignalSource(firstNonEmpty(strings.TrimSpace(string(item.ConflictSource)), strings.TrimSpace(string(item.ConflictSummary.Source))))
+		item.ConflictGeneratedAt = chooseNewerTime(item.ConflictGeneratedAt, item.ConflictSummary.GeneratedAt)
+		item.ConflictReasons = normalizeReasonCodesFromConditionReasons(item.ConflictSummary.Reasons, item.ConflictReasons)
+	}
+	if item.GatingSummary != nil {
+		item.GatingStatus = model.RuntimeGatingStatus(firstNonEmpty(strings.TrimSpace(string(item.GatingStatus)), strings.TrimSpace(string(item.GatingSummary.Status))))
+		item.GatingAllowed = item.GatingAllowed || item.GatingSummary.Allowed
+		item.GatingSource = model.RuntimeSignalSource(firstNonEmpty(strings.TrimSpace(string(item.GatingSource)), strings.TrimSpace(string(item.GatingSummary.Source))))
+		item.GatingGeneratedAt = chooseNewerTime(item.GatingGeneratedAt, item.GatingSummary.GeneratedAt)
+		item.GatingReasons = normalizeReasonCodesFromConditionReasons(item.GatingSummary.Reasons, item.GatingReasons)
+	}
+	if item.LastLifecyclePlan != nil {
+		item.LastPlanAction = model.RuntimeLifecycleAction(firstNonEmpty(strings.TrimSpace(string(item.LastPlanAction)), strings.TrimSpace(string(item.LastLifecyclePlan.Action))))
+		item.LastPlanStatus = model.RuntimeLifecyclePlanStatus(firstNonEmpty(strings.TrimSpace(string(item.LastPlanStatus)), strings.TrimSpace(string(item.LastLifecyclePlan.Status))))
+		item.LastPlanReason = firstNonEmpty(strings.TrimSpace(item.LastPlanReason), strings.TrimSpace(item.LastLifecyclePlan.Message))
+		item.LastPlanGeneratedAt = chooseNewerTime(item.LastPlanGeneratedAt, chooseNewerTime(item.LastLifecyclePlan.GeneratedAt, item.LastLifecyclePlan.UpdatedAt))
+		if item.LastPlanDetail == nil {
+			item.LastPlanDetail = map[string]interface{}{}
+		}
+		if strings.TrimSpace(item.LastLifecyclePlan.PlanID) != "" {
+			item.LastPlanDetail["plan_id"] = strings.TrimSpace(item.LastLifecyclePlan.PlanID)
+		}
+		if len(item.LastLifecyclePlan.ReasonCodes) > 0 {
+			item.LastPlanDetail["reason_codes"] = cloneStringSlice(item.LastLifecyclePlan.ReasonCodes)
+		}
+		if len(item.LastLifecyclePlan.BlockedReasonCodes) > 0 {
+			item.LastPlanDetail["blocked_reason_codes"] = cloneStringSlice(item.LastLifecyclePlan.BlockedReasonCodes)
+		}
+		if len(item.LastLifecyclePlan.ReleaseTargets) > 0 {
+			item.LastPlanDetail["release_targets"] = cloneStringSlice(item.LastLifecyclePlan.ReleaseTargets)
+		}
 	}
 }
 
@@ -692,6 +1945,61 @@ func (s *RuntimeObjectService) persistRuntimeInstanceDerivedFields(item *model.R
 			item.Metadata["last_agent_task_at"] = item.LastAgentTask.FinishedAt.UTC().Format(time.RFC3339)
 		}
 	}
+	if item.PrecheckSummary == nil && (strings.TrimSpace(string(item.PrecheckStatus)) != "" || item.PrecheckGating || len(item.PrecheckReasons) > 0) {
+		item.PrecheckSummary = &model.RuntimePrecheckSummary{
+			Status:      item.PrecheckStatus,
+			Gating:      item.PrecheckGating,
+			Reasons:     precheckReasonsToConditionReasons(item.PrecheckReasons, model.RuntimeSignalSourceController, item.ID, item.NodeID, item.BindingID),
+			GeneratedAt: chooseNewerTime(item.LastPrecheckAt, item.LastReconciledAt),
+			Source:      model.RuntimeSignalSourceController,
+		}
+	}
+	if item.ConflictSummary == nil && (strings.TrimSpace(string(item.ConflictStatus)) != "" || len(item.ConflictReasons) > 0 || item.ConflictBlocking) {
+		item.ConflictSummary = &model.RuntimeConflictSummary{
+			Status:      item.ConflictStatus,
+			Blocking:    item.ConflictBlocking,
+			Reasons:     precheckReasonsToConditionReasons(item.ConflictReasons, firstNonEmptySignalSource(item.ConflictSource, model.RuntimeSignalSourceController), item.ID, item.NodeID, item.BindingID),
+			GeneratedAt: chooseNewerTime(item.ConflictGeneratedAt, item.LastReconciledAt),
+			Source:      firstNonEmptySignalSource(item.ConflictSource, model.RuntimeSignalSourceController),
+		}
+	}
+	if item.GatingSummary == nil && (strings.TrimSpace(string(item.GatingStatus)) != "" || len(item.GatingReasons) > 0 || item.GatingAllowed) {
+		item.GatingSummary = &model.RuntimeGatingSummary{
+			Status:       item.GatingStatus,
+			Allowed:      item.GatingAllowed,
+			Reasons:      precheckReasonsToConditionReasons(item.GatingReasons, firstNonEmptySignalSource(item.GatingSource, model.RuntimeSignalSourceController), item.ID, item.NodeID, item.BindingID),
+			GeneratedAt:  chooseNewerTime(item.GatingGeneratedAt, item.LastReconciledAt),
+			Source:       firstNonEmptySignalSource(item.GatingSource, model.RuntimeSignalSourceController),
+			TargetAction: item.LastPlanAction,
+		}
+	}
+	if item.LastLifecyclePlan == nil && (strings.TrimSpace(string(item.LastPlanAction)) != "" || strings.TrimSpace(string(item.LastPlanStatus)) != "" || strings.TrimSpace(item.LastPlanReason) != "") {
+		item.LastLifecyclePlan = &model.RuntimeLifecyclePlanSummary{
+			PlanID:             strings.TrimSpace(fmt.Sprint(item.LastPlanDetail["plan_id"])),
+			Action:             item.LastPlanAction,
+			Status:             item.LastPlanStatus,
+			Message:            strings.TrimSpace(item.LastPlanReason),
+			ReasonCodes:        normalizeStringList(readStringSliceFromObjectMap(item.LastPlanDetail, "reason_codes")),
+			BlockedReasonCodes: normalizeStringList(readStringSliceFromObjectMap(item.LastPlanDetail, "blocked_reason_codes")),
+			ReleaseTargets:     normalizeStringList(readStringSliceFromObjectMap(item.LastPlanDetail, "release_targets")),
+			TriggeredBy:        firstNonEmpty(strings.TrimSpace(fmt.Sprint(item.LastPlanDetail["triggered_by"])), "controller.reconcile"),
+			Source:             model.RuntimeSignalSourceController,
+			GeneratedAt:        item.LastPlanGeneratedAt,
+			UpdatedAt:          item.LastPlanGeneratedAt,
+		}
+	}
+	if item.PrecheckSummary != nil {
+		item.Metadata["precheck_summary_json"] = mustJSON(item.PrecheckSummary, "{}")
+	}
+	if item.ConflictSummary != nil {
+		item.Metadata["conflict_summary_json"] = mustJSON(item.ConflictSummary, "{}")
+	}
+	if item.GatingSummary != nil {
+		item.Metadata["gating_summary_json"] = mustJSON(item.GatingSummary, "{}")
+	}
+	if item.LastLifecyclePlan != nil {
+		item.Metadata["last_lifecycle_plan_json"] = mustJSON(item.LastLifecyclePlan, "{}")
+	}
 }
 
 func parseJSONStringSlice(raw string) []string {
@@ -716,6 +2024,54 @@ func parseRuntimeInstanceAgentTaskSummary(raw string) *model.RuntimeInstanceAgen
 		return nil
 	}
 	if strings.TrimSpace(out.TaskID) == "" && strings.TrimSpace(string(out.TaskType)) == "" {
+		return nil
+	}
+	return &out
+}
+
+func parseRuntimePrecheckSummary(raw string) *model.RuntimePrecheckSummary {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "{}" || raw == "null" {
+		return nil
+	}
+	var out model.RuntimePrecheckSummary
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil
+	}
+	return &out
+}
+
+func parseRuntimeConflictSummary(raw string) *model.RuntimeConflictSummary {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "{}" || raw == "null" {
+		return nil
+	}
+	var out model.RuntimeConflictSummary
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil
+	}
+	return &out
+}
+
+func parseRuntimeGatingSummary(raw string) *model.RuntimeGatingSummary {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "{}" || raw == "null" {
+		return nil
+	}
+	var out model.RuntimeGatingSummary
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil
+	}
+	return &out
+}
+
+func parseRuntimeLifecyclePlanSummary(raw string) *model.RuntimeLifecyclePlanSummary {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "{}" || raw == "null" {
+		return nil
+	}
+	var out model.RuntimeLifecyclePlanSummary
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
 		return nil
 	}
 	return &out
@@ -957,6 +2313,83 @@ func (s *RuntimeObjectService) upsertRuntimeInstanceFromBinding(ctx context.Cont
 		PrecheckStatus: model.PrecheckStatusUnknown,
 		CreatedAt:      createdAt,
 		UpdatedAt:      time.Now().UTC(),
+	}
+	if ok {
+		instance.BindingMode = model.RuntimeBindingMode(firstNonEmpty(strings.TrimSpace(string(instance.BindingMode)), strings.TrimSpace(string(existing.BindingMode))))
+		instance.ManifestID = firstNonEmpty(strings.TrimSpace(instance.ManifestID), strings.TrimSpace(existing.ManifestID))
+		instance.NodeID = firstNonEmpty(strings.TrimSpace(instance.NodeID), strings.TrimSpace(existing.NodeID))
+		instance.ObservedState = firstNonEmpty(strings.TrimSpace(existing.ObservedState), strings.TrimSpace(instance.ObservedState))
+		instance.Readiness = chooseReadinessState(existing.Readiness, instance.Readiness)
+		instance.HealthMessage = firstNonEmpty(strings.TrimSpace(existing.HealthMessage), strings.TrimSpace(instance.HealthMessage))
+		instance.DriftReason = firstNonEmpty(strings.TrimSpace(existing.DriftReason), strings.TrimSpace(instance.DriftReason))
+		instance.Endpoint = firstNonEmpty(strings.TrimSpace(existing.Endpoint), strings.TrimSpace(instance.Endpoint))
+		instance.LastReconciledAt = chooseNewerTime(existing.LastReconciledAt, instance.LastReconciledAt)
+		instance.LastPrecheckAt = chooseNewerTime(existing.LastPrecheckAt, instance.LastPrecheckAt)
+		instance.LastPrecheckTaskID = firstNonEmpty(strings.TrimSpace(existing.LastPrecheckTaskID), strings.TrimSpace(instance.LastPrecheckTaskID))
+		instance.PrecheckStatus = model.PrecheckOverallStatus(firstNonEmpty(strings.TrimSpace(string(existing.PrecheckStatus)), strings.TrimSpace(string(instance.PrecheckStatus))))
+		instance.PrecheckGating = existing.PrecheckGating || instance.PrecheckGating
+		if len(existing.PrecheckReasons) > 0 {
+			instance.PrecheckReasons = cloneStringSlice(existing.PrecheckReasons)
+		}
+		if existing.PrecheckResult != nil {
+			instance.PrecheckResult = existing.PrecheckResult
+		}
+		if existing.PrecheckSummary != nil {
+			instance.PrecheckSummary = existing.PrecheckSummary
+		}
+		if existing.LastAgentTask != nil {
+			instance.LastAgentTask = existing.LastAgentTask
+		}
+		instance.ConflictStatus = model.RuntimeConflictStatus(firstNonEmpty(strings.TrimSpace(string(existing.ConflictStatus)), strings.TrimSpace(string(instance.ConflictStatus))))
+		instance.ConflictBlocking = existing.ConflictBlocking || instance.ConflictBlocking
+		instance.ConflictReasons = normalizeReasonCodesFromConditionReasons(precheckReasonsToConditionReasons(existing.ConflictReasons, model.RuntimeSignalSourceController, existing.ID, existing.NodeID, existing.BindingID), instance.ConflictReasons)
+		instance.ConflictSource = model.RuntimeSignalSource(firstNonEmpty(strings.TrimSpace(string(existing.ConflictSource)), strings.TrimSpace(string(instance.ConflictSource))))
+		instance.ConflictGeneratedAt = chooseNewerTime(existing.ConflictGeneratedAt, instance.ConflictGeneratedAt)
+		if existing.ConflictSummary != nil {
+			instance.ConflictSummary = existing.ConflictSummary
+		}
+		instance.GatingStatus = model.RuntimeGatingStatus(firstNonEmpty(strings.TrimSpace(string(existing.GatingStatus)), strings.TrimSpace(string(instance.GatingStatus))))
+		instance.GatingAllowed = existing.GatingAllowed || instance.GatingAllowed
+		instance.GatingReasons = normalizeReasonCodesFromConditionReasons(precheckReasonsToConditionReasons(existing.GatingReasons, model.RuntimeSignalSourceController, existing.ID, existing.NodeID, existing.BindingID), instance.GatingReasons)
+		instance.GatingSource = model.RuntimeSignalSource(firstNonEmpty(strings.TrimSpace(string(existing.GatingSource)), strings.TrimSpace(string(instance.GatingSource))))
+		instance.GatingGeneratedAt = chooseNewerTime(existing.GatingGeneratedAt, instance.GatingGeneratedAt)
+		if existing.GatingSummary != nil {
+			instance.GatingSummary = existing.GatingSummary
+		}
+		instance.LastPlanAction = model.RuntimeLifecycleAction(firstNonEmpty(strings.TrimSpace(string(existing.LastPlanAction)), strings.TrimSpace(string(instance.LastPlanAction))))
+		instance.LastPlanStatus = model.RuntimeLifecyclePlanStatus(firstNonEmpty(strings.TrimSpace(string(existing.LastPlanStatus)), strings.TrimSpace(string(instance.LastPlanStatus))))
+		instance.LastPlanReason = firstNonEmpty(strings.TrimSpace(existing.LastPlanReason), strings.TrimSpace(instance.LastPlanReason))
+		instance.LastPlanGeneratedAt = chooseNewerTime(existing.LastPlanGeneratedAt, instance.LastPlanGeneratedAt)
+		if len(existing.LastPlanDetail) > 0 && len(instance.LastPlanDetail) == 0 {
+			instance.LastPlanDetail = cloneObjectMap(existing.LastPlanDetail)
+		}
+		if existing.LastLifecyclePlan != nil {
+			instance.LastLifecyclePlan = existing.LastLifecyclePlan
+		}
+		if len(existing.ResolvedMounts) > 0 {
+			instance.ResolvedMounts = cloneStringSlice(existing.ResolvedMounts)
+		}
+		if len(existing.ResolvedPorts) > 0 {
+			instance.ResolvedPorts = cloneStringSlice(existing.ResolvedPorts)
+		}
+		if strings.TrimSpace(existing.ResolvedScript) != "" {
+			instance.ResolvedScript = strings.TrimSpace(existing.ResolvedScript)
+		}
+		if len(existing.MountedPaths) > 0 {
+			instance.MountedPaths = cloneStringSlice(existing.MountedPaths)
+		}
+		if strings.TrimSpace(existing.ScriptUsed) != "" {
+			instance.ScriptUsed = strings.TrimSpace(existing.ScriptUsed)
+		}
+		mergedMetadata := cloneStringMap(existing.Metadata)
+		for k, v := range instance.Metadata {
+			key := strings.TrimSpace(k)
+			if key == "" {
+				continue
+			}
+			mergedMetadata[key] = strings.TrimSpace(v)
+		}
+		instance.Metadata = mergedMetadata
 	}
 	if instance.NodeID == "" {
 		nodes := s.nodeRegistry.List()

@@ -1,6 +1,0 @@
-[2026-03-11T15:18:30.639183246Z] test run started: id=testrun-1773242310626649681 scenario=e5_embedding_smoke triggered_by=debug-check
-[2026-03-11T15:18:30.639209487Z] parameters: log_dir=/opt/controller/test-logs/testrun-1773242310626649681
-[2026-03-11T15:18:30.639657548Z] step=discover_model ok=true message=已找到 E5 模型 detail={"expected_dim":768,"model_id":"local-multilingual-e5-base"}
-[2026-03-11T15:18:30.645291631Z] step=runtime_start ok=true message=已创建 runtime start 任务 detail={"task_id":"task-1773242310639665644"}
-[2026-03-11T15:18:31.847149776Z] step=runtime_start_wait ok=false message=runtime start 任务未成功 detail={"error":"","message":"当前状态(stopped)不允许执行 start","status":"failed"}
-[2026-03-11T15:18:31.858142711Z] test run finished: status=failed summary=runtime start 任务未成功 error=task status=failed message=当前状态(stopped)不允许执行 start error=

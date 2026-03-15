@@ -241,6 +241,111 @@ type RuntimePrecheckResult struct {
 	FinishedAt          time.Time                          `json:"finished_at,omitempty"`
 }
 
+type RuntimeSignalSource string
+
+const (
+	RuntimeSignalSourceUnknown    RuntimeSignalSource = "unknown"
+	RuntimeSignalSourceAgent      RuntimeSignalSource = "agent"
+	RuntimeSignalSourceController RuntimeSignalSource = "controller"
+)
+
+type RuntimeConflictStatus string
+
+const (
+	RuntimeConflictStatusUnknown RuntimeConflictStatus = "unknown"
+	RuntimeConflictStatusClear   RuntimeConflictStatus = "clear"
+	RuntimeConflictStatusWarning RuntimeConflictStatus = "warning"
+	RuntimeConflictStatusBlocked RuntimeConflictStatus = "blocked"
+)
+
+type RuntimeGatingStatus string
+
+const (
+	RuntimeGatingStatusUnknown  RuntimeGatingStatus = "unknown"
+	RuntimeGatingStatusAllowed  RuntimeGatingStatus = "allowed"
+	RuntimeGatingStatusBlocked  RuntimeGatingStatus = "blocked"
+	RuntimeGatingStatusDeferred RuntimeGatingStatus = "deferred"
+)
+
+type RuntimeLifecycleAction string
+
+const (
+	RuntimeLifecycleActionNone      RuntimeLifecycleAction = "none"
+	RuntimeLifecycleActionLoad      RuntimeLifecycleAction = "load"
+	RuntimeLifecycleActionStart     RuntimeLifecycleAction = "start"
+	RuntimeLifecycleActionLoadStart RuntimeLifecycleAction = "load_start"
+	RuntimeLifecycleActionStop      RuntimeLifecycleAction = "stop"
+	RuntimeLifecycleActionUnload    RuntimeLifecycleAction = "unload"
+	RuntimeLifecycleActionRestart   RuntimeLifecycleAction = "restart"
+	RuntimeLifecycleActionRefresh   RuntimeLifecycleAction = "refresh"
+	RuntimeLifecycleActionRelease   RuntimeLifecycleAction = "release_slot"
+)
+
+type RuntimeLifecyclePlanStatus string
+
+const (
+	RuntimeLifecyclePlanStatusUnknown   RuntimeLifecyclePlanStatus = "unknown"
+	RuntimeLifecyclePlanStatusPlanned   RuntimeLifecyclePlanStatus = "planned"
+	RuntimeLifecyclePlanStatusExecuting RuntimeLifecyclePlanStatus = "executing"
+	RuntimeLifecyclePlanStatusCompleted RuntimeLifecyclePlanStatus = "completed"
+	RuntimeLifecyclePlanStatusBlocked   RuntimeLifecyclePlanStatus = "blocked"
+	RuntimeLifecyclePlanStatusDeferred  RuntimeLifecyclePlanStatus = "deferred"
+	RuntimeLifecyclePlanStatusFailed    RuntimeLifecyclePlanStatus = "failed"
+	RuntimeLifecyclePlanStatusRejected  RuntimeLifecyclePlanStatus = "rejected"
+)
+
+type RuntimeConditionReason struct {
+	Code              string                 `json:"code,omitempty"`
+	Message           string                 `json:"message,omitempty"`
+	Blocking          bool                   `json:"blocking"`
+	Source            RuntimeSignalSource    `json:"source,omitempty"`
+	RelatedInstanceID string                 `json:"related_instance_id,omitempty"`
+	RelatedNodeID     string                 `json:"related_node_id,omitempty"`
+	RelatedBindingID  string                 `json:"related_binding_id,omitempty"`
+	Detail            map[string]interface{} `json:"detail,omitempty"`
+}
+
+type RuntimePrecheckSummary struct {
+	Status      PrecheckOverallStatus    `json:"status,omitempty"`
+	Gating      bool                     `json:"gating"`
+	Reasons     []RuntimeConditionReason `json:"reasons,omitempty"`
+	GeneratedAt time.Time                `json:"generated_at,omitempty"`
+	Source      RuntimeSignalSource      `json:"source,omitempty"`
+}
+
+type RuntimeConflictSummary struct {
+	Status      RuntimeConflictStatus    `json:"status,omitempty"`
+	Blocking    bool                     `json:"blocking"`
+	Reasons     []RuntimeConditionReason `json:"reasons,omitempty"`
+	GeneratedAt time.Time                `json:"generated_at,omitempty"`
+	Source      RuntimeSignalSource      `json:"source,omitempty"`
+}
+
+type RuntimeGatingSummary struct {
+	Status       RuntimeGatingStatus      `json:"status,omitempty"`
+	Allowed      bool                     `json:"allowed"`
+	Reasons      []RuntimeConditionReason `json:"reasons,omitempty"`
+	GeneratedAt  time.Time                `json:"generated_at,omitempty"`
+	Source       RuntimeSignalSource      `json:"source,omitempty"`
+	TargetAction RuntimeLifecycleAction   `json:"target_action,omitempty"`
+}
+
+type RuntimeLifecyclePlanSummary struct {
+	PlanID             string                     `json:"plan_id,omitempty"`
+	Action             RuntimeLifecycleAction     `json:"action,omitempty"`
+	Status             RuntimeLifecyclePlanStatus `json:"status,omitempty"`
+	Message            string                     `json:"message,omitempty"`
+	ReasonCodes        []string                   `json:"reason_codes,omitempty"`
+	BlockedReasonCodes []string                   `json:"blocked_reason_codes,omitempty"`
+	ReleaseTargets     []string                   `json:"release_targets,omitempty"`
+	RequestedTaskType  TaskType                   `json:"requested_task_type,omitempty"`
+	TriggeredBy        string                     `json:"triggered_by,omitempty"`
+	Source             RuntimeSignalSource        `json:"source,omitempty"`
+	RelatedTaskID      string                     `json:"related_task_id,omitempty"`
+	GeneratedAt        time.Time                  `json:"generated_at,omitempty"`
+	UpdatedAt          time.Time                  `json:"updated_at,omitempty"`
+}
+
 type TaskStatus string
 
 const (
@@ -523,37 +628,91 @@ type RuntimeInstanceAgentTaskSummary struct {
 }
 
 type RuntimeInstance struct {
-	ID                 string                           `json:"id"`
-	ModelID            string                           `json:"model_id"`
-	TemplateID         string                           `json:"template_id"`
-	BindingID          string                           `json:"binding_id"`
-	BindingMode        RuntimeBindingMode               `json:"binding_mode,omitempty"`
-	ManifestID         string                           `json:"manifest_id,omitempty"`
-	NodeID             string                           `json:"node_id"`
-	DesiredState       string                           `json:"desired_state,omitempty"`
-	ObservedState      string                           `json:"observed_state,omitempty"`
-	Readiness          ReadinessState                   `json:"readiness,omitempty"`
-	HealthMessage      string                           `json:"health_message,omitempty"`
-	DriftReason        string                           `json:"drift_reason,omitempty"`
-	Endpoint           string                           `json:"endpoint,omitempty"`
-	LaunchedCommand    []string                         `json:"launched_command,omitempty"`
-	MountedPaths       []string                         `json:"mounted_paths,omitempty"`
-	InjectedEnv        map[string]string                `json:"injected_env,omitempty"`
-	ScriptUsed         string                           `json:"script_used,omitempty"`
-	ResolvedMounts     []string                         `json:"resolved_mounts,omitempty"`
-	ResolvedPorts      []string                         `json:"resolved_ports,omitempty"`
-	ResolvedScript     string                           `json:"resolved_script,omitempty"`
-	LastReconciledAt   time.Time                        `json:"last_reconciled_at,omitempty"`
-	Metadata           map[string]string                `json:"metadata,omitempty"`
-	LastAgentTask      *RuntimeInstanceAgentTaskSummary `json:"last_agent_task,omitempty"`
-	PrecheckStatus     PrecheckOverallStatus            `json:"precheck_status,omitempty"`
-	PrecheckGating     bool                             `json:"precheck_gating"`
-	PrecheckReasons    []string                         `json:"precheck_reasons,omitempty"`
-	LastPrecheckTaskID string                           `json:"last_precheck_task_id,omitempty"`
-	LastPrecheckAt     time.Time                        `json:"last_precheck_at,omitempty"`
-	PrecheckResult     *RuntimePrecheckResult           `json:"precheck_result,omitempty"`
-	CreatedAt          time.Time                        `json:"created_at,omitempty"`
-	UpdatedAt          time.Time                        `json:"updated_at,omitempty"`
+	ID                  string                           `json:"id"`
+	ModelID             string                           `json:"model_id"`
+	TemplateID          string                           `json:"template_id"`
+	BindingID           string                           `json:"binding_id"`
+	BindingMode         RuntimeBindingMode               `json:"binding_mode,omitempty"`
+	ManifestID          string                           `json:"manifest_id,omitempty"`
+	NodeID              string                           `json:"node_id"`
+	DesiredState        string                           `json:"desired_state,omitempty"`
+	ObservedState       string                           `json:"observed_state,omitempty"`
+	Readiness           ReadinessState                   `json:"readiness,omitempty"`
+	HealthMessage       string                           `json:"health_message,omitempty"`
+	DriftReason         string                           `json:"drift_reason,omitempty"`
+	Endpoint            string                           `json:"endpoint,omitempty"`
+	LaunchedCommand     []string                         `json:"launched_command,omitempty"`
+	MountedPaths        []string                         `json:"mounted_paths,omitempty"`
+	InjectedEnv         map[string]string                `json:"injected_env,omitempty"`
+	ScriptUsed          string                           `json:"script_used,omitempty"`
+	ResolvedMounts      []string                         `json:"resolved_mounts,omitempty"`
+	ResolvedPorts       []string                         `json:"resolved_ports,omitempty"`
+	ResolvedScript      string                           `json:"resolved_script,omitempty"`
+	LastReconciledAt    time.Time                        `json:"last_reconciled_at,omitempty"`
+	Metadata            map[string]string                `json:"metadata,omitempty"`
+	LastAgentTask       *RuntimeInstanceAgentTaskSummary `json:"last_agent_task,omitempty"`
+	PrecheckStatus      PrecheckOverallStatus            `json:"precheck_status,omitempty"`
+	PrecheckGating      bool                             `json:"precheck_gating"`
+	PrecheckReasons     []string                         `json:"precheck_reasons,omitempty"`
+	PrecheckSummary     *RuntimePrecheckSummary          `json:"precheck_summary,omitempty"`
+	ConflictStatus      RuntimeConflictStatus            `json:"conflict_status,omitempty"`
+	ConflictBlocking    bool                             `json:"conflict_blocking"`
+	ConflictReasons     []string                         `json:"conflict_reasons,omitempty"`
+	ConflictSource      RuntimeSignalSource              `json:"conflict_source,omitempty"`
+	ConflictGeneratedAt time.Time                        `json:"conflict_generated_at,omitempty"`
+	ConflictSummary     *RuntimeConflictSummary          `json:"conflict_summary,omitempty"`
+	GatingStatus        RuntimeGatingStatus              `json:"gating_status,omitempty"`
+	GatingAllowed       bool                             `json:"gating_allowed"`
+	GatingReasons       []string                         `json:"gating_reasons,omitempty"`
+	GatingSource        RuntimeSignalSource              `json:"gating_source,omitempty"`
+	GatingGeneratedAt   time.Time                        `json:"gating_generated_at,omitempty"`
+	GatingSummary       *RuntimeGatingSummary            `json:"gating_summary,omitempty"`
+	LastPlanAction      RuntimeLifecycleAction           `json:"last_plan_action,omitempty"`
+	LastPlanStatus      RuntimeLifecyclePlanStatus       `json:"last_plan_status,omitempty"`
+	LastPlanReason      string                           `json:"last_plan_reason,omitempty"`
+	LastPlanGeneratedAt time.Time                        `json:"last_plan_generated_at,omitempty"`
+	LastPlanDetail      map[string]interface{}           `json:"last_plan_detail,omitempty"`
+	LastLifecyclePlan   *RuntimeLifecyclePlanSummary     `json:"last_lifecycle_plan,omitempty"`
+	LastPrecheckTaskID  string                           `json:"last_precheck_task_id,omitempty"`
+	LastPrecheckAt      time.Time                        `json:"last_precheck_at,omitempty"`
+	PrecheckResult      *RuntimePrecheckResult           `json:"precheck_result,omitempty"`
+	CreatedAt           time.Time                        `json:"created_at,omitempty"`
+	UpdatedAt           time.Time                        `json:"updated_at,omitempty"`
+}
+
+// RuntimeInstanceReconcileSummary captures the latest instance-first reconcile
+// interpretation from controller, including precheck/drift/readiness explanation.
+type RuntimeInstanceReconcileSummary struct {
+	RuntimeInstanceID string                           `json:"runtime_instance_id"`
+	ModelID           string                           `json:"model_id,omitempty"`
+	NodeID            string                           `json:"node_id,omitempty"`
+	RuntimeTemplateID string                           `json:"runtime_template_id,omitempty"`
+	BindingMode       RuntimeBindingMode               `json:"binding_mode,omitempty"`
+	ManifestID        string                           `json:"manifest_id,omitempty"`
+	DesiredState      string                           `json:"desired_state,omitempty"`
+	ObservedState     string                           `json:"observed_state,omitempty"`
+	Readiness         ReadinessState                   `json:"readiness,omitempty"`
+	HealthMessage     string                           `json:"health_message,omitempty"`
+	DriftReason       string                           `json:"drift_reason,omitempty"`
+	PrecheckStatus    PrecheckOverallStatus            `json:"precheck_status,omitempty"`
+	PrecheckGating    bool                             `json:"precheck_gating"`
+	PrecheckReasons   []string                         `json:"precheck_reasons,omitempty"`
+	ConflictStatus    RuntimeConflictStatus            `json:"conflict_status,omitempty"`
+	ConflictBlocking  bool                             `json:"conflict_blocking"`
+	ConflictReasons   []string                         `json:"conflict_reasons,omitempty"`
+	GatingStatus      RuntimeGatingStatus              `json:"gating_status,omitempty"`
+	GatingAllowed     bool                             `json:"gating_allowed"`
+	GatingReasons     []string                         `json:"gating_reasons,omitempty"`
+	PlannedAction     RuntimeLifecycleAction           `json:"planned_action,omitempty"`
+	AgentStatus       string                           `json:"agent_status,omitempty"`
+	AgentOnline       bool                             `json:"agent_online"`
+	ObservationStale  bool                             `json:"observation_stale"`
+	LastObservationAt time.Time                        `json:"last_observation_at,omitempty"`
+	LastReconciledAt  time.Time                        `json:"last_reconciled_at,omitempty"`
+	ReconcileReasons  []string                         `json:"reconcile_reasons,omitempty"`
+	Trigger           string                           `json:"trigger,omitempty"`
+	LastAgentTask     *RuntimeInstanceAgentTaskSummary `json:"last_agent_task,omitempty"`
+	LastLifecyclePlan *RuntimeLifecyclePlanSummary     `json:"last_lifecycle_plan,omitempty"`
 }
 
 type LaunchProfile = RuntimeBinding

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -245,13 +246,26 @@ func (h *Handler) GetRuntimeInstance(w http.ResponseWriter, r *http.Request) {
 type runtimeInstanceStatusSummary struct {
 	RuntimeInstance  model.RuntimeInstance                  `json:"runtime_instance"`
 	RecentAgentTasks []model.Task                           `json:"recent_agent_tasks,omitempty"`
+	DesiredState     string                                 `json:"desired_state,omitempty"`
+	ObservedState    string                                 `json:"observed_state,omitempty"`
 	PrecheckStatus   model.PrecheckOverallStatus            `json:"precheck_status,omitempty"`
 	PrecheckGating   bool                                   `json:"precheck_gating"`
 	PrecheckReasons  []string                               `json:"precheck_reasons,omitempty"`
+	ConflictStatus   model.RuntimeConflictStatus            `json:"conflict_status,omitempty"`
+	ConflictBlocking bool                                   `json:"conflict_blocking"`
+	ConflictReasons  []string                               `json:"conflict_reasons,omitempty"`
+	GatingStatus     model.RuntimeGatingStatus              `json:"gating_status,omitempty"`
+	GatingAllowed    bool                                   `json:"gating_allowed"`
+	GatingReasons    []string                               `json:"gating_reasons,omitempty"`
+	LastPlanAction   model.RuntimeLifecycleAction           `json:"last_plan_action,omitempty"`
+	LastPlanStatus   model.RuntimeLifecyclePlanStatus       `json:"last_plan_status,omitempty"`
+	LastPlanReason   string                                 `json:"last_plan_reason,omitempty"`
 	Readiness        model.ReadinessState                   `json:"readiness,omitempty"`
 	HealthMessage    string                                 `json:"health_message,omitempty"`
 	DriftReason      string                                 `json:"drift_reason,omitempty"`
 	LastAgentTask    *model.RuntimeInstanceAgentTaskSummary `json:"last_agent_task,omitempty"`
+	LastReconciledAt time.Time                              `json:"last_reconciled_at,omitempty"`
+	ReconcileSummary model.RuntimeInstanceReconcileSummary  `json:"reconcile_summary,omitempty"`
 }
 
 func (h *Handler) GetRuntimeInstanceSummary(w http.ResponseWriter, r *http.Request) {
@@ -288,17 +302,57 @@ func (h *Handler) GetRuntimeInstanceSummary(w http.ResponseWriter, r *http.Reque
 		Fail(w, http.StatusInternalServerError, "查询 runtime instance tasks 失败", err.Error())
 		return
 	}
+	reconcileSummary, err := h.runtimeObjectService.GetRuntimeInstanceReconcileSummary(r.Context(), runtimeInstanceID)
+	if err != nil {
+		Fail(w, http.StatusInternalServerError, "查询 runtime instance reconcile summary 失败", err.Error())
+		return
+	}
 	OK(w, runtimeInstanceStatusSummary{
 		RuntimeInstance:  instance,
 		RecentAgentTasks: tasks,
+		DesiredState:     instance.DesiredState,
+		ObservedState:    instance.ObservedState,
 		PrecheckStatus:   instance.PrecheckStatus,
 		PrecheckGating:   instance.PrecheckGating,
 		PrecheckReasons:  instance.PrecheckReasons,
+		ConflictStatus:   model.RuntimeConflictStatus(firstNonEmpty(string(instance.ConflictStatus), string(reconcileSummary.ConflictStatus))),
+		ConflictBlocking: instance.ConflictBlocking || reconcileSummary.ConflictBlocking,
+		ConflictReasons:  mergeStringSlices(instance.ConflictReasons, reconcileSummary.ConflictReasons),
+		GatingStatus:     model.RuntimeGatingStatus(firstNonEmpty(string(instance.GatingStatus), string(reconcileSummary.GatingStatus))),
+		GatingAllowed:    instance.GatingAllowed || reconcileSummary.GatingAllowed,
+		GatingReasons:    mergeStringSlices(instance.GatingReasons, reconcileSummary.GatingReasons),
+		LastPlanAction:   firstNonEmptyLifecycleAction(instance.LastPlanAction, reconcileSummary.PlannedAction),
+		LastPlanStatus:   instance.LastPlanStatus,
+		LastPlanReason:   instance.LastPlanReason,
 		Readiness:        instance.Readiness,
 		HealthMessage:    instance.HealthMessage,
 		DriftReason:      instance.DriftReason,
 		LastAgentTask:    instance.LastAgentTask,
+		LastReconciledAt: instance.LastReconciledAt,
+		ReconcileSummary: reconcileSummary,
 	})
+}
+
+func (h *Handler) GetRuntimeInstanceReconcileSummary(w http.ResponseWriter, r *http.Request) {
+	if h.runtimeObjectService == nil {
+		Fail(w, http.StatusServiceUnavailable, "runtime object 服务未就绪", nil)
+		return
+	}
+	runtimeInstanceID := strings.TrimSpace(chi.URLParam(r, "id"))
+	if runtimeInstanceID == "" {
+		Fail(w, http.StatusBadRequest, "runtime_instance_id 不能为空", nil)
+		return
+	}
+	summary, err := h.runtimeObjectService.GetRuntimeInstanceReconcileSummary(r.Context(), runtimeInstanceID)
+	if err != nil {
+		if errors.Is(err, service.ErrRuntimeInstanceNotFound) {
+			Fail(w, http.StatusNotFound, "runtime instance 不存在", map[string]string{"id": runtimeInstanceID})
+			return
+		}
+		Fail(w, http.StatusInternalServerError, "查询 runtime instance reconcile summary 失败", err.Error())
+		return
+	}
+	OK(w, summary)
 }
 
 func (h *Handler) ListRuntimeInstanceAgentTasks(w http.ResponseWriter, r *http.Request) {
@@ -450,6 +504,17 @@ func (h *Handler) createRuntimeTask(w http.ResponseWriter, r *http.Request, task
 	}
 	task, err := h.taskService.CreateRuntimeTask(r.Context(), taskType, req.ModelID, req.TriggeredBy)
 	if err != nil {
+		var gatedErr *service.RuntimeActionGatedError
+		if errors.As(err, &gatedErr) {
+			Fail(w, http.StatusConflict, "runtime action blocked by gating", map[string]interface{}{
+				"model_id":            strings.TrimSpace(gatedErr.ModelID),
+				"runtime_instance_id": strings.TrimSpace(gatedErr.RuntimeInstanceID),
+				"task_type":           strings.TrimSpace(string(gatedErr.TaskType)),
+				"gating_status":       strings.TrimSpace(string(gatedErr.GatingStatus)),
+				"gating_reasons":      gatedErr.GatingReasons,
+			})
+			return
+		}
 		if errors.Is(err, service.ErrTaskStoreNotReady) {
 			Fail(w, http.StatusServiceUnavailable, "task store 未就绪", err.Error())
 			return
@@ -605,6 +670,14 @@ func (h *Handler) ReportAgentTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	OK(w, item)
+}
+
+func (h *Handler) ListTestRunScenarios(w http.ResponseWriter, r *http.Request) {
+	if h.testRunService == nil {
+		Fail(w, http.StatusServiceUnavailable, "test run 服务未就绪", nil)
+		return
+	}
+	OK(w, h.testRunService.ListScenarios())
 }
 
 func (h *Handler) CreateTestRun(w http.ResponseWriter, r *http.Request) {
@@ -1013,6 +1086,37 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func mergeStringSlices(left, right []string) []string {
+	out := make([]string, 0, len(left)+len(right))
+	seen := map[string]struct{}{}
+	appendSlice := func(values []string) {
+		for _, raw := range values {
+			value := strings.TrimSpace(raw)
+			if value == "" {
+				continue
+			}
+			if _, ok := seen[value]; ok {
+				continue
+			}
+			seen[value] = struct{}{}
+			out = append(out, value)
+		}
+	}
+	appendSlice(left)
+	appendSlice(right)
+	return out
+}
+
+func firstNonEmptyLifecycleAction(primary, fallback model.RuntimeLifecycleAction) model.RuntimeLifecycleAction {
+	if strings.TrimSpace(string(primary)) != "" && primary != model.RuntimeLifecycleActionNone {
+		return primary
+	}
+	if strings.TrimSpace(string(fallback)) != "" {
+		return fallback
+	}
+	return model.RuntimeLifecycleActionNone
 }
 
 func runtimeTemplateIsZero(tpl model.RuntimeTemplate) bool {

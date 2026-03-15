@@ -4,6 +4,8 @@ import (
 	"context"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -118,7 +120,11 @@ func main() {
 		log.Error("模型持久化状态加载失败", "error", err)
 		os.Exit(1)
 	}
+	observationStaleAfter := resolveInstanceObservationStaleAfter()
 	runtimeObjectService := service.NewRuntimeObjectService(modelRegistry, nodeRegistry, runtimeTemplateService, log)
+	runtimeObjectService.SetAgentService(agentService)
+	runtimeObjectService.SetRuntimeInstanceProjectionSink(modelService)
+	runtimeObjectService.SetObservationStaleAfter(observationStaleAfter)
 	if err := runtimeObjectService.SetStore(context.Background(), sqliteStore); err != nil {
 		log.Error("runtime object 持久化状态加载失败", "error", err)
 		os.Exit(1)
@@ -142,6 +148,12 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	modelService.StartAutoRefresh(ctx, time.Duration(cfg.Integrations.LMStudio.CacheRefreshSeconds)*time.Second)
+	instanceReconcileInterval := resolveInstanceReconcileInterval()
+	log.Info("启动 instance-first reconcile loop",
+		"interval", instanceReconcileInterval.String(),
+		"observation_stale_after", observationStaleAfter.String(),
+	)
+	runtimeObjectService.StartInstanceReconcileLoop(ctx, instanceReconcileInterval)
 
 	if err := httpServer.Start(ctx); err != nil {
 		log.Error("服务退出", "error", err)
@@ -199,4 +211,28 @@ func resolveDockerProbeEndpoint(cfg *config.Config) string {
 		}
 	}
 	return cfg.Integrations.Docker.Endpoint
+}
+
+func resolveInstanceReconcileInterval() time.Duration {
+	return resolveDurationEnvSeconds("MCP_INSTANCE_RECONCILE_INTERVAL_SECONDS", 15*time.Second, 3*time.Second)
+}
+
+func resolveInstanceObservationStaleAfter() time.Duration {
+	return resolveDurationEnvSeconds("MCP_INSTANCE_OBSERVATION_STALE_SECONDS", 2*time.Minute, 30*time.Second)
+}
+
+func resolveDurationEnvSeconds(key string, fallback, min time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	seconds, err := strconv.Atoi(raw)
+	if err != nil || seconds <= 0 {
+		return fallback
+	}
+	d := time.Duration(seconds) * time.Second
+	if d < min {
+		return min
+	}
+	return d
 }

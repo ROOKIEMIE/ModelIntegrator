@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -75,6 +76,71 @@ func TestRuntimeTaskStartLifecycle(t *testing.T) {
 	}
 	if finalTask.Status != model.TaskStatusSuccess {
 		t.Fatalf("unexpected final task status: %s message=%s error=%s", finalTask.Status, finalTask.Message, finalTask.Error)
+	}
+}
+
+func TestCreateRuntimeTaskStartFailFastWhenGatingBlocked(t *testing.T) {
+	capture := &captureAdapter{}
+	taskSvc, _ := newTaskServiceForTest(t,
+		[]model.Model{{
+			ID:           "local-multilingual-e5-base",
+			Name:         "multilingual-e5-base",
+			ModelType:    model.ModelKindEmbedding,
+			Format:       model.ModelFormatSafeTensors,
+			BackendType:  model.RuntimeTypeDocker,
+			HostNodeID:   "node-controller",
+			RuntimeID:    "rt-docker",
+			State:        model.ModelStateLoaded,
+			DesiredState: string(model.ModelStateRunning),
+			Metadata: map[string]string{
+				"runtime_template_id": "tei-embedding",
+			},
+		}},
+		[]model.Node{{ID: "node-controller", Role: model.NodeRoleController, Runtimes: []model.Runtime{{ID: "rt-docker", Type: model.RuntimeTypeDocker, Enabled: true}}}},
+		capture,
+	)
+
+	runtimeObjectSvc := newRuntimeObjectTestService(
+		[]model.Model{{
+			ID:           "local-multilingual-e5-base",
+			Name:         "multilingual-e5-base",
+			ModelType:    model.ModelKindEmbedding,
+			SourceType:   model.ModelSourceLocalPath,
+			Format:       model.ModelFormatSafeTensors,
+			BackendType:  model.RuntimeTypeDocker,
+			HostNodeID:   "node-controller",
+			DesiredState: "running",
+			Metadata: map[string]string{
+				"runtime_template_id": "tei-embedding",
+			},
+		}},
+		[]model.Node{{ID: "node-controller", Role: model.NodeRoleController}},
+	)
+	if err := runtimeObjectSvc.Bootstrap(context.Background()); err != nil {
+		t.Fatalf("runtime bootstrap failed: %v", err)
+	}
+	instance, err := runtimeObjectSvc.GetRuntimeInstanceByModelID(context.Background(), "local-multilingual-e5-base")
+	if err != nil {
+		t.Fatalf("get runtime instance failed: %v", err)
+	}
+	instance.PrecheckStatus = model.PrecheckStatusFailed
+	instance.PrecheckGating = true
+	instance.PrecheckReasons = []string{"required_env_missing"}
+	if err := runtimeObjectSvc.upsertRuntimeInstance(context.Background(), instance); err != nil {
+		t.Fatalf("upsert runtime instance failed: %v", err)
+	}
+	taskSvc.SetRuntimeObjectService(runtimeObjectSvc)
+
+	_, err = taskSvc.CreateRuntimeTask(context.Background(), model.TaskTypeRuntimeStart, "local-multilingual-e5-base", "test")
+	if err == nil {
+		t.Fatalf("expected runtime action gated error")
+	}
+	var gatedErr *RuntimeActionGatedError
+	if !errors.As(err, &gatedErr) {
+		t.Fatalf("expected RuntimeActionGatedError, got=%v", err)
+	}
+	if strings.TrimSpace(gatedErr.RuntimeInstanceID) == "" {
+		t.Fatalf("runtime instance id should be included in gated error")
 	}
 }
 
@@ -254,6 +320,76 @@ func TestCreateAgentNodeTaskWithRuntimeInstanceContext(t *testing.T) {
 	}
 	if got := strings.TrimSpace(fmt.Sprint(created.Detail["task_scope"])); got != "runtime_instance" {
 		t.Fatalf("unexpected task_scope detail: %s", got)
+	}
+}
+
+func TestReportAgentTaskNormalizesDetailEnvelope(t *testing.T) {
+	capture := &captureAdapter{}
+	taskSvc, _ := newTaskServiceForTest(t,
+		[]model.Model{{
+			ID:          "local-multilingual-e5-base",
+			Name:        "multilingual-e5-base",
+			BackendType: model.RuntimeTypeDocker,
+			HostNodeID:  "node-controller",
+			RuntimeID:   "rt-docker",
+			State:       model.ModelStateRunning,
+			Metadata: map[string]string{
+				"runtime_template_id": "tei-embedding",
+			},
+		}},
+		[]model.Node{{ID: "node-controller", Runtimes: []model.Runtime{{ID: "rt-docker", Type: model.RuntimeTypeDocker, Enabled: true}}}},
+		capture,
+	)
+
+	agentSvc := NewAgentService(30*time.Second, 5*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if _, err := agentSvc.Register(context.Background(), model.AgentRegisterRequest{
+		ID:     "agent-controller-local",
+		NodeID: "node-controller",
+	}); err != nil {
+		t.Fatalf("register agent failed: %v", err)
+	}
+	taskSvc.SetAgentService(agentSvc)
+
+	created, err := taskSvc.CreateAgentNodeTask(context.Background(), AgentNodeLocalTaskRequest{
+		AgentID:  "agent-controller-local",
+		ModelID:  "local-multilingual-e5-base",
+		TaskType: model.TaskTypeAgentRuntimeReadiness,
+		Payload: map[string]interface{}{
+			"endpoint": "http://127.0.0.1:58001",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create agent task failed: %v", err)
+	}
+
+	reported, err := taskSvc.ReportAgentTask(context.Background(), "agent-controller-local", created.ID, AgentTaskReport{
+		Status:     model.TaskStatusSuccess,
+		Progress:   100,
+		Message:    "runtime ready",
+		Detail:     map[string]interface{}{"runtime_ready": true},
+		StartedAt:  time.Now().Add(-2 * time.Second).UTC(),
+		FinishedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("report task failed: %v", err)
+	}
+	if got := strings.TrimSpace(fmt.Sprint(reported.Detail["task_type"])); got != string(model.TaskTypeAgentRuntimeReadiness) {
+		t.Fatalf("unexpected detail.task_type: %s", got)
+	}
+	if got := strings.TrimSpace(fmt.Sprint(reported.Detail["overall_status"])); got == "" {
+		t.Fatalf("detail.overall_status should not be empty")
+	}
+	if _, ok := reported.Detail["structured_result"].(map[string]interface{}); !ok {
+		t.Fatalf("detail.structured_result should be object")
+	}
+	if _, ok := reported.Detail["detail"].(map[string]interface{}); !ok {
+		t.Fatalf("detail.detail should be object")
+	}
+	if got := strings.TrimSpace(fmt.Sprint(reported.Detail["started_at"])); got == "" {
+		t.Fatalf("detail.started_at should not be empty")
+	}
+	if got := strings.TrimSpace(fmt.Sprint(reported.Detail["finished_at"])); got == "" {
+		t.Fatalf("detail.finished_at should not be empty")
 	}
 }
 

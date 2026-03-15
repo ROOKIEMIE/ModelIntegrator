@@ -1,8 +1,0 @@
-[2026-03-12T12:54:12.952836674Z] test run started: id=testrun-1773320052939733605 scenario=e5_embedding_smoke triggered_by=script
-[2026-03-12T12:54:12.952849008Z] parameters: log_dir=/opt/controller/test-logs/testrun-1773320052939733605
-[2026-03-12T12:54:12.953107884Z] step=discover_model ok=true message=已找到 E5 模型 detail={"expected_dim":768,"model_id":"local-multilingual-e5-base"}
-[2026-03-12T12:54:12.958344732Z] step=runtime_start ok=true message=已创建 runtime start 任务 detail={"task_id":"task-1773320052953112959"}
-[2026-03-12T12:54:15.359161195Z] step=runtime_start_wait ok=true message=runtime start 任务成功 detail={"task_id":"task-1773320052953112959"}
-[2026-03-12T12:54:19.379710058Z] step=readiness_poll ok=true message=模型已就绪 detail={"attempt":1,"desired_state":"running","endpoint":"\u003cnil\u003e","health_message":"runtime precheck passed","observed_state":"running","readiness":"ready"}
-[2026-03-12T12:54:19.379768222Z] step=embedding_request ok=false message=embedding 请求失败 detail={"endpoint":"\u003cnil\u003e","error":"Post \"%3Cnil%3E/v1/embeddings\": unsupported protocol scheme \"\""}
-[2026-03-12T12:54:19.384859058Z] test run finished: status=failed summary=embedding 请求失败 error=Post "%3Cnil%3E/v1/embeddings": unsupported protocol scheme ""

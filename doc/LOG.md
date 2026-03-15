@@ -1,5 +1,182 @@
 # 变更日志
 
+## 2026-03-16
+
+### 测试系统强化：阶段0~B场景矩阵 + 前端手动触发入口
+
+本轮将测试入口从“单场景触发”升级为“阶段化场景矩阵”，并对齐 API/前端/testsystem 三处入口。
+
+### 本轮完成
+
+- `TestRunService` 新增阶段化场景注册：
+  - `stage0_runtime_object_smoke`
+  - `e5_embedding_smoke`
+  - `local_agent_execution_smoke`
+  - `e5_gating_blocked_smoke`
+  - `stage0_to_b_full_smoke`（推荐）
+- `stage0_to_b_full_smoke` 作为组合场景，顺序覆盖阶段0到阶段B关键链路。
+- API 新增：
+  - `GET /api/v1/test-runs/scenarios`
+- 前端“任务与测试”新增手动触发能力：
+  - 场景下拉选择 + “运行所选测试”
+  - “一键测试阶段0~B”快捷按钮
+- testsystem 新增脚本：
+  - `testsystem/scenarios/stage0_runtime_object_smoke.sh`
+  - `testsystem/scenarios/stage0_to_b_full_smoke.sh`
+- testsystem 默认场景切换为 `stage0_to_b_full_smoke`，回归默认覆盖范围扩展到阶段0~B。
+
+### 说明
+
+- 单场景脚本仍保留，便于定位具体阶段问题。
+- 阶段0~B覆盖当前仍是最小可执行矩阵，不包含阶段C外部网关/代理联调。
+
+### 阶段 B 深化：precheck/conflict/gating 与最小生命周期规划
+
+本轮在阶段 B 起步基础上，正式把 controller 推进到“实例级前置判断 + 最小 load/unload 规划”。
+
+### 本轮完成
+
+- `RuntimeInstance` 新增并统一承接：
+  - `conflict_status/conflict_blocking/conflict_reasons/conflict_source/conflict_generated_at/conflict_summary`
+  - `gating_status/gating_allowed/gating_reasons/gating_source/gating_generated_at/gating_summary`
+  - `last_plan_action/last_plan_status/last_plan_reason/last_plan_generated_at/last_plan_detail`
+  - `last_lifecycle_plan`
+- `RuntimeObjectService` reconcile 管线升级为：
+  - precheck 汇总 -> conflict 检测 -> gating 判定 -> lifecycle plan 生成
+  - 支持同节点同 `runtime_kind` 互斥冲突与 release plan（`unload-for-release`）写入
+- `TaskService` 接入 planner 准入：
+  - `runtime.start/restart` 创建前执行 reconcile 准入
+  - `gating_allowed=false` 时 fail-fast（直接拒绝，不入队）
+  - runtime task payload/detail 附加 planner 元信息（action/status/reason/source）
+- SQLite 持久化补齐 runtime instance 相关字段映射：
+  - `precheck_summary_json/conflict_*/gating_*/last_lifecycle_plan_json` 全量读写
+  - 历史库增量迁移补列（不重置数据）
+- API/前端增强：
+  - runtime instance summary 输出 conflict/gating/last plan 摘要
+  - 前端 runtime instance 卡片新增 conflict/gating/last plan 展示
+- testsystem 增强：
+  - `local_agent_execution_smoke` 报告新增 reconcile conflict/gating/planned_action
+  - 新增 `e5_gating_blocked_smoke`：通过 binding/script 冲突触发阻塞，并验证 `runtime.start` fail-fast
+
+### 当前仍是最小版本（留待后续阶段 B 深化）
+
+- planner 仍是实例级最小计划，不含全局优先级队列与多节点最优解。
+- `runtime_kind` 互斥规则目前为 same-kind v1，不跨 kind。
+- direct fallback 仍保留兼容路径，但已被 instance-level gating/conflict 显式约束与解释。
+
+### 阶段 B 起步：controller 进入 instance-first reconcile 内核
+
+本轮在阶段 A 收口基础上，正式把 controller 的持续协调主对象落到 `RuntimeInstance`，目标是“持续解释状态”而不是“动作后被动刷新”。
+
+### 本轮完成
+
+- 新增 `RuntimeObjectService` 实例协调循环（instance-first reconcile loop）：
+  - 周期扫描 `RuntimeInstance`
+  - 基于 instance 当前字段 + agent 最近事实 + binding/template/manifest 上下文做协调解释
+  - 写回 `observed_state/readiness/health_message/drift_reason/last_reconciled_at`
+- 新增实例级 reconcile 摘要模型与 API：
+  - `GET /api/v1/runtime-instances/{id}/reconcile-summary`
+  - `GET /api/v1/runtime-instances/{id}/summary` 增补 `reconcile_summary`
+- precheck 正式进入 reconcile 输入：
+  - `precheck_gating=true` -> 实例阻塞（`readiness=not_ready`，drift/health 解释为 precheck 阻塞）
+  - precheck 通过但 readiness 失败 -> 区分为 `runtime_running_not_ready`
+  - agent 不在线或观测过期 -> 结论包含 `agent_offline/agent_observation_stale`
+- 运行态协调职责向 `RuntimeObjectService` 收拢：
+  - `ModelService` 增加 `ApplyRuntimeInstanceProjection`，作为资产视图投影入口
+  - `RuntimeObjectService` 在协调后回推 model 视图，减少实例运行态由 `ModelService` 主驱动
+- `RuntimeInstance` 同步增强：
+  - 保留阶段 A 状态沉淀并持续更新
+  - model 同步流程改为优先保留已有 instance 运行态（避免预检查/任务事实被覆盖）
+
+### 前端与 testsystem
+
+- 前端 runtime instance 卡片新增 reconcile 关键可视项：
+  - `last_reconciled_at`
+  - `agent_status / observation_stale`
+  - `reconcile_reasons`
+- testsystem `local_agent_execution_smoke` 增补 reconcile-summary 校验：
+  - 校验 `desired/observed/readiness/drift/precheck/last_reconciled_at`
+  - 验证 reconcile 时间推进
+
+### 当前仍保留（阶段 B 深化项）
+
+- controller direct fallback 仍存在（兼容路径），尚未彻底移除。
+- 复杂多节点冲突仲裁与自动恢复策略仍留待阶段 B 深化。
+- custom bundle 深度执行器仍在后续阶段。
+
+## 2026-03-15
+
+### 阶段 A 收口：manifest 驱动 precheck + 统一 agent 结果 + RuntimeInstance 首要落点
+
+本轮目标是补齐阶段 A 遗留项，不进入阶段 B 的复杂调度策略。
+
+### 已完成的收口项
+
+- `agent.runtime_precheck` 升级为 manifest 驱动节点 preflight，输出结构化 `precheck_result`：
+  - `overall_status/gating/reasons/checks`
+  - `resolved_mounts/resolved_env/resolved_script/resolved_ports`
+  - `compatibility_result`
+- precheck 检查项补齐：
+  - model path 存在性
+  - binding mount rules 合规性
+  - manifest required env 满足性
+  - script_ref / generic_with_script 脚本存在性
+  - manifest 暴露端口冲突
+  - model type/format 兼容性
+  - command/script 策略约束（`command_override_allowed/script_mount_allowed`）
+  - `custom_bundle` 最小 manifest 合法性检查
+- agent 任务结果统一 envelope（检查类 + 执行类）：
+  - `task_type/overall_status/message/detail/structured_result`
+  - `started_at/finished_at`
+  - `node_id/runtime_instance_id/runtime_binding_id`
+  - `manifest_summary`
+- controller `TaskService.ReportAgentTask` 增加统一 detail 归一化，兼容旧 agent detail。
+- `RuntimeObjectService/NodeService/ModelService` 改为优先消费统一 detail（含 `structured_result`/`detail` 扁平化）。
+
+### 已统一结构的 agent 任务
+
+- `agent.runtime_precheck`
+- `agent.runtime_readiness_check`
+- `agent.port_check`
+- `agent.model_path_check`
+- `agent.resource_snapshot`
+- `agent.docker_inspect`
+- `agent.docker_start_container`
+- `agent.docker_stop_container`
+
+### 正式沉淀到 RuntimeInstance 的状态
+
+- `precheck_status`
+- `precheck_gating`
+- `precheck_reasons`
+- `precheck_result`
+- `observed_state`
+- `readiness`
+- `health_message`
+- `drift_reason`
+- `last_agent_task`
+- `last_reconciled_at`
+
+### local-agent-first 收口与仍保留的 fallback
+
+- 本机路径继续优先 local-agent。
+- controller direct fallback 仍保留（兼容期）并显式写入：
+  - `fallback`
+  - `self_check`
+  - `compatibility_path`
+- 保留原因：agent 不可用、instance 上下文缺失、兼容旧模型/旧任务输入时仍需可退化执行。
+
+### testsystem / 前端 / API 同步
+
+- `local_agent_execution_smoke` 增强为阶段 A 收口链路（E5 默认模型）：
+  - instance-first 提交 `agent.runtime_precheck`
+  - 校验结构化结果字段与 envelope
+  - 校验 `RuntimeInstance` summary/detail API 状态沉淀
+- 前端 runtime instance 卡片新增：
+  - manifest basic check 摘要
+  - model→template→binding→instance 链路可见
+  - 最近 agent task 与 precheck 状态摘要
+
 ## 2026-03-14
 
 ### 文档改造：外部参考脉络分层归档与增强路线补全

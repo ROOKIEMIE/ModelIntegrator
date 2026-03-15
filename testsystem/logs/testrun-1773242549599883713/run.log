@@ -1,8 +1,0 @@
-[2026-03-11T15:22:29.612926644Z] test run started: id=testrun-1773242549599883713 scenario=e5_embedding_smoke triggered_by=debug-check-2
-[2026-03-11T15:22:29.612964871Z] parameters: log_dir=/opt/controller/test-logs/testrun-1773242549599883713
-[2026-03-11T15:22:29.613557094Z] step=discover_model ok=true message=已找到 E5 模型 detail={"expected_dim":768,"model_id":"local-multilingual-e5-base"}
-[2026-03-11T15:22:29.619213319Z] step=runtime_start ok=true message=已创建 runtime start 任务 detail={"task_id":"task-1773242549613571380"}
-[2026-03-11T15:22:30.819948803Z] step=runtime_start_wait ok=true message=runtime start 任务成功 detail={"task_id":"task-1773242549613571380"}
-[2026-03-11T15:22:30.830389189Z] step=readiness_poll ok=true message=模型已就绪 detail={"attempt":1,"desired_state":"running","endpoint":"http://127.0.0.1:58001","health_message":"runtime running","observed_state":"running","readiness":"ready"}
-[2026-03-11T15:22:30.830775244Z] step=embedding_request ok=false message=embedding 请求失败 detail={"endpoint":"http://127.0.0.1:58001","error":"Post \"http://127.0.0.1:58001/v1/embeddings\": dial tcp 127.0.0.1:58001: connect: connection refused"}
-[2026-03-11T15:22:30.835897226Z] test run finished: status=failed summary=embedding 请求失败 error=Post "http://127.0.0.1:58001/v1/embeddings": dial tcp 127.0.0.1:58001: connect: connection refused
